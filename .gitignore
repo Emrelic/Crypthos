@@ -1,0 +1,25 @@
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data & logs
+data/
+*.db
+*.log
+
+# Debug scripts
+debug_*.py
+
+# Config with sensitive data
+# config.json  (keeping it for now since no API keys)
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude
+.claude/
