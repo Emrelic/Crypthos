@@ -67,3 +67,35 @@ class BinanceRestClient:
     def get_all_24h_tickers(self) -> list:
         """Get 24h ticker data for ALL symbols in one request."""
         return self._get("/fapi/v1/ticker/24hr")
+
+    def get_leverage_bracket(self, symbol: str) -> list:
+        """Get leverage brackets for a symbol from /fapi/v1/leverageBracket."""
+        try:
+            data = self._get("/fapi/v1/leverageBracket", {"symbol": symbol})
+            if isinstance(data, list) and data:
+                return data[0].get("brackets", [])
+            return []
+        except Exception as e:
+            logger.warning(f"Failed to get leverage brackets for {symbol}: {e}")
+            return []
+
+    def get_max_leverage(self, symbol: str, notional: float = 100.0,
+                         fallback: int = 75) -> int:
+        """Return the max available leverage for a given notional size.
+        Note: leverageBracket endpoint requires API key. If unavailable,
+        returns fallback value (most coins support 75x for small positions).
+        """
+        try:
+            brackets = self.get_leverage_bracket(symbol)
+            if not brackets:
+                return fallback
+            for b in sorted(brackets, key=lambda x: x.get("bracket", 99)):
+                floor = float(b.get("notionalFloor", 0))
+                cap = float(b.get("notionalCap", float("inf")))
+                if floor <= notional < cap:
+                    return int(b.get("initialLeverage", fallback))
+            if brackets:
+                return int(brackets[0].get("initialLeverage", fallback))
+        except Exception as e:
+            logger.warning(f"Failed to get max leverage for {symbol}: {e}")
+        return fallback

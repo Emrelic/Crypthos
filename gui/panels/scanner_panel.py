@@ -96,7 +96,8 @@ class ScannerPanel(ctk.CTkFrame):
 
         self._pos_labels = {}
         pos_fields = ["Sembol", "Yon", "Giris", "Fiyat", "PnL", "PnL%",
-                       "SL", "TP", "Trailing", "Sure"]
+                       "SL", "TP", "Trailing", "Sure",
+                       "Lev", "Marjin", "ROI%", "Liq"]
         for i, name in enumerate(pos_fields):
             row, col = divmod(i, 5)
             f = ctk.CTkFrame(pos_grid, fg_color="transparent")
@@ -218,6 +219,25 @@ class ScannerPanel(ctk.CTkFrame):
         mins = int(hold_sec // 60)
         secs = int(hold_sec % 60)
         self._pos_labels["Sure"].configure(text=f"{mins}m{secs:02d}s")
+
+        # Leverage info
+        lev = pos.get("leverage", 1)
+        margin = pos.get("margin_usdt", 0)
+        liq = pos.get("liquidation_price", 0)
+
+        if lev > 1:
+            self._pos_labels["Lev"].configure(
+                text=f"{lev}x", text_color="#FF9800")
+            self._pos_labels["Marjin"].configure(
+                text=f"${margin:.2f}", text_color="white")
+            self._pos_labels["Liq"].configure(
+                text=f"{liq:{fmt}}", text_color="#FF1744")
+            self._pos_labels["ROI%"].configure(text="...")
+        else:
+            self._pos_labels["Lev"].configure(text="1x", text_color="gray")
+            self._pos_labels["Marjin"].configure(text="--", text_color="gray")
+            self._pos_labels["Liq"].configure(text="--", text_color="gray")
+            self._pos_labels["ROI%"].configure(text="--", text_color="gray")
 
         # PnL will be updated via events or price refresh
         self._pos_labels["Fiyat"].configure(text="...")

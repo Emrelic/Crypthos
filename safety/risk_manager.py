@@ -24,6 +24,8 @@ class RiskManager:
         self._config = config
         self._event_bus = event_bus
         self._total_exposure_usdt: float = 0.0
+        self._total_margin_exposure_usdt: float = 0.0
+        self._current_leverage: int = 1
         self._killed = False
 
         # Drawdown tracking
@@ -50,7 +52,9 @@ class RiskManager:
     # ──────────────────── Order Validation ────────────────────
 
     def validate_order(self, size: float, price: float,
-                       symbol: str = None) -> tuple[bool, str]:
+                       symbol: str = None,
+                       margin_usdt: float = None,
+                       leverage: int = None) -> tuple[bool, str]:
         if self._killed:
             return False, "Kill switch active"
 
@@ -60,26 +64,59 @@ class RiskManager:
         if size <= 0 or price <= 0:
             return False, "Size and price must be positive"
 
-        notional = size * price
+        lev_enabled = (leverage is not None and leverage > 1
+                       and margin_usdt is not None)
 
-        # Max single order check
-        max_single = self._config.get("risk.max_single_order_usdt", 50.0)
-        if notional > max_single:
-            return False, f"Order {notional:.2f} USDT exceeds max single order {max_single:.2f}"
-
-        # Max total position check
-        max_pos = self._config.get("risk.max_position_usdt", 100.0)
-        if self._total_exposure_usdt + notional > max_pos:
-            return False, (
-                f"Total exposure would be {self._total_exposure_usdt + notional:.2f} USDT, "
-                f"exceeds max {max_pos:.2f}"
-            )
+        if lev_enabled:
+            # Leverage mode: validate against margin, not notional
+            sizing_mode = self._config.get("leverage.position_sizing", "fixed")
+            if sizing_mode == "percentage":
+                # In percentage mode, the margin is already calculated as % of portfolio
+                # Just check we don't exceed the portfolio balance
+                portfolio = self._current_balance
+                if self._total_margin_exposure_usdt + margin_usdt > portfolio:
+                    return False, (
+                        f"Margin exposure {self._total_margin_exposure_usdt + margin_usdt:.2f} "
+                        f"exceeds portfolio balance ({portfolio:.2f})"
+                    )
+            else:
+                # Fixed mode: check against max_position_usdt
+                max_pos = self._config.get("leverage.max_position_usdt", 50.0)
+                if margin_usdt > max_pos:
+                    return False, (
+                        f"Margin {margin_usdt:.2f} exceeds max position {max_pos:.2f}"
+                    )
+                portfolio = self._current_balance
+                if self._total_margin_exposure_usdt + margin_usdt > portfolio:
+                    return False, (
+                        f"Margin exposure {self._total_margin_exposure_usdt + margin_usdt:.2f} "
+                        f"exceeds portfolio balance ({portfolio:.2f})"
+                    )
+        else:
+            # Legacy: notional check
+            notional = size * price
+            max_single = self._config.get("risk.max_single_order_usdt", 50.0)
+            if notional > max_single:
+                return False, (
+                    f"Order {notional:.2f} USDT exceeds max "
+                    f"single order {max_single:.2f}"
+                )
+            max_pos = self._config.get("risk.max_position_usdt", 100.0)
+            if self._total_exposure_usdt + notional > max_pos:
+                return False, (
+                    f"Total exposure would be "
+                    f"{self._total_exposure_usdt + notional:.2f} USDT, "
+                    f"exceeds max {max_pos:.2f}"
+                )
 
         # Daily loss limit
         self._reset_daily_if_needed()
-        daily_limit = self._config.get("risk.daily_loss_limit_usdt", 50.0)
+        daily_limit = self._config.get("risk.daily_loss_limit_usdt", 5.0)
         if self._daily_loss >= daily_limit:
-            return False, f"Daily loss limit reached: {self._daily_loss:.2f}/{daily_limit:.2f} USDT"
+            return False, (
+                f"Daily loss limit reached: "
+                f"{self._daily_loss:.2f}/{daily_limit:.2f} USDT"
+            )
 
         # Drawdown check
         max_dd = self._config.get("risk.max_drawdown_percent", 20.0)
@@ -205,11 +242,13 @@ class RiskManager:
                             atr: float = None) -> float:
         """Calculate optimal position size using Kelly Criterion.
 
-        Kelly % = W - (1-W)/R
-        Where W = win rate, R = average win / average loss
-
-        Returns position size in USDT (capped by config limits).
+        For leverage mode: returns the configured margin_usdt directly.
+        For legacy mode: returns Kelly-sized notional in USDT.
         """
+        # In leverage mode, return fixed margin from config
+        if self._config.get("leverage.enabled", False):
+            return self._config.get("leverage.margin_usdt", 1.0)
+
         total_trades = self._win_count + self._loss_count
         if total_trades < 10:
             # Not enough data, use fixed fraction
@@ -261,9 +300,25 @@ class RiskManager:
 
     # ──────────────────── Trade Recording ────────────────────
 
-    def record_order(self, size: float, price: float) -> None:
+    def record_order(self, size: float, price: float,
+                     margin_usdt: float = None) -> None:
         """Record a new order placement."""
-        self._total_exposure_usdt += size * price
+        notional = size * price
+        self._total_exposure_usdt += notional
+        if margin_usdt is not None:
+            self._total_margin_exposure_usdt += margin_usdt
+            self._current_leverage = int(round(
+                notional / margin_usdt)) if margin_usdt > 0 else 1
+
+    def release_exposure(self, notional_usdt: float = None,
+                         margin_usdt: float = None) -> None:
+        """Release exposure when a position is closed."""
+        if notional_usdt is not None:
+            self._total_exposure_usdt = max(
+                0.0, self._total_exposure_usdt - notional_usdt)
+        if margin_usdt is not None:
+            self._total_margin_exposure_usdt = max(
+                0.0, self._total_margin_exposure_usdt - margin_usdt)
 
     def record_trade_result(self, pnl: float) -> None:
         """Record trade result for Kelly calculation and loss tracking.
@@ -305,6 +360,8 @@ class RiskManager:
         """Get comprehensive risk statistics."""
         return {
             "total_exposure": round(self._total_exposure_usdt, 2),
+            "margin_exposure": round(self._total_margin_exposure_usdt, 2),
+            "current_leverage": self._current_leverage,
             "current_balance": round(self._current_balance, 2),
             "peak_balance": round(self._peak_balance, 2),
             "drawdown_pct": round(self.get_drawdown_percent(), 2),
@@ -356,6 +413,7 @@ class RiskManager:
 
     def reset_exposure(self) -> None:
         self._total_exposure_usdt = 0.0
+        self._total_margin_exposure_usdt = 0.0
 
     def reset_consecutive_losses(self) -> None:
         """Reset consecutive loss counter (allows trading to resume)."""

@@ -18,6 +18,7 @@ from safety.risk_manager import RiskManager
 from safety.kill_switch import KillSwitch
 from safety.order_logger import OrderLogger
 from market.binance_rest import BinanceRestClient
+from market.symbol_info import SymbolInfoCache
 from scanner.state_machine import ScannerStateMachine
 from gui.main_window import MainWindow
 
@@ -75,11 +76,14 @@ def main():
 
     # Scanner (crypto screener state machine)
     rest_client = BinanceRestClient()
-    scanner = ScannerStateMachine(config, event_bus, rest_client)
+    symbol_info_cache = SymbolInfoCache(rest_client)
+    scanner = ScannerStateMachine(config, event_bus, rest_client,
+                                  symbol_info_cache=symbol_info_cache)
     scanner.set_order_executor(order_executor)
     scanner.set_pair_switcher(pair_switcher)
     scanner.set_market_service(market_service)
     scanner.set_risk_manager(risk_manager)
+    scanner.set_binance_app(binance_app)
     controller.set_scanner(scanner)
 
     # Start services

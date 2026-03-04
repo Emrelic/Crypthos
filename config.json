@@ -16,19 +16,44 @@
     "max_single_order_usdt": 50.0,
     "confirm_above_usdt": 20.0,
     "default_tp_percent": 5.0,
-    "default_sl_percent": 2.0
+    "default_sl_percent": 2.0,
+    "initial_balance": 5.0,
+    "daily_loss_limit_usdt": 5.0,
+    "max_drawdown_percent": 20.0,
+    "max_consecutive_losses": 5,
+    "default_position_fraction": 0.02
+  },
+  "leverage": {
+    "enabled": true,
+    "mode": "isolated",
+    "margin_usdt": 1.0,
+    "min_leverage": 75,
+    "max_leverage": 100,
+    "sl_percent": 0.8,
+    "tp_percent": 0.5,
+    "trailing_activation_pct": 0.3,
+    "trailing_distance_pct": 0.15,
+    "max_hold_minutes": 60,
+    "min_hold_seconds": 30,
+    "position_sizing": "percentage",
+    "portfolio_percent": 25,
+    "max_position_usdt": 50.0
   },
   "indicators": {
-    "rsi_period": 14,
-    "ma_fast": 20,
-    "ma_slow": 200,
-    "macd_fast": 12,
-    "macd_slow": 26,
-    "macd_signal": 9,
-    "kline_interval": "15m",
-    "kline_limit": 500
+    "rsi_period": 9,
+    "ma_fast": 5,
+    "ma_slow": 13,
+    "macd_fast": 8,
+    "macd_slow": 17,
+    "macd_signal": 5,
+    "kline_interval": "1m",
+    "kline_limit": 200
   },
   "strategy_eval_interval_seconds": 5,
   "ui_refresh_ms": 1000,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "scanner": {
+    "max_positions": 1,
+    "focus_mode": true
+  }
 }

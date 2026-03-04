@@ -142,12 +142,27 @@ class ScannerScorer:
         regime_name = r.regime.get("regime", "UNKNOWN")
         trend_dir = r.regime.get("trend_direction", "NONE")
 
+        # === ATR vs LEVERAGE filter (scientific) ===
+        # Formula: liq = (1/L) * 85%, SL = liq * 65%, max_atr = SL / 2
+        # Coin's 1m ATR must be below max_atr or we WILL get liquidated
+        max_lev = self._config.get("leverage.max_leverage", 100)
+        if max_lev > 1 and r.atr_percent > 0:
+            liq_pct = (1.0 / max_lev) * 100.0 * 0.85
+            sl_pct = liq_pct * 0.65
+            max_safe_atr_pct = sl_pct / 2.0
+            if r.atr_percent > max_safe_atr_pct:
+                return False, (f"atr_too_volatile_{max_lev}x "
+                               f"(1m ATR={r.atr_percent:.3f}% > "
+                               f"safe={max_safe_atr_pct:.3f}%)")
+
+        # === VOLATILE regime is instant death at high leverage ===
+        if regime_name == "VOLATILE" and max_lev >= 50:
+            return False, "volatile_regime_high_leverage"
+
         if r.direction == "LONG":
             # LONG filters
             if conf_score < 4.0:
                 return False, f"confluence_low ({conf_score:.1f})"
-            if regime_name == "VOLATILE" and r.regime.get("confidence", 0) > 0.7:
-                return False, "volatile_regime"
             if r.rsi > 65:
                 return False, f"rsi_overbought ({r.rsi:.0f})"
             if r.adx < 15:
