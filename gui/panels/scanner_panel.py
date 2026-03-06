@@ -1,5 +1,6 @@
 """Scanner Panel - shows scanner state, scan results, active position."""
 import customtkinter as ctk
+from tkinter import messagebox
 
 
 class ScannerPanel(ctk.CTkFrame):
@@ -47,6 +48,17 @@ class ScannerPanel(ctk.CTkFrame):
         )
         self._start_btn.pack(side="right", padx=5)
 
+        # Battle Mode toggle
+        battle_on = self.controller.config.get("scanner.battle_mode", False)
+        self._battle_var = ctk.BooleanVar(value=battle_on)
+        self._battle_cb = ctk.CTkCheckBox(
+            ctrl, text="Savas Modu", variable=self._battle_var,
+            command=self._on_battle_toggle,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#FF9800", fg_color="#FF9800", hover_color="#F57C00",
+        )
+        self._battle_cb.pack(side="right", padx=15)
+
         # Scan info
         info = ctk.CTkFrame(self)
         info.pack(fill="x", padx=10, pady=3)
@@ -84,35 +96,55 @@ class ScannerPanel(ctk.CTkFrame):
         self._results_scroll.pack(fill="both", expand=True, padx=5, pady=3)
         self._result_rows = []
 
-        # === BOTTOM: Active Position ===
+        # === BOTTOM: Active Positions (all) ===
         pos_frame = ctk.CTkFrame(self)
         pos_frame.pack(fill="x", padx=10, pady=5)
 
-        ctk.CTkLabel(pos_frame, text="Aktif Pozisyon",
+        ctk.CTkLabel(pos_frame, text="Aktif Pozisyonlar",
                      font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=5)
 
-        pos_grid = ctk.CTkFrame(pos_frame)
-        pos_grid.pack(fill="x", padx=5, pady=5)
+        # Position table header
+        pos_hdr = ctk.CTkFrame(pos_frame)
+        pos_hdr.pack(fill="x", padx=5)
+        pos_headers = ["Sembol", "Yon", "Lev", "Giris", "SL", "Trailing", "Sure", "Marjin"]
+        pos_widths = [90, 50, 40, 80, 80, 70, 60, 55]
+        for h, w in zip(pos_headers, pos_widths):
+            ctk.CTkLabel(pos_hdr, text=h, width=w,
+                         font=ctk.CTkFont(size=10, weight="bold"),
+                         text_color="gray").pack(side="left", padx=2)
 
-        self._pos_labels = {}
-        pos_fields = ["Sembol", "Yon", "Giris", "Fiyat", "PnL", "PnL%",
-                       "SL", "TP", "Trailing", "Sure",
-                       "Lev", "Marjin", "ROI%", "Liq"]
-        for i, name in enumerate(pos_fields):
-            row, col = divmod(i, 5)
-            f = ctk.CTkFrame(pos_grid, fg_color="transparent")
-            f.grid(row=row, column=col, padx=8, pady=2, sticky="w")
-            ctk.CTkLabel(f, text=f"{name}:", text_color="gray",
-                         font=ctk.CTkFont(size=10)).pack(side="left")
-            lbl = ctk.CTkLabel(f, text="--", font=ctk.CTkFont(size=10, weight="bold"))
-            lbl.pack(side="left", padx=3)
-            self._pos_labels[name] = lbl
+        self._pos_scroll = ctk.CTkScrollableFrame(pos_frame, height=120)
+        self._pos_scroll.pack(fill="x", padx=5, pady=3)
+        self._pos_rows = []
 
     def _on_start(self) -> None:
         self.controller.start_scanner()
 
     def _on_stop(self) -> None:
         self.controller.stop_scanner()
+
+    def _on_battle_toggle(self) -> None:
+        enabled = self._battle_var.get()
+        if enabled:
+            confirm = messagebox.askyesno(
+                "Savas Modu",
+                "SAVAS MODU - Kanin Son Damlasina Kadar!\n\n"
+                "Bu mod aktifken cikis stratejisi degisir:\n\n"
+                "• Zarardayken: Sadece emergency close (likidasyon korumasi) calisir.\n"
+                "  Baska hicbir sinyal pozisyonu kapatmaz. Olene kadar tut.\n\n"
+                "• Fee breakeven - %50 ROI arasi: Sadece guclu sinyal\n"
+                "  donusumunde satar (confluence <= -5.0)\n\n"
+                "• %50+ ROI: Cok guclu donusum veya trailing stop\n"
+                "  tetiklenirse satar, yoksa karda oturur.\n\n"
+                "• Zaman limiti YOK, Take Profit YOK\n"
+                "• Trailing: genis mesafe, kari kosturur\n\n"
+                "Emin misiniz?",
+            )
+            if not confirm:
+                self._battle_var.set(False)
+                return
+        self.controller.config.set("scanner.battle_mode", enabled)
+        self.controller.config.save()
 
     def _start_refresh(self) -> None:
         self._refresh()
@@ -189,60 +221,58 @@ class ScannerPanel(ctk.CTkFrame):
             self._candidate_lbl.configure(text="Aday: --", text_color="gray")
 
     def _update_position(self) -> None:
-        pos = self.controller.get_scanner_position()
-        if not pos:
-            for lbl in self._pos_labels.values():
-                lbl.configure(text="--", text_color="white")
+        positions = self.controller.get_all_scanner_positions()
+
+        # Clear old rows
+        for row in self._pos_rows:
+            row.destroy()
+        self._pos_rows.clear()
+
+        if not positions:
+            row_frame = ctk.CTkFrame(self._pos_scroll, fg_color="transparent")
+            row_frame.pack(fill="x", pady=1)
+            self._pos_rows.append(row_frame)
+            ctk.CTkLabel(row_frame, text="Pozisyon yok",
+                         text_color="gray", font=ctk.CTkFont(size=10)).pack(side="left", padx=10)
             return
 
-        symbol = pos.get("symbol", "--")
-        side = pos.get("side", "--")
-        entry = pos.get("entry_price", 0)
-        sl = pos.get("sl", 0)
-        tp = pos.get("tp", 0)
-        trailing = pos.get("trailing", 0)
-        hold_sec = pos.get("hold_seconds", 0)
+        widths = [90, 50, 40, 80, 80, 70, 60, 55]
+        for pos in positions:
+            row_frame = ctk.CTkFrame(self._pos_scroll, fg_color="transparent")
+            row_frame.pack(fill="x", pady=1)
+            self._pos_rows.append(row_frame)
 
-        fmt = ".6f" if entry < 1 else ".2f"
+            symbol = pos.get("symbol", "--")
+            side = pos.get("side", "--")
+            entry = pos.get("entry_price", 0)
+            sl = pos.get("sl", 0)
+            trailing = pos.get("trailing", 0)
+            hold_sec = pos.get("hold_seconds", 0)
+            lev = pos.get("leverage", 1)
+            margin = pos.get("margin_usdt", 0)
 
-        self._pos_labels["Sembol"].configure(text=symbol)
-        side_color = "#00C853" if "Buy" in side else "#FF1744"
-        self._pos_labels["Yon"].configure(text=side, text_color=side_color)
-        self._pos_labels["Giris"].configure(text=f"{entry:{fmt}}")
-        self._pos_labels["SL"].configure(text=f"{sl:{fmt}}", text_color="#FF1744")
-        self._pos_labels["TP"].configure(text=f"{tp:{fmt}}", text_color="#00C853")
+            fmt = ".6f" if entry < 1 else ".4f" if entry < 10 else ".2f"
+            side_short = "L" if "Buy" in side else "S"
+            side_color = "#00C853" if "Buy" in side else "#FF1744"
+            trail_color = "#FF9800" if pos.get("trailing_active") else "gray"
+            mins = int(hold_sec // 60)
+            secs = int(hold_sec % 60)
 
-        trail_color = "#FF9800" if pos.get("trailing_active") else "gray"
-        self._pos_labels["Trailing"].configure(text=f"{trailing:{fmt}}",
-                                                text_color=trail_color)
+            vals = [
+                (symbol, "white"),
+                (side_short, side_color),
+                (f"{lev}x", "#FF9800"),
+                (f"{entry:{fmt}}", "white"),
+                (f"{sl:{fmt}}", "#FF1744"),
+                (f"{trailing:{fmt}}", trail_color),
+                (f"{mins}m{secs:02d}s", "white"),
+                (f"${margin:.2f}", "white"),
+            ]
 
-        mins = int(hold_sec // 60)
-        secs = int(hold_sec % 60)
-        self._pos_labels["Sure"].configure(text=f"{mins}m{secs:02d}s")
-
-        # Leverage info
-        lev = pos.get("leverage", 1)
-        margin = pos.get("margin_usdt", 0)
-        liq = pos.get("liquidation_price", 0)
-
-        if lev > 1:
-            self._pos_labels["Lev"].configure(
-                text=f"{lev}x", text_color="#FF9800")
-            self._pos_labels["Marjin"].configure(
-                text=f"${margin:.2f}", text_color="white")
-            self._pos_labels["Liq"].configure(
-                text=f"{liq:{fmt}}", text_color="#FF1744")
-            self._pos_labels["ROI%"].configure(text="...")
-        else:
-            self._pos_labels["Lev"].configure(text="1x", text_color="gray")
-            self._pos_labels["Marjin"].configure(text="--", text_color="gray")
-            self._pos_labels["Liq"].configure(text="--", text_color="gray")
-            self._pos_labels["ROI%"].configure(text="--", text_color="gray")
-
-        # PnL will be updated via events or price refresh
-        self._pos_labels["Fiyat"].configure(text="...")
-        self._pos_labels["PnL"].configure(text="...")
-        self._pos_labels["PnL%"].configure(text="...")
+            for (val, color), w in zip(vals, widths):
+                ctk.CTkLabel(row_frame, text=val, width=w,
+                             font=ctk.CTkFont(size=10),
+                             text_color=color).pack(side="left", padx=2)
 
     def _update_trade(self) -> None:
         trade = self.controller.get_last_trade()

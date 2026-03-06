@@ -142,52 +142,71 @@ class ScannerScorer:
         regime_name = r.regime.get("regime", "UNKNOWN")
         trend_dir = r.regime.get("trend_direction", "NONE")
 
-        # === ATR vs LEVERAGE filter (scientific) ===
-        # Formula: liq = (1/L) * 85%, SL = liq * 65%, max_atr = SL / 2
-        # Coin's 1m ATR must be below max_atr or we WILL get liquidated
+        # === READ STRATEGY CONFIG ===
+        strat = self._config.get("strategy", {})
         max_lev = self._config.get("leverage.max_leverage", 100)
+        high_leverage = max_lev >= 50
+
+        # ATR vs LEVERAGE: 1-candle ATR should be <50% of liq distance
         if max_lev > 1 and r.atr_percent > 0:
-            liq_pct = (1.0 / max_lev) * 100.0 * 0.85
-            sl_pct = liq_pct * 0.65
-            max_safe_atr_pct = sl_pct / 2.0
+            target_atr_pct = (1.0 / max_lev) * 100.0 * 0.25
+            max_safe_atr_pct = target_atr_pct * 2.0
             if r.atr_percent > max_safe_atr_pct:
                 return False, (f"atr_too_volatile_{max_lev}x "
                                f"(1m ATR={r.atr_percent:.3f}% > "
                                f"safe={max_safe_atr_pct:.3f}%)")
 
-        # === VOLATILE regime is instant death at high leverage ===
-        if regime_name == "VOLATILE" and max_lev >= 50:
+        # VOLATILE regime filter
+        if strat.get("volatile_filter", True) and regime_name == "VOLATILE" and high_leverage:
             return False, "volatile_regime_high_leverage"
 
+        # === CONFIGURABLE THRESHOLDS ===
+        min_conf = strat.get("min_confluence", 4.0)
+        min_adx = strat.get("min_adx", 18 if high_leverage else 15)
+        max_rsi_long = strat.get("max_rsi_long", 62 if high_leverage else 65)
+        min_rsi_short = strat.get("min_rsi_short", 38 if high_leverage else 35)
+        use_macd = strat.get("macd_filter", True)
+        use_volume = strat.get("volume_filter", True)
+
         if r.direction == "LONG":
-            # LONG filters
-            if conf_score < 4.0:
-                return False, f"confluence_low ({conf_score:.1f})"
-            if r.rsi > 65:
+            if conf_score < min_conf:
+                return False, f"confluence_low ({conf_score:.1f}, need {min_conf}+)"
+            if r.rsi > max_rsi_long:
                 return False, f"rsi_overbought ({r.rsi:.0f})"
-            if r.adx < 15:
-                return False, f"adx_too_low ({r.adx:.0f})"
+            if r.adx < min_adx:
+                return False, f"adx_too_low ({r.adx:.0f}, need {min_adx}+)"
 
             # Volume confirmation
-            obv_slope = r.indicator_values.get("OBV_slope", 0)
-            cmf = r.indicator_values.get("CMF", 0)
-            if obv_slope <= 0 and cmf <= 0:
-                return False, "no_volume_confirmation"
+            if use_volume:
+                obv_slope = r.indicator_values.get("OBV_slope", 0)
+                cmf = r.indicator_values.get("CMF", 0)
+                if obv_slope <= 0 and cmf <= 0:
+                    return False, "no_volume_confirmation"
+
+            # MACD filter
+            if use_macd and high_leverage:
+                macd_h = r.indicator_values.get("MACD_histogram", 0)
+                if macd_h <= 0:
+                    return False, f"macd_not_bullish ({macd_h:.4f})"
 
         else:
-            # SHORT filters
-            if conf_score > -4.0:
-                return False, f"confluence_high ({conf_score:.1f})"
-            if r.rsi < 35:
+            if conf_score > -min_conf:
+                return False, f"confluence_high ({conf_score:.1f}, need -{min_conf})"
+            if r.rsi < min_rsi_short:
                 return False, f"rsi_oversold ({r.rsi:.0f})"
-            if r.adx < 15:
-                return False, f"adx_too_low ({r.adx:.0f})"
+            if r.adx < min_adx:
+                return False, f"adx_too_low ({r.adx:.0f}, need {min_adx}+)"
 
-            # Volume confirmation (negative)
-            obv_slope = r.indicator_values.get("OBV_slope", 0)
-            cmf = r.indicator_values.get("CMF", 0)
-            if obv_slope >= 0 and cmf >= 0:
-                return False, "no_volume_confirmation"
+            if use_volume:
+                obv_slope = r.indicator_values.get("OBV_slope", 0)
+                cmf = r.indicator_values.get("CMF", 0)
+                if obv_slope >= 0 and cmf >= 0:
+                    return False, "no_volume_confirmation"
+
+            if use_macd and high_leverage:
+                macd_h = r.indicator_values.get("MACD_histogram", 0)
+                if macd_h >= 0:
+                    return False, f"macd_not_bearish ({macd_h:.4f})"
 
         return True, ""
 

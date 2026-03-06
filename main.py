@@ -11,6 +11,7 @@ from core.app_controller import AppController
 from market.market_data_service import MarketDataService
 from automation.binance_app import BinanceApp
 from automation.order_executor import OrderExecutor
+from automation.api_order_executor import ApiOrderExecutor
 from automation.pair_switcher import PairSwitcher
 from indicators.indicator_engine import IndicatorEngine
 from strategy.strategy_engine import StrategyEngine
@@ -64,30 +65,64 @@ def main():
     order_logger = OrderLogger("data/crypthos.db")
     controller.set_order_logger(order_logger)
 
-    # UI Automation (connect to Binance Desktop)
-    binance_app = BinanceApp()
-    controller.set_binance_app(binance_app)
+    # Trading mode: API or UI automation
+    use_api = config.get("trading.use_api", False)
+    api_key = config.get_api_key()
+    api_secret = config.get_api_secret()
 
-    order_executor = OrderExecutor(binance_app, event_bus)
-    controller.set_order_executor(order_executor)
+    if use_api and api_key and api_secret:
+        # API mode — no Binance Desktop needed, works in background
+        logger.info("Trading mode: API (background)")
+        rest_client = BinanceRestClient(api_key=api_key, api_secret=api_secret)
 
-    pair_switcher = PairSwitcher(binance_app, event_bus)
-    controller.set_pair_switcher(pair_switcher)
+        # Test API connection
+        api_executor = ApiOrderExecutor(rest_client, event_bus)
+        if not api_executor.test_connection():
+            logger.error("API connection failed! Check .env keys. "
+                         "Falling back to UI mode.")
+            use_api = False
 
-    # Scanner (crypto screener state machine)
-    rest_client = BinanceRestClient()
-    symbol_info_cache = SymbolInfoCache(rest_client)
-    scanner = ScannerStateMachine(config, event_bus, rest_client,
-                                  symbol_info_cache=symbol_info_cache)
-    scanner.set_order_executor(order_executor)
-    scanner.set_pair_switcher(pair_switcher)
-    scanner.set_market_service(market_service)
-    scanner.set_risk_manager(risk_manager)
-    scanner.set_binance_app(binance_app)
-    controller.set_scanner(scanner)
+    if use_api and api_key and api_secret:
+        symbol_info_cache = SymbolInfoCache(rest_client)
+        scanner = ScannerStateMachine(config, event_bus, rest_client,
+                                      symbol_info_cache=symbol_info_cache)
+        scanner.set_order_executor(api_executor)
+        scanner.set_risk_manager(risk_manager)
+        controller.set_scanner(scanner)
+
+        # In API mode, skip Binance Desktop entirely — no window needed
+        logger.info("Binance Desktop not needed in API mode, skipping UI automation")
+    else:
+        # Legacy UI automation mode
+        logger.info("Trading mode: UI automation (Binance Desktop required)")
+        rest_client = BinanceRestClient()
+
+        binance_app = BinanceApp()
+        controller.set_binance_app(binance_app)
+
+        order_executor = OrderExecutor(binance_app, event_bus)
+        controller.set_order_executor(order_executor)
+
+        pair_switcher = PairSwitcher(binance_app, event_bus)
+        controller.set_pair_switcher(pair_switcher)
+
+        symbol_info_cache = SymbolInfoCache(rest_client)
+        scanner = ScannerStateMachine(config, event_bus, rest_client,
+                                      symbol_info_cache=symbol_info_cache)
+        scanner.set_order_executor(order_executor)
+        scanner.set_pair_switcher(pair_switcher)
+        scanner.set_market_service(market_service)
+        scanner.set_risk_manager(risk_manager)
+        scanner.set_binance_app(binance_app)
+        controller.set_scanner(scanner)
 
     # Start services
     controller.start()
+
+    # Auto-start scanner if enabled
+    if config.get("scanner.auto_start", True):
+        scanner.start()
+        logger.info("Scanner auto-started")
 
     # Register kill switch hotkey
     kill_switch.register()

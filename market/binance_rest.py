@@ -1,3 +1,8 @@
+import time
+import hmac
+import hashlib
+from urllib.parse import urlencode
+
 import requests
 import pandas as pd
 from loguru import logger
@@ -7,9 +12,16 @@ from core.constants import BINANCE_FUTURES_REST
 class BinanceRestClient:
     BASE_URL = BINANCE_FUTURES_REST
 
-    def __init__(self, session: requests.Session = None):
+    def __init__(self, session: requests.Session = None,
+                 api_key: str = "", api_secret: str = ""):
         self._session = session or requests.Session()
         self._session.headers.update({"Accept": "application/json"})
+        self._api_key = api_key
+        self._api_secret = api_secret
+        if api_key:
+            self._session.headers["X-MBX-APIKEY"] = api_key
+
+    # ─── public (unauthenticated) ─────────────────────────────
 
     def _get(self, endpoint: str, params: dict = None) -> dict | list:
         url = f"{self.BASE_URL}{endpoint}"
@@ -68,10 +80,93 @@ class BinanceRestClient:
         """Get 24h ticker data for ALL symbols in one request."""
         return self._get("/fapi/v1/ticker/24hr")
 
-    def get_leverage_bracket(self, symbol: str) -> list:
-        """Get leverage brackets for a symbol from /fapi/v1/leverageBracket."""
+    # ─── authenticated (signed) ───────────────────────────────
+
+    def _sign(self, params: dict) -> dict:
+        """Add timestamp and HMAC-SHA256 signature to params."""
+        params["timestamp"] = int(time.time() * 1000)
+        query = urlencode(params)
+        sig = hmac.new(
+            self._api_secret.encode(), query.encode(), hashlib.sha256
+        ).hexdigest()
+        params["signature"] = sig
+        return params
+
+    def _signed_get(self, endpoint: str, params: dict = None) -> dict | list:
+        params = self._sign(params or {})
+        url = f"{self.BASE_URL}{endpoint}"
+        resp = self._session.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _signed_post(self, endpoint: str, params: dict = None) -> dict | list:
+        params = self._sign(params or {})
+        url = f"{self.BASE_URL}{endpoint}"
+        resp = self._session.post(url, params=params, timeout=10)
+        if resp.status_code >= 400:
+            try:
+                err_body = resp.json()
+                logger.error(f"API error {resp.status_code}: {err_body}")
+            except Exception:
+                logger.error(f"API error {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+        return resp.json()
+
+    def _signed_delete(self, endpoint: str, params: dict = None) -> dict | list:
+        params = self._sign(params or {})
+        url = f"{self.BASE_URL}{endpoint}"
+        resp = self._session.delete(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ─── account & positions ──────────────────────────────────
+
+    def get_account(self) -> dict:
+        """GET /fapi/v2/account — full account info with balances & positions."""
+        return self._signed_get("/fapi/v2/account")
+
+    def get_balance(self) -> float:
+        """Return available USDT balance."""
+        data = self._signed_get("/fapi/v2/balance")
+        for asset in data:
+            if asset.get("asset") == "USDT":
+                return float(asset.get("availableBalance", 0))
+        return 0.0
+
+    def get_positions(self, symbol: str = None) -> list:
+        """GET /fapi/v2/positionRisk — open positions."""
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        return self._signed_get("/fapi/v2/positionRisk", params)
+
+    # ─── leverage & margin ────────────────────────────────────
+
+    def set_leverage(self, symbol: str, leverage: int) -> dict:
+        """POST /fapi/v1/leverage"""
+        return self._signed_post("/fapi/v1/leverage", {
+            "symbol": symbol,
+            "leverage": leverage,
+        })
+
+    def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> dict:
+        """POST /fapi/v1/marginType — ISOLATED or CROSSED."""
         try:
-            data = self._get("/fapi/v1/leverageBracket", {"symbol": symbol})
+            return self._signed_post("/fapi/v1/marginType", {
+                "symbol": symbol,
+                "marginType": margin_type,
+            })
+        except requests.HTTPError as e:
+            # -4046: "No need to change margin type" — already set
+            err_str = str(e)
+            if "4046" in err_str or "400" in err_str:
+                return {"msg": "already_set"}
+            raise
+
+    def get_leverage_bracket(self, symbol: str) -> list:
+        """Get leverage brackets (authenticated)."""
+        try:
+            data = self._signed_get("/fapi/v1/leverageBracket", {"symbol": symbol})
             if isinstance(data, list) and data:
                 return data[0].get("brackets", [])
             return []
@@ -81,10 +176,7 @@ class BinanceRestClient:
 
     def get_max_leverage(self, symbol: str, notional: float = 100.0,
                          fallback: int = 75) -> int:
-        """Return the max available leverage for a given notional size.
-        Note: leverageBracket endpoint requires API key. If unavailable,
-        returns fallback value (most coins support 75x for small positions).
-        """
+        """Return the max available leverage for a given notional size."""
         try:
             brackets = self.get_leverage_bracket(symbol)
             if not brackets:
@@ -99,3 +191,108 @@ class BinanceRestClient:
         except Exception as e:
             logger.warning(f"Failed to get max leverage for {symbol}: {e}")
         return fallback
+
+    # ─── orders ───────────────────────────────────────────────
+
+    # Conditional order types that must use Algo Order API (since 2025-12-09)
+    _ALGO_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP",
+                   "TAKE_PROFIT", "TRAILING_STOP_MARKET"}
+
+    def place_order(self, symbol: str, side: str, order_type: str = "MARKET",
+                    quantity: float = None, price: float = None,
+                    stop_price: float = None, close_position: bool = False,
+                    reduce_only: bool = False,
+                    time_in_force: str = None) -> dict:
+        """Place a new order. Automatically routes conditional orders
+        (STOP_MARKET, TAKE_PROFIT_MARKET etc.) to Algo Order API.
+
+        side: "BUY" or "SELL"
+        order_type: "MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"
+        """
+        if order_type in self._ALGO_TYPES:
+            return self._place_algo_order(
+                symbol, side, order_type, quantity, price,
+                stop_price, close_position)
+
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "newOrderRespType": "RESULT",
+        }
+        if quantity is not None:
+            params["quantity"] = str(quantity)
+        if price is not None:
+            params["price"] = str(price)
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if time_in_force:
+            params["timeInForce"] = time_in_force
+        elif order_type == "LIMIT":
+            params["timeInForce"] = "GTC"
+
+        return self._signed_post("/fapi/v1/order", params)
+
+    def _place_algo_order(self, symbol: str, side: str, order_type: str,
+                          quantity: float = None, price: float = None,
+                          trigger_price: float = None,
+                          close_position: bool = False) -> dict:
+        """POST /fapi/v1/algoOrder — conditional orders (SL/TP).
+        Binance migrated these from /fapi/v1/order on 2025-12-09."""
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+        }
+        if trigger_price is not None:
+            params["triggerPrice"] = str(trigger_price)
+        if quantity is not None and not close_position:
+            params["quantity"] = str(quantity)
+        if price is not None:
+            params["price"] = str(price)
+        if close_position:
+            params["closePosition"] = "true"
+
+        return self._signed_post("/fapi/v1/algoOrder", params)
+
+    def cancel_all_orders(self, symbol: str) -> dict:
+        """Cancel all open orders (regular + algo) for a symbol."""
+        # Cancel regular orders
+        try:
+            self._signed_delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
+        except Exception:
+            pass
+        # Cancel algo/conditional orders (SL/TP)
+        try:
+            algo_orders = self.get_algo_open_orders(symbol)
+            for o in algo_orders:
+                algo_id = o.get("algoId")
+                if algo_id:
+                    self.cancel_algo_order(algo_id)
+                    logger.debug(f"Cancelled algo order {algo_id} for {symbol}")
+        except Exception:
+            pass
+        return {"msg": "ok"}
+
+    def get_open_orders(self, symbol: str = None) -> list:
+        """GET /fapi/v1/openOrders — regular orders."""
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        return self._signed_get("/fapi/v1/openOrders", params)
+
+    def get_algo_open_orders(self, symbol: str = None) -> list:
+        """GET /fapi/v1/openAlgoOrders — active conditional orders (SL/TP)."""
+        try:
+            params = {}
+            if symbol:
+                params["symbol"] = symbol
+            data = self._signed_get("/fapi/v1/openAlgoOrders", params)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def cancel_algo_order(self, algo_id: int) -> dict:
+        """DELETE /fapi/v1/algoOrder — cancel a single algo order."""
+        return self._signed_delete("/fapi/v1/algoOrder", {"algoId": algo_id})

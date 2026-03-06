@@ -17,6 +17,9 @@ debug_*.py
 # Config with sensitive data
 # config.json  (keeping it for now since no API keys)
 
+# Environment variables (API keys)
+.env
+
 # OS
 Thumbs.db
 .DS_Store

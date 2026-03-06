@@ -74,6 +74,14 @@ class ScannerStateMachine:
         self._failed_symbols: dict[str, float] = {}  # symbol -> fail timestamp
         self._failed_cooldown = 300  # skip failed symbols for 5 minutes
 
+        # Anti-churning: track trade frequency
+        self._trade_timestamps: list[float] = []
+        self._max_trades_per_hour = config.get("scanner.max_trades_per_hour", 12)
+
+        # Close retry tracking: symbol -> {"count": int, "next_retry": float}
+        self._close_retries: dict[str, dict] = {}
+        self._max_close_retries = 5
+
     # ──── Setters ────
 
     def set_order_executor(self, executor) -> None:
@@ -96,6 +104,10 @@ class ScannerStateMachine:
     def start(self) -> None:
         if self._running:
             return
+
+        # Sync existing API positions before starting
+        self._sync_api_positions()
+
         self._running = True
         self._thread = threading.Thread(target=self._main_loop, daemon=True,
                                         name="ScannerStateMachine")
@@ -193,20 +205,27 @@ class ScannerStateMachine:
         }
 
         eligible = [r for r in results if r.eligible]
-        min_score = self._config.get("scanner.min_buy_score", 60)
+        min_score = self._config.get("scanner.min_buy_score", 70)
 
-        candidate = None
+        # Log top 5 scores for debugging (eligible or not)
+        for i, r in enumerate(results[:5]):
+            logger.info(f"  #{i+1} {r.symbol}: score={r.score:+.1f} "
+                        f"dir={r.direction} eligible={r.eligible} "
+                        f"reject={r.reject_reason or '-'}")
+        if eligible:
+            logger.info(f"  Eligible: {len(eligible)} symbols, "
+                        f"top={eligible[0].symbol} score={eligible[0].score:+.1f}")
+
+        # Collect all valid candidates (not just the first one)
+        candidates = []
         for r in eligible:
             if abs(r.score) >= min_score:
-                # Skip recently failed
                 if r.symbol in self._failed_symbols:
                     logger.debug(f"Skipping {r.symbol} (recently failed)")
                     continue
-                # Skip already held
                 if self._position_mgr.is_holding(r.symbol):
                     continue
-                candidate = r
-                break
+                candidates.append(r)
 
         # Publish scan results for GUI
         self._event_bus.publish(EventType.SCANNER_UPDATE, {
@@ -222,21 +241,62 @@ class ScannerStateMachine:
                  "confluence": r.confluence.get("score", 0)}
                 for r in results[:5]
             ],
-            "candidate": candidate.symbol if candidate else None,
+            "candidate": candidates[0].symbol if candidates else None,
         })
 
-        if candidate and self._position_mgr.has_capacity:
-            self._last_candidate = candidate
-            logger.info(f"Candidate found: {candidate.symbol} "
-                        f"score={candidate.score:+.1f} dir={candidate.direction} "
-                        f"regime={candidate.regime.get('regime')} "
-                        f"confluence={candidate.confluence.get('score', 0):+.1f}")
-            self._transition(ScannerState.BUYING)
+        close_only = self._config.get("scanner.close_only", False)
+        if close_only:
+            if self._position_mgr.has_position:
+                logger.info(f"Close-only mode: monitoring {self._position_mgr.position_count} position(s), no new trades")
+            else:
+                logger.info("Close-only mode: no positions left, waiting...")
+            scan_interval = self._config.get("scanner.scan_interval_seconds", 30)
+            self._wait(scan_interval)
+            return
+
+        if candidates and self._position_mgr.has_capacity:
+            # Check available margin before attempting buys
+            real_balance = 0.0
+            if self._order_executor and hasattr(self._order_executor, "get_balance"):
+                try:
+                    real_balance = self._order_executor.get_balance()
+                except Exception:
+                    pass
+            if real_balance > 0 and real_balance < 1.0:
+                logger.info(f"Available balance too low ({real_balance:.2f}$), waiting for positions to close")
+                scan_interval = self._config.get("scanner.scan_interval_seconds", 30)
+                self._wait(scan_interval)
+                return
+
+            # Buy as many candidates as we have capacity for
+            bought_any = False
+            for candidate in candidates:
+                if not self._position_mgr.has_capacity:
+                    break
+                if not self._check_trade_frequency():
+                    break
+
+                logger.info(f"Candidate found: {candidate.symbol} "
+                            f"score={candidate.score:+.1f} dir={candidate.direction} "
+                            f"regime={candidate.regime.get('regime')} "
+                            f"confluence={candidate.confluence.get('score', 0):+.1f}")
+                self._last_candidate = candidate
+                if self._do_buying_inline():
+                    bought_any = True
+                else:
+                    break  # likely margin issue, stop trying
+
+            # Short wait then scan again if still have capacity
+            if self._position_mgr.has_capacity and bought_any:
+                self._wait(5)
+            else:
+                scan_interval = self._config.get("scanner.scan_interval_seconds", 30)
+                self._wait(scan_interval)
         else:
             if not self._position_mgr.has_capacity:
                 logger.info(f"Max positions reached ({self._position_mgr.position_count}/"
                             f"{self._position_mgr.max_positions}). Monitoring only.")
-            scan_interval = self._config.get("scanner.scan_interval_seconds", 60)
+            scan_interval = self._config.get("scanner.scan_interval_seconds", 30)
             self._wait(scan_interval)
 
     # ──── Focus Mode Monitoring ────
@@ -338,18 +398,23 @@ class ScannerStateMachine:
 
         success = True
         if self._order_executor:
-            # Switch to the symbol first
-            if self._pair_switcher:
-                self._pair_switcher.switch_to(symbol)
-                time.sleep(2)
-
-            success = self._order_executor.execute_order(
-                symbol=symbol, side=close_side, order_type=OrderType.MARKET,
-                size=pos.size, reduce_only=True,
-                qty_precision=3,
-            )
+            # API mode: close directly, no pair switching needed
+            if hasattr(self._order_executor, "close_position"):
+                success = self._order_executor.close_position(
+                    symbol, pos.side, pos.size)
+            else:
+                # Legacy UI mode
+                if self._pair_switcher:
+                    self._pair_switcher.switch_to(symbol)
+                    time.sleep(2)
+                success = self._order_executor.execute_order(
+                    symbol=symbol, side=close_side, order_type=OrderType.MARKET,
+                    size=pos.size, reduce_only=True,
+                    qty_precision=3,
+                )
 
         if success:
+            self._close_retries.pop(symbol, None)  # Clear retry counter on success
             result = self._position_mgr.close_position(symbol, exit_price, reason)
             self._last_trade_result = result
 
@@ -364,16 +429,57 @@ class ScannerStateMachine:
 
             self._event_bus.publish(EventType.TRADE_RESULT, result)
         else:
-            logger.error(f"Failed to close {symbol}, will retry next cycle")
+            # Track retry count with exponential backoff
+            retry_info = self._close_retries.get(symbol, {"count": 0})
+            retry_info["count"] += 1
+            backoff = min(2 ** retry_info["count"], 60)  # 2s, 4s, 8s, 16s, 32s, 60s
+            retry_info["next_retry"] = time.time() + backoff
+            self._close_retries[symbol] = retry_info
+
+            if retry_info["count"] >= self._max_close_retries:
+                logger.error(f"Failed to close {symbol} after {retry_info['count']} attempts, "
+                             f"removing from tracking (position may have been closed by exchange)")
+                # Force-remove from position manager
+                result = self._position_mgr.close_position(symbol, exit_price, reason + "_FORCED")
+                self._last_trade_result = result
+                self._event_bus.publish(EventType.TRADE_RESULT, result)
+                self._close_retries.pop(symbol, None)
+            else:
+                logger.error(f"Failed to close {symbol}, retry {retry_info['count']}/{self._max_close_retries} "
+                             f"(next in {backoff}s)")
 
     # ──── BUYING State ────
 
+    def _check_trade_frequency(self) -> bool:
+        """Check if we've exceeded the hourly trade limit."""
+        now = time.time()
+        self._trade_timestamps = [t for t in self._trade_timestamps
+                                  if now - t < 3600]
+        if len(self._trade_timestamps) >= self._max_trades_per_hour:
+            logger.info(f"Trade frequency limit reached: "
+                        f"{len(self._trade_timestamps)}/{self._max_trades_per_hour} "
+                        f"trades in last hour. Waiting...")
+            return False
+        return True
+
     def _do_buying(self) -> None:
-        """Switch pair and place order, then return to SCANNING."""
-        candidate = self._last_candidate
-        if not candidate:
+        """Place order via API (legacy state machine entry), then return to SCANNING."""
+        if not self._last_candidate:
             self._transition(ScannerState.SCANNING)
             return
+        if not self._check_trade_frequency():
+            self._transition(ScannerState.SCANNING)
+            scan_interval = self._config.get("scanner.scan_interval_seconds", 30)
+            self._wait(scan_interval)
+            return
+        self._do_buying_inline()
+        self._transition(ScannerState.SCANNING)
+
+    def _do_buying_inline(self) -> bool:
+        """Place order for self._last_candidate. Returns True on success."""
+        candidate = self._last_candidate
+        if not candidate:
+            return False
 
         symbol = candidate.symbol
         price = candidate.price
@@ -382,39 +488,14 @@ class ScannerStateMachine:
 
         side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
 
-        # 0. Ensure Binance Desktop is visible and ready
-        if self._binance_app:
-            ready = self._binance_app.ensure_visible(min_elements=300)
-            if not ready:
-                logger.warning("Binance Desktop not ready, retrying in 30s")
-                time.sleep(30)
-                self._transition(ScannerState.SCANNING)
-                return
-
-        # 1. Switch pair on Binance Desktop
-        if self._pair_switcher:
-            logger.info(f"Switching to {symbol}...")
-            success = self._pair_switcher.switch_to(symbol)
-            if not success:
-                logger.error(f"Failed to switch to {symbol}, skipping for {self._failed_cooldown}s")
-                self._failed_symbols[symbol] = time.time()
-                self._transition(ScannerState.SCANNING)
-                return
-            time.sleep(2)
-
-        # 2. Switch market data service
-        if self._market_service:
-            self._market_service.switch_symbol(symbol)
-            time.sleep(1)
-
-        # 3. Get fresh price
+        # 1. Get fresh price from API
         try:
             ticker = self._rest.get_ticker_price(symbol)
             price = float(ticker.get("price", price))
         except Exception:
             pass
 
-        # 4. Determine leverage mode
+        # 2. Determine leverage mode
         lev_enabled = self._config.get("leverage.enabled", False)
         leverage = None
         margin_usdt = None
@@ -424,19 +505,18 @@ class ScannerStateMachine:
             min_lev = self._config.get("leverage.min_leverage", 10)
             max_lev = self._config.get("leverage.max_leverage", 125)
 
-            # Read REAL available balance from Binance UI
+            # Read balance from API (or executor)
             real_balance = 0.0
-            if self._binance_app:
+            if self._order_executor and hasattr(self._order_executor, "get_balance"):
                 try:
-                    real_balance = self._binance_app.read_available_balance()
+                    real_balance = self._order_executor.get_balance()
                 except Exception as e:
-                    logger.warning(f"Could not read UI balance: {e}")
+                    logger.warning(f"Could not read API balance: {e}")
 
             # Position sizing mode: "percentage" or "fixed"
             sizing_mode = self._config.get("leverage.position_sizing", "fixed")
             if sizing_mode == "percentage":
                 portfolio_pct = self._config.get("leverage.portfolio_percent", 25)
-                # Use real balance from UI if available, else fallback to config
                 if real_balance > 0:
                     available = real_balance
                 else:
@@ -446,7 +526,6 @@ class ScannerStateMachine:
                     used_margin = self._position_mgr.get_total_margin()
                     available = balance - used_margin
 
-                # Calculate: portfolio % of available balance
                 margin_usdt = round(available * portfolio_pct / 100.0, 2)
 
                 # Minimum 1$ margin rule
@@ -456,10 +535,8 @@ class ScannerStateMachine:
                     else:
                         logger.warning(f"Balance too low: {available:.2f}$ "
                                        f"(need at least 1$)")
-                        self._transition(ScannerState.SCANNING)
-                        return
+                        return False
 
-                # Don't exceed what's actually available
                 if real_balance > 0 and margin_usdt > real_balance * 0.95:
                     margin_usdt = round(real_balance * 0.95, 2)
 
@@ -470,10 +547,12 @@ class ScannerStateMachine:
                 max_pos = self._config.get("leverage.max_position_usdt", 50.0)
                 if margin_usdt > max_pos:
                     margin_usdt = max_pos
-                # Don't exceed real available balance
                 if real_balance > 0 and margin_usdt > real_balance * 0.95:
                     margin_usdt = round(real_balance * 0.95, 2)
                     logger.info(f"Margin capped to {margin_usdt}$ (avbl={real_balance}$)")
+                if margin_usdt < 1.0:
+                    logger.warning(f"Available margin too low: {margin_usdt}$ (need 1$+, avbl={real_balance}$)")
+                    return False
 
             # Get qty precision from symbol info cache
             qty_precision = 3
@@ -485,41 +564,15 @@ class ScannerStateMachine:
                 except Exception as e:
                     logger.warning(f"SymbolInfo fetch failed for {symbol}: {e}")
 
-            # Read actual max leverage from Binance UI
-            ui_max = 0
-            if self._binance_app:
-                try:
-                    ui_max = self._binance_app.get_ui_max_leverage()
-                    logger.info(f"{symbol} UI max leverage: {ui_max}x")
-                except Exception as e:
-                    logger.warning(f"Failed to read UI leverage for {symbol}: {e}")
-
-            if ui_max > 0:
-                available_max = ui_max
-            else:
-                # Fallback: read current leverage button value
-                btn_lev = 0
-                if self._binance_app:
-                    try:
-                        btn = self._binance_app.get_leverage_button()
-                        match = re.search(r"(\d+)x", btn.element_info.name or "")
-                        if match:
-                            btn_lev = int(match.group(1))
-                    except Exception:
-                        pass
-                if btn_lev > 0:
-                    available_max = btn_lev
-                    logger.info(f"Using current leverage button: {btn_lev}x")
-                else:
-                    available_max = max_lev
-                    logger.warning(f"Could not read UI max leverage, using config: {max_lev}x")
+            # Get max leverage from API (authenticated — accurate)
+            available_max = self._rest.get_max_leverage(symbol, margin_usdt * max_lev)
+            logger.info(f"{symbol} API max leverage: {available_max}x")
 
             if available_max < min_lev:
                 logger.warning(f"{symbol} max leverage {available_max}x < "
                                f"min required {min_lev}x, skipping")
                 self._failed_symbols[symbol] = time.time()
-                self._transition(ScannerState.SCANNING)
-                return
+                return False
 
             leverage = min(max_lev, available_max)
 
@@ -548,8 +601,7 @@ class ScannerStateMachine:
                     logger.warning(f"{symbol} min notional {min_notional}$ needs "
                                    f"{needed_margin:.2f}$ margin (max {max_allowed}$), skipping")
                     self._failed_symbols[symbol] = time.time()
-                    self._transition(ScannerState.SCANNING)
-                    return
+                    return False
 
             size_qty = round(notional_usdt / price,
                              qty_precision) if price > 0 else 0
@@ -577,18 +629,21 @@ class ScannerStateMachine:
                     logger.warning(f"{symbol} min qty {min_qty} needs "
                                    f"{needed_margin:.2f}$ margin, skipping")
                     self._failed_symbols[symbol] = time.time()
-                    self._transition(ScannerState.SCANNING)
-                    return
+                    return False
 
-            # TP/SL as ROI% for Binance UI
-            sl_price_pct = self._config.get("leverage.sl_percent", 0.7)
-            tp_price_pct = self._config.get("leverage.tp_percent", 1.5)
-            sl_roi = round(sl_price_pct * leverage, 1)
-            tp_roi = round(tp_price_pct * leverage, 1)
+            # Dynamic SL/TP from leverage (dual-layer protection)
+            # Katman 1: Server SL at 50% of liq distance
+            # Katman 2: Emergency software close at 80% (in position_manager)
+            liq_pct = (1.0 / leverage) * 0.85
+            sl_price_pct = liq_pct * 0.50
+            tp_price_pct = liq_pct * 3.0  # safety net, trailing does real work
+            sl_roi = round(sl_price_pct * leverage * 100, 1)
+            tp_roi = round(tp_price_pct * leverage * 100, 1)
 
             logger.info(f"LEVERAGE: {leverage}x margin={margin_usdt}$ "
                         f"notional={notional_usdt:.1f}$ qty={size_qty} "
-                        f"SL_ROI={sl_roi}% TP_ROI={tp_roi}%")
+                        f"SL={sl_price_pct*100:.2f}%(ROI-{sl_roi}%) "
+                        f"Emergency@80%liq")
         else:
             # Legacy non-leverage sizing
             if self._risk_manager:
@@ -606,7 +661,7 @@ class ScannerStateMachine:
             sl_roi = sl_pct
             tp_roi = tp_pct
 
-        # 5. Validate order
+        # 3. Validate order
         if self._risk_manager:
             valid, reason = self._risk_manager.validate_order(
                 size_qty, price, symbol,
@@ -616,10 +671,9 @@ class ScannerStateMachine:
             if not valid:
                 logger.warning(f"Order rejected: {reason}")
                 self._failed_symbols[symbol] = time.time()
-                self._transition(ScannerState.SCANNING)
-                return
+                return False
 
-        # 6. Execute order
+        # 4. Execute order
         lev_str = f" LEV={leverage}x" if leverage else ""
         logger.info(f"Placing order: {side.value} {size_qty} {symbol} @ {price:.6f}"
                     f"{lev_str} TP_ROI={tp_roi:.1f}% SL_ROI={sl_roi:.1f}%")
@@ -637,10 +691,9 @@ class ScannerStateMachine:
             if not success:
                 logger.error("Order execution failed")
                 self._failed_symbols[symbol] = time.time()
-                self._transition(ScannerState.SCANNING)
-                return
+                return False
 
-        # 7. Open position tracking
+        # 5. Open position tracking
         self._position_mgr.open_position(
             symbol, side, price, size_qty, atr,
             leverage=leverage if lev_enabled else 1,
@@ -653,8 +706,9 @@ class ScannerStateMachine:
                 margin_usdt=margin_usdt if lev_enabled else None,
             )
 
-        # Go back to scanning (can open more positions)
-        self._transition(ScannerState.SCANNING)
+        # Record trade timestamp for frequency limiter
+        self._trade_timestamps.append(time.time())
+        return True
 
     # ──── SELLING State (legacy, for manual sells) ────
 
@@ -675,7 +729,7 @@ class ScannerStateMachine:
     # ──── COOLDOWN State ────
 
     def _do_cooldown(self) -> None:
-        cooldown = self._config.get("scanner.cooldown_after_sell_seconds", 10)
+        cooldown = self._config.get("scanner.cooldown_after_sell_seconds", 120)
         logger.info(f"Cooldown: {cooldown}s before next scan...")
         self._wait(cooldown)
         self._transition(ScannerState.SCANNING)
@@ -683,10 +737,10 @@ class ScannerStateMachine:
     # ──── Position Monitor (fast check thread) ────
 
     def _position_monitor_loop(self) -> None:
-        """Separate thread that checks positions every 3 seconds.
-        This is critical for high-leverage positions where liquidation
-        can happen faster than the scan cycle."""
-        check_interval = 2  # seconds (fast for high leverage)
+        """Separate thread that checks positions every 1 second.
+        Critical for anti-liquidation: detects emergency close level
+        before Binance can liquidate."""
+        check_interval = 1  # 1 second — anti-liquidation speed
         logger.info("Position monitor thread started")
         while self._running:
             try:
@@ -712,6 +766,11 @@ class ScannerStateMachine:
                         symbol, current_price)
 
                     if exit_reason != "HOLD":
+                        # Check if we're in backoff period for this symbol
+                        retry_info = self._close_retries.get(symbol)
+                        if retry_info and time.time() < retry_info.get("next_retry", 0):
+                            continue  # Skip until backoff expires
+
                         logger.warning(
                             f"[MONITOR] Exit signal for {symbol}: "
                             f"{exit_reason} @ {current_price:.6f}")
@@ -723,6 +782,116 @@ class ScannerStateMachine:
             except Exception as e:
                 logger.error(f"Position monitor error: {e}")
                 time.sleep(5)
+
+    # ──── API Position Sync ────
+
+    def _sync_api_positions(self) -> None:
+        """On startup, sync any existing API positions into the position manager.
+        This way the program tracks positions that were opened before restart."""
+        if not self._order_executor or not hasattr(self._order_executor, 'get_open_positions'):
+            return
+
+        try:
+            api_positions = self._order_executor.get_open_positions()
+            if not api_positions:
+                logger.info("No existing API positions to sync")
+                return
+
+            for p in api_positions:
+                symbol = p.get("symbol", "")
+                amt = float(p.get("positionAmt", 0))
+                entry_price = float(p.get("entryPrice", 0))
+                leverage = int(p.get("leverage", 1))
+                margin = float(p.get("isolatedWallet", 0))
+
+                if amt == 0 or entry_price == 0:
+                    continue
+
+                side = OrderSide.BUY_LONG if amt > 0 else OrderSide.SELL_SHORT
+                size = abs(amt)
+
+                # Get ATR for this symbol
+                atr = 0.0
+                try:
+                    interval = self._config.get("indicators.kline_interval", "1m")
+                    klines = self._rest.get_klines(symbol, interval, limit=50)
+                    if klines is not None and len(klines) > 14:
+                        from indicators.indicator_engine import IndicatorEngine
+                        eng = IndicatorEngine(self._config)
+                        indicators = eng.compute_all(klines)
+                        atr = indicators.get("ATR", 0)
+                except Exception:
+                    pass
+
+                # Open position in manager (will set SL/TP/trailing)
+                self._position_mgr.open_position(
+                    symbol, side, entry_price, size, atr,
+                    leverage=leverage,
+                    margin_usdt=margin,
+                )
+                logger.info(f"Synced API position: {symbol} {side.value} "
+                            f"qty={size} entry={entry_price} lev={leverage}x "
+                            f"margin={margin:.2f}")
+
+            logger.info(f"Synced {len(api_positions)} API position(s)")
+
+            # Update TP/SL for synced positions with fee-aware values
+            self._update_synced_tp_sl()
+
+        except Exception as e:
+            logger.error(f"Failed to sync API positions: {e}")
+
+    def _update_synced_tp_sl(self) -> None:
+        """Update TP/SL orders for synced positions using fee-aware calculations."""
+        if not self._order_executor or not hasattr(self._order_executor, 'update_tp_sl'):
+            return
+
+        battle_mode = self._config.get("scanner.battle_mode", False)
+
+        for symbol, pos in self._position_mgr._positions.items():
+            if pos.leverage <= 1:
+                continue
+
+            lev = pos.leverage
+            liq_pct = (1.0 / lev) * 0.85
+
+            entry_side = "BUY" if pos.side == OrderSide.BUY_LONG else "SELL"
+
+            if battle_mode:
+                # Battle mode: emergency SL only, NO TP
+                sl_price_pct = liq_pct * 0.65
+                sl_roi = round(sl_price_pct * lev * 100, 1)
+                try:
+                    self._order_executor.update_tp_sl(
+                        symbol=symbol,
+                        entry_side=entry_side,
+                        qty=pos.size,
+                        entry_price=pos.entry_price,
+                        leverage=lev,
+                        tp_roi_pct=None,
+                        sl_roi_pct=sl_roi,
+                    )
+                    logger.info(f"Battle mode: SL only for {symbol}: SL_ROI={sl_roi}% (no TP)")
+                except Exception as e:
+                    logger.warning(f"Failed to update SL for {symbol}: {e}")
+            else:
+                sl_price_pct = liq_pct * 0.50
+                tp_price_pct = liq_pct * 3.0
+                sl_roi = round(sl_price_pct * lev * 100, 1)
+                tp_roi = round(tp_price_pct * lev * 100, 1)
+                try:
+                    self._order_executor.update_tp_sl(
+                        symbol=symbol,
+                        entry_side=entry_side,
+                        qty=pos.size,
+                        entry_price=pos.entry_price,
+                        leverage=lev,
+                        tp_roi_pct=tp_roi,
+                        sl_roi_pct=sl_roi,
+                    )
+                    logger.info(f"Updated TP/SL for {symbol}: SL_ROI={sl_roi}% TP_ROI={tp_roi}%")
+                except Exception as e:
+                    logger.warning(f"Failed to update TP/SL for {symbol}: {e}")
 
     # ──── Helpers ────
 

@@ -9,6 +9,7 @@ from gui.panels.market_panel import MarketPanel
 from gui.panels.activity_panel import ActivityPanel
 from gui.panels.settings_panel import SettingsPanel
 from gui.panels.scanner_panel import ScannerPanel
+from gui.panels.strategy_settings_panel import StrategySettingsPanel
 
 
 class MainWindow(ctk.CTk):
@@ -37,6 +38,7 @@ class MainWindow(ctk.CTk):
         tab_quick = self._tabview.add("Hizli Emir")
         tab_market = self._tabview.add("Piyasa")
         tab_strategy = self._tabview.add("Strateji")
+        tab_strat_settings = self._tabview.add("Strateji Ayarlari")
         tab_activity = self._tabview.add("Aktivite")
         tab_settings = self._tabview.add("Ayarlar")
 
@@ -44,6 +46,7 @@ class MainWindow(ctk.CTk):
         self._quick_panel = QuickOrderPanel(tab_quick, controller)
         self._market_panel = MarketPanel(tab_market, controller)
         self._strategy_panel = StrategyPanel(tab_strategy, controller)
+        self._strategy_settings_panel = StrategySettingsPanel(tab_strat_settings, controller)
         self._activity_panel = ActivityPanel(tab_activity, controller)
         self._settings_panel = SettingsPanel(tab_settings, controller)
 
@@ -123,8 +126,12 @@ class MainWindow(ctk.CTk):
                     indicator_values = self.controller.indicator_engine.compute_all(klines)
 
             # Update status bar
-            binance_connected = (self.controller.binance_app and
-                                 self.controller.binance_app.is_connected)
+            use_api = self.controller.config.get("trading.use_api", False)
+            if use_api:
+                binance_connected = True  # API mode — always connected
+            else:
+                binance_connected = (self.controller.binance_app and
+                                     self.controller.binance_app.is_connected)
             ws_connected = (self.controller.market_service and
                             self.controller.market_service._ws.is_connected)
             strategy_running = (self.controller.strategy_engine and

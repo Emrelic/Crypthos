@@ -240,6 +240,11 @@ class AppController:
             return self.scanner.get_position_info()
         return {}
 
+    def get_all_scanner_positions(self) -> list[dict]:
+        if self.scanner:
+            return self.scanner.get_all_positions()
+        return []
+
     def get_last_trade(self) -> dict:
         if self.scanner:
             return self.scanner.get_last_trade()

@@ -3,6 +3,12 @@ import os
 import copy
 from loguru import logger
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv optional, can use env vars directly
+
 
 DEFAULT_CONFIG = {
     "active_symbol": "DOGEUSDT",
@@ -99,6 +105,12 @@ class ConfigManager:
                 d[k] = {}
             d = d[k]
         d[keys[-1]] = value
+
+    def get_api_key(self) -> str:
+        return os.environ.get("BINANCE_API_KEY", "")
+
+    def get_api_secret(self) -> str:
+        return os.environ.get("BINANCE_API_SECRET", "")
 
     @property
     def config(self) -> dict:

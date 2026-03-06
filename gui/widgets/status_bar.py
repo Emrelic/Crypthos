@@ -54,10 +54,28 @@ class StatusBar(ctk.CTkFrame):
         self._kill_btn.pack(side="right", padx=10)
 
     def _on_reconnect(self) -> None:
-        """Force reconnect to Binance Desktop."""
+        """Force reconnect — API test or Binance Desktop."""
         self._conn_label.configure(text="  Baglaniyor...", text_color="yellow")
         self.update()
-        if self.controller.binance_app:
+        use_api = getattr(self.controller, 'config', None)
+        api_mode = use_api.get("trading.use_api", False) if use_api else False
+        if api_mode:
+            # API mode: test API connection
+            try:
+                from automation.api_order_executor import ApiOrderExecutor
+                scanner = self.controller.scanner
+                if scanner and hasattr(scanner, '_order_executor'):
+                    executor = scanner._order_executor
+                    if hasattr(executor, 'test_connection') and executor.test_connection():
+                        self._conn_label.configure(
+                            text="  API Connected", text_color="green")
+                    else:
+                        self._conn_label.configure(text="  API BASARISIZ", text_color="red")
+                else:
+                    self._conn_label.configure(text="  API not configured", text_color="red")
+            except Exception:
+                self._conn_label.configure(text="  API BASARISIZ", text_color="red")
+        elif self.controller.binance_app:
             success = self.controller.binance_app.refresh_connection()
             if success:
                 count = len(self.controller.binance_app._descendants)
@@ -83,7 +101,10 @@ class StatusBar(ctk.CTkFrame):
         self._change_label.configure(text=f"{change_pct:+.2f}%", text_color=color)
 
         if binance_connected:
-            self._conn_label.configure(text="  Connected", text_color="green")
+            use_api = getattr(self.controller, 'config', None)
+            api_mode = use_api.get("trading.use_api", False) if use_api else False
+            label = "  API Connected" if api_mode else "  Connected"
+            self._conn_label.configure(text=label, text_color="green")
         else:
             self._conn_label.configure(text="  Disconnected", text_color="red")
 

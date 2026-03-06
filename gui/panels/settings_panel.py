@@ -146,21 +146,30 @@ class SettingsPanel(ctk.CTkFrame):
         # Initial state
         self._on_sizing_mode_change()
 
-        # TP/SL settings
-        self._section_sub(scroll, "TP / SL Ayarlari")
-        self._field(scroll, "lev_sl", "SL Fiyat Hareketi %",
-                    str(lev.get("sl_percent", 0.7)))
-        self._field(scroll, "lev_tp", "TP Fiyat Hareketi %",
-                    str(lev.get("tp_percent", 1.5)))
-
-        # Trailing stop
-        self._section_sub(scroll, "Trailing Stop")
-        self._field(scroll, "lev_trail_act", "Aktivasyon %",
-                    str(lev.get("trailing_activation_pct", 0.5)))
-        self._field(scroll, "lev_trail_dist", "Mesafe %",
-                    str(lev.get("trailing_distance_pct", 0.3)))
+        # SL/TP info (dynamic, calculated from leverage)
+        self._section_sub(scroll, "SL / TP (Otomatik)")
+        info_text = ("SL/TP kaldiractan otomatik hesaplanir:\n"
+                     "  SL = Likid. mesafesi x %60\n"
+                     "  Trailing: ROI %20'de aktif, %10 mesafe\n"
+                     "  Fee: kaldirac x %0.1 (100x = %10 marjin)")
+        ctk.CTkLabel(scroll, text=info_text, text_color="gray60",
+                     font=ctk.CTkFont(size=11), justify="left").pack(
+            anchor="w", padx=30, pady=4)
         self._field(scroll, "lev_max_hold", "Max Tutma (dk)",
                     str(lev.get("max_hold_minutes", 60)))
+
+        # Trading mode
+        self._section_sub(scroll, "Islem Modu")
+        use_api = self.controller.config.get("trading.use_api", False)
+        self._checkbox(scroll, "use_api", "API Modu (arka plan, Binance Desktop gerekmez)",
+                       use_api)
+        auto_start = self.controller.config.get("scanner.auto_start", True)
+        self._checkbox(scroll, "auto_start", "Otomatik Baslat (program acilinca scanner baslar)",
+                       auto_start)
+        close_only = self.controller.config.get("scanner.close_only", False)
+        self._checkbox(scroll, "close_only",
+                       "Sadece Kapat Modu (yeni pozisyon acma, mevcutlari kapat)",
+                       close_only)
 
         # ═══════════════════════════════════════════════════════
         # RISK
@@ -289,19 +298,14 @@ class SettingsPanel(ctk.CTkFrame):
         c.set("leverage.max_position_usdt",
               float(self._entries["max_pos_lev"].get() or 50.0))
 
-        # TP/SL
-        c.set("leverage.sl_percent",
-              float(self._entries["lev_sl"].get() or 0.7))
-        c.set("leverage.tp_percent",
-              float(self._entries["lev_tp"].get() or 1.5))
-
-        # Trailing
-        c.set("leverage.trailing_activation_pct",
-              float(self._entries["lev_trail_act"].get() or 0.5))
-        c.set("leverage.trailing_distance_pct",
-              float(self._entries["lev_trail_dist"].get() or 0.3))
+        # Max hold
         c.set("leverage.max_hold_minutes",
               int(self._entries["lev_max_hold"].get() or 60))
+
+        # Trading mode
+        c.set("trading.use_api", self._entries["use_api"].get())
+        c.set("scanner.auto_start", self._entries["auto_start"].get())
+        c.set("scanner.close_only", self._entries["close_only"].get())
 
         # Risk
         c.set("risk.initial_balance",
