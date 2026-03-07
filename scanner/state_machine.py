@@ -278,7 +278,7 @@ class ScannerStateMachine:
                     real_balance = self._order_executor.get_balance()
                 except Exception:
                     pass
-            if real_balance > 0 and real_balance < 1.0:
+            if real_balance > 0 and real_balance < 0.90:
                 logger.info(f"Available balance too low ({real_balance:.2f}$), waiting for positions to close")
                 scan_interval = self._config.get("scanner.scan_interval_seconds", 30)
                 self._wait(scan_interval)

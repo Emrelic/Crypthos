@@ -83,6 +83,15 @@ def main():
             use_api = False
 
     if use_api and api_key and api_secret:
+        # Sync risk manager with real API balance
+        try:
+            real_bal = api_executor.get_balance()
+            if real_bal > 0:
+                risk_manager.update_balance(real_bal)
+                logger.info(f"Risk manager synced with API balance: {real_bal:.2f} USDT")
+        except Exception as e:
+            logger.warning(f"Could not sync risk manager balance: {e}")
+
         symbol_info_cache = SymbolInfoCache(rest_client)
         scanner = ScannerStateMachine(config, event_bus, rest_client,
                                       symbol_info_cache=symbol_info_cache)

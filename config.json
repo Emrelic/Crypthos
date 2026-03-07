@@ -17,7 +17,7 @@
     "confirm_above_usdt": 20.0,
     "default_tp_percent": 5.0,
     "default_sl_percent": 2.0,
-    "initial_balance": 1.35,
+    "initial_balance": 4.0,
     "daily_loss_limit_usdt": 5.0,
     "max_drawdown_percent": 20.0,
     "max_consecutive_losses": 5,
