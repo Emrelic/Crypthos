@@ -98,8 +98,8 @@ PRESETS = {
             "max_rsi_long": 62, "min_rsi_short": 38,
             "macd_filter": True, "volume_filter": True, "volatile_filter": True,
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
-            # Kaldirac: 100x hedef
-            "min_leverage": 75, "max_leverage": 100,
+            # Kaldirac: max mumkun (20x bile olsa ac)
+            "min_leverage": 1, "max_leverage": 100,
             # Pozisyon: 4 cephede, 1/12 portfoy
             "max_positions": 4, "portfolio_percent": 8, "portfolio_divider": 12,
             # SL: pratik liq %70, SL %50 (= %0.35 at 100x)

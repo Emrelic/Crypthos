@@ -564,9 +564,12 @@ class ScannerStateMachine:
                     available = balance - used_margin
 
                 # Emre Ortalama: portfolio_divider (1/N of balance)
-                # Falls back to portfolio_percent if divider not set
+                # Below 12 USDT: dynamic divider = floor(balance), min 1 USDT per position
+                # Above 12 USDT: use configured divider (default 12)
                 divider = self._config.get("strategy.portfolio_divider", 0)
                 if divider > 0:
+                    if available < 12.0:
+                        divider = max(1, int(available))
                     margin_usdt = round(available / divider, 2)
                     sizing_label = f"1/{divider}"
                 else:
