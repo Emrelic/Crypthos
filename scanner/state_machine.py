@@ -554,7 +554,6 @@ class ScannerStateMachine:
             # Position sizing mode: "percentage" or "fixed"
             sizing_mode = self._config.get("leverage.position_sizing", "fixed")
             if sizing_mode == "percentage":
-                portfolio_pct = self._config.get("leverage.portfolio_percent", 25)
                 if real_balance > 0:
                     available = real_balance
                 else:
@@ -564,21 +563,30 @@ class ScannerStateMachine:
                     used_margin = self._position_mgr.get_total_margin()
                     available = balance - used_margin
 
-                margin_usdt = round(available * portfolio_pct / 100.0, 2)
+                # Emre Ortalama: portfolio_divider (1/N of balance)
+                # Falls back to portfolio_percent if divider not set
+                divider = self._config.get("strategy.portfolio_divider", 0)
+                if divider > 0:
+                    margin_usdt = round(available / divider, 2)
+                    sizing_label = f"1/{divider}"
+                else:
+                    portfolio_pct = self._config.get("leverage.portfolio_percent", 25)
+                    margin_usdt = round(available * portfolio_pct / 100.0, 2)
+                    sizing_label = f"{portfolio_pct}%"
 
                 # Minimum 1$ margin rule
                 if margin_usdt < 1.0:
-                    if available >= 1.0:
+                    if available >= 0.90:
                         margin_usdt = 1.0
                     else:
                         logger.warning(f"Balance too low: {available:.2f}$ "
-                                       f"(need at least 1$)")
+                                       f"(need at least 0.90$)")
                         return False
 
                 if real_balance > 0 and margin_usdt > real_balance * 0.95:
                     margin_usdt = round(real_balance * 0.95, 2)
 
-                logger.info(f"Position sizing: {portfolio_pct}% of "
+                logger.info(f"Position sizing: {sizing_label} of "
                             f"{available:.2f}$ = {margin_usdt}$ margin")
             else:
                 margin_usdt = self._config.get("leverage.margin_usdt", 1.0)

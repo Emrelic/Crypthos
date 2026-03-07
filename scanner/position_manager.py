@@ -353,37 +353,65 @@ class PositionManager:
         lev = pos.leverage
         fee_roi = 0.001 * lev * 100
         strat = self._config.get("strategy", {})
+        trailing_mode = strat.get("trailing_mode", "roi")
 
-        # Direct ROI values take priority
-        direct_activate = strat.get("trailing_activate_roi", 0)
-        direct_distance = strat.get("trailing_distance_roi", 0)
-        if direct_activate > 0 and direct_distance > 0:
-            activate_roi = direct_activate
-            trail_roi = direct_distance
+        if trailing_mode == "atr" and pos.atr_at_entry > 0:
+            atr = pos.atr_at_entry
+            activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
+            distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+            activate_price = atr * activate_mult
+            trail_distance = atr * distance_mult
+
+            if pos.side == OrderSide.BUY_LONG:
+                profit = price - pos.entry_price
+                if profit >= activate_price:
+                    if not pos.trailing_active:
+                        logger.info(f"[SAVAS] {pos.symbol} ATR trailing activated "
+                                    f"@ {profit/pos.entry_price*100:.3f}% move")
+                    pos.trailing_active = True
+                    new_trail = price - trail_distance
+                    if new_trail > pos.trailing_stop:
+                        pos.trailing_stop = new_trail
+            else:
+                profit = pos.entry_price - price
+                if profit >= activate_price:
+                    if not pos.trailing_active:
+                        logger.info(f"[SAVAS] {pos.symbol} ATR trailing activated "
+                                    f"@ {profit/pos.entry_price*100:.3f}% move")
+                    pos.trailing_active = True
+                    new_trail = price + trail_distance
+                    if new_trail < pos.trailing_stop:
+                        pos.trailing_stop = new_trail
         else:
-            activate_roi = fee_roi * 2.0   # 75x → 15% ROI
-            trail_roi = fee_roi * 4.0      # 75x → 30% ROI distance
+            direct_activate = strat.get("trailing_activate_roi", 0)
+            direct_distance = strat.get("trailing_distance_roi", 0)
+            if direct_activate > 0 and direct_distance > 0:
+                activate_roi = direct_activate
+                trail_roi = direct_distance
+            else:
+                activate_roi = fee_roi * 2.0
+                trail_roi = fee_roi * 4.0
 
-        trail_price_pct = trail_roi / (lev * 100)
+            trail_price_pct = trail_roi / (lev * 100)
 
-        if pos.side == OrderSide.BUY_LONG:
-            roi = (price - pos.entry_price) / pos.entry_price * lev * 100
-            if roi >= activate_roi:
-                if not pos.trailing_active:
-                    logger.info(f"[SAVAS] {pos.symbol} trailing activated @ ROI {roi:.1f}%")
-                pos.trailing_active = True
-                new_trail = price * (1 - trail_price_pct)
-                if new_trail > pos.trailing_stop:
-                    pos.trailing_stop = new_trail
-        else:
-            roi = (pos.entry_price - price) / pos.entry_price * lev * 100
-            if roi >= activate_roi:
-                if not pos.trailing_active:
-                    logger.info(f"[SAVAS] {pos.symbol} trailing activated @ ROI {roi:.1f}%")
-                pos.trailing_active = True
-                new_trail = price * (1 + trail_price_pct)
-                if new_trail < pos.trailing_stop:
-                    pos.trailing_stop = new_trail
+            if pos.side == OrderSide.BUY_LONG:
+                roi = (price - pos.entry_price) / pos.entry_price * lev * 100
+                if roi >= activate_roi:
+                    if not pos.trailing_active:
+                        logger.info(f"[SAVAS] {pos.symbol} trailing activated @ ROI {roi:.1f}%")
+                    pos.trailing_active = True
+                    new_trail = price * (1 - trail_price_pct)
+                    if new_trail > pos.trailing_stop:
+                        pos.trailing_stop = new_trail
+            else:
+                roi = (pos.entry_price - price) / pos.entry_price * lev * 100
+                if roi >= activate_roi:
+                    if not pos.trailing_active:
+                        logger.info(f"[SAVAS] {pos.symbol} trailing activated @ ROI {roi:.1f}%")
+                    pos.trailing_active = True
+                    new_trail = price * (1 + trail_price_pct)
+                    if new_trail < pos.trailing_stop:
+                        pos.trailing_stop = new_trail
 
     def _check_battle_trailing(self, pos: ActivePosition, price: float) -> bool:
         """Check if battle mode trailing stop is hit."""
@@ -469,46 +497,78 @@ class PositionManager:
 
     def _update_trailing(self, pos: ActivePosition, price: float) -> None:
         if pos.leverage > 1:
-            # ROI-based trailing stop for leverage positions
             lev = pos.leverage
             fee_roi = 0.001 * lev * 100
             strat = self._config.get("strategy", {})
+            trailing_mode = strat.get("trailing_mode", "roi")
 
-            # Direct ROI values take priority over fee multipliers
-            direct_activate = strat.get("trailing_activate_roi", 0)
-            direct_distance = strat.get("trailing_distance_roi", 0)
-            if direct_activate > 0 and direct_distance > 0:
-                activate_roi = direct_activate
-                trail_roi = direct_distance
+            if trailing_mode == "atr" and pos.atr_at_entry > 0:
+                # ATR-based trailing: activate at N*ATR profit, trail at M*ATR distance
+                atr = pos.atr_at_entry
+                activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
+                distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+                activate_price = atr * activate_mult
+                trail_distance = atr * distance_mult
+
+                if pos.side == OrderSide.BUY_LONG:
+                    profit = price - pos.entry_price
+                    if profit >= activate_price:
+                        if not pos.trailing_active:
+                            roi = profit / pos.entry_price * lev * 100
+                            logger.info(f"[{pos.symbol}] ATR trailing activated at "
+                                        f"{profit/pos.entry_price*100:.3f}% move "
+                                        f"(ROI {roi:.1f}%, {activate_mult}x ATR)")
+                        pos.trailing_active = True
+                        new_trail = price - trail_distance
+                        if new_trail > pos.trailing_stop:
+                            pos.trailing_stop = new_trail
+                else:
+                    profit = pos.entry_price - price
+                    if profit >= activate_price:
+                        if not pos.trailing_active:
+                            roi = profit / pos.entry_price * lev * 100
+                            logger.info(f"[{pos.symbol}] ATR trailing activated at "
+                                        f"{profit/pos.entry_price*100:.3f}% move "
+                                        f"(ROI {roi:.1f}%, {activate_mult}x ATR)")
+                        pos.trailing_active = True
+                        new_trail = price + trail_distance
+                        if new_trail < pos.trailing_stop:
+                            pos.trailing_stop = new_trail
             else:
-                activate_mult = strat.get("trailing_activate_fee_mult", 3.0)
-                distance_mult = strat.get("trailing_distance_fee_mult", 2.0)
-                activate_roi = fee_roi * activate_mult
-                trail_roi = fee_roi * distance_mult
+                # ROI-based trailing stop
+                direct_activate = strat.get("trailing_activate_roi", 0)
+                direct_distance = strat.get("trailing_distance_roi", 0)
+                if direct_activate > 0 and direct_distance > 0:
+                    activate_roi = direct_activate
+                    trail_roi = direct_distance
+                else:
+                    activate_mult = strat.get("trailing_activate_fee_mult", 3.0)
+                    distance_mult = strat.get("trailing_distance_fee_mult", 2.0)
+                    activate_roi = fee_roi * activate_mult
+                    trail_roi = fee_roi * distance_mult
 
-            # Convert ROI% to price%: price_pct = roi_pct / (leverage * 100)
-            trail_price_pct = trail_roi / (lev * 100)
+                trail_price_pct = trail_roi / (lev * 100)
 
-            if pos.side == OrderSide.BUY_LONG:
-                roi = (price - pos.entry_price) / pos.entry_price * lev * 100
-                if roi >= activate_roi:
-                    if not pos.trailing_active:
-                        logger.info(f"[{pos.symbol}] Trailing activated at ROI "
-                                    f"{roi:.1f}% (net {roi - fee_roi:.1f}%)")
-                    pos.trailing_active = True
-                    new_trail = price * (1 - trail_price_pct)
-                    if new_trail > pos.trailing_stop:
-                        pos.trailing_stop = new_trail
-            else:
-                roi = (pos.entry_price - price) / pos.entry_price * lev * 100
-                if roi >= activate_roi:
-                    if not pos.trailing_active:
-                        logger.info(f"[{pos.symbol}] Trailing activated at ROI "
-                                    f"{roi:.1f}% (net {roi - fee_roi:.1f}%)")
-                    pos.trailing_active = True
-                    new_trail = price * (1 + trail_price_pct)
-                    if new_trail < pos.trailing_stop:
-                        pos.trailing_stop = new_trail
+                if pos.side == OrderSide.BUY_LONG:
+                    roi = (price - pos.entry_price) / pos.entry_price * lev * 100
+                    if roi >= activate_roi:
+                        if not pos.trailing_active:
+                            logger.info(f"[{pos.symbol}] Trailing activated at ROI "
+                                        f"{roi:.1f}% (net {roi - fee_roi:.1f}%)")
+                        pos.trailing_active = True
+                        new_trail = price * (1 - trail_price_pct)
+                        if new_trail > pos.trailing_stop:
+                            pos.trailing_stop = new_trail
+                else:
+                    roi = (pos.entry_price - price) / pos.entry_price * lev * 100
+                    if roi >= activate_roi:
+                        if not pos.trailing_active:
+                            logger.info(f"[{pos.symbol}] Trailing activated at ROI "
+                                        f"{roi:.1f}% (net {roi - fee_roi:.1f}%)")
+                        pos.trailing_active = True
+                        new_trail = price * (1 + trail_price_pct)
+                        if new_trail < pos.trailing_stop:
+                            pos.trailing_stop = new_trail
         else:
             atr = pos.atr_at_entry
             activation_mult = self._config.get("scanner.trailing_activation_atr", 1.0)

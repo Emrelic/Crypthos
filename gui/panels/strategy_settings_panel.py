@@ -72,15 +72,51 @@ PRESETS = {
             "macd_filter": True, "volume_filter": True, "volatile_filter": True,
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_leverage": 50, "max_leverage": 100,
-            "max_positions": 6, "portfolio_percent": 25,
+            "max_positions": 6, "portfolio_percent": 25, "portfolio_divider": 0,
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "emergency_enabled": True, "emergency_liq_percent": 80,
-            "trailing_enabled": True,
+            "trailing_enabled": True, "trailing_mode": "roi",
+            "trailing_activate_roi": 60, "trailing_distance_roi": 10,
+            "trailing_atr_activate_mult": 4.0, "trailing_atr_distance_mult": 1.0,
             "trailing_activate_fee_mult": 2.0, "trailing_distance_fee_mult": 4.0,
             "tp_enabled": False, "tp_liq_multiplier": 3.0, "tp_exit_mode": "signal",
             "signal_exit_enabled": True, "signal_exit_threshold": 5.0,
             "signal_min_hold_seconds": 30, "signal_only_in_profit": True,
             "divergence_exit_enabled": False,
+            "time_limit_enabled": True, "time_limit_minutes": 480,
+            "time_limit_extend_trailing": True, "time_limit_extend_breakeven": True,
+            "cooldown_seconds": 60,
+        },
+    },
+    "emre_ortalama": {
+        "name": "Emre Ortalama",
+        "desc": "100x, 1/12 portfoy, ATR trailing (4x/1x), sinyal her zaman cikis",
+        "color": "#9C27B0",
+        "values": {
+            # Entry: agresif giris, guclu sinyal gerektir
+            "min_buy_score": 55, "min_confluence": 4.0, "min_adx": 18,
+            "max_rsi_long": 62, "min_rsi_short": 38,
+            "macd_filter": True, "volume_filter": True, "volatile_filter": True,
+            "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
+            # Kaldirac: 100x hedef
+            "min_leverage": 75, "max_leverage": 100,
+            # Pozisyon: 4 cephede, 1/12 portfoy
+            "max_positions": 4, "portfolio_percent": 8, "portfolio_divider": 12,
+            # SL: pratik liq %70, SL %50 (= %0.35 at 100x)
+            "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
+            "emergency_enabled": True, "emergency_liq_percent": 80,
+            # Trailing: ATR bazli (4x tetik, 1x geri cekilme)
+            "trailing_enabled": True, "trailing_mode": "atr",
+            "trailing_atr_activate_mult": 4.0, "trailing_atr_distance_mult": 1.0,
+            "trailing_activate_roi": 0, "trailing_distance_roi": 0,
+            "trailing_activate_fee_mult": 2.0, "trailing_distance_fee_mult": 4.0,
+            # TP: kapali, trailing ve sinyal yonetir
+            "tp_enabled": False, "tp_liq_multiplier": 3.0, "tp_exit_mode": "signal",
+            # Sinyal: HER ZAMAN cikis (zararda bile), override trailing
+            "signal_exit_enabled": True, "signal_exit_threshold": 5.0,
+            "signal_min_hold_seconds": 30, "signal_only_in_profit": False,
+            "divergence_exit_enabled": False,
+            # Zaman: 8 saat, trailing aktifse uzat
             "time_limit_enabled": True, "time_limit_minutes": 480,
             "time_limit_extend_trailing": True, "time_limit_extend_breakeven": True,
             "cooldown_seconds": 60,
@@ -237,6 +273,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
         self._field(s, "max_positions", "Max Esanli Pozisyon", "6")
         self._field(s, "portfolio_percent", "Portfoy Yuzdesi (%)", "25",
                     tip="Her pozisyon icin bakiyenin yuzde kaci kullanilsin")
+        self._field(s, "portfolio_divider", "Portfoy Boleni (1/N)", "0",
+                    tip="Bakiyenin 1/N'i (ornek: 12 = 1/12). 0=yuzde modu kullan")
 
         # ──────────────── STOP LOSS ────────────────
         self._section(s, "Stop Loss")
@@ -252,13 +290,35 @@ class StrategySettingsPanel(ctk.CTkFrame):
         # ──────────────── TRAILING STOP ────────────────
         self._section(s, "Iz Suren Stop (Trailing)")
         self._checkbox(s, "trailing_enabled", "Trailing Stop Aktif")
-        self._field(s, "trailing_activate_roi", "Aktivasyon ROI (%)", "0",
-                    tip="Dogrudan ROI% (ornek: 90 = %90 ROI'de basla). 0=fee carpani kullan")
-        self._field(s, "trailing_distance_roi", "Mesafe ROI (%)", "0",
-                    tip="Geri cekilme ROI% (ornek: 20 = %20 geri gelince sat). 0=fee carpani kullan")
-        self._field(s, "trailing_activate_fee_mult", "Aktivasyon (fee carpani)", "3.0",
+
+        # Trailing mode selector
+        row_tmode = ctk.CTkFrame(s, fg_color="transparent")
+        row_tmode.pack(fill="x", padx=20, pady=2)
+        ctk.CTkLabel(row_tmode, text="Trailing Modu:", width=240, anchor="w").pack(side="left")
+        self._trailing_mode_var = ctk.StringVar(value="roi")
+        tmode_seg = ctk.CTkSegmentedButton(
+            row_tmode, values=["atr", "roi"],
+            variable=self._trailing_mode_var,
+            font=ctk.CTkFont(size=11),
+        )
+        tmode_seg.pack(side="left", padx=5)
+        self._all_widgets.append((tmode_seg, "seg"))
+        ctk.CTkLabel(row_tmode, text="(atr=ATR bazli, roi=ROI bazli)",
+                     text_color="gray60", font=ctk.CTkFont(size=10)).pack(side="left", padx=5)
+
+        # ATR-based trailing fields
+        self._field(s, "trailing_atr_activate_mult", "ATR Aktivasyon (x ATR)", "4.0",
+                    tip="Kac ATR kar olunca trailing baslasin (4=konservatif, 5=agresif)")
+        self._field(s, "trailing_atr_distance_mult", "ATR Mesafe (x ATR)", "1.0",
+                    tip="Kac ATR geri cekilince sat (1=konservatif, 2=agresif)")
+        # ROI-based trailing fields
+        self._field(s, "trailing_activate_roi", "ROI Aktivasyon (%)", "0",
+                    tip="Dogrudan ROI% (ornek: 60 = %60 ROI'de basla). 0=fee carpani kullan")
+        self._field(s, "trailing_distance_roi", "ROI Mesafe (%)", "0",
+                    tip="Geri cekilme ROI% (ornek: 10 = %10 geri gelince sat). 0=fee carpani kullan")
+        self._field(s, "trailing_activate_fee_mult", "Fee Carpani Aktivasyon", "3.0",
                     tip="ROI=0 ise kullanilir. Kac x fee ROI'de trailing baslasin")
-        self._field(s, "trailing_distance_fee_mult", "Mesafe (fee carpani)", "2.0",
+        self._field(s, "trailing_distance_fee_mult", "Fee Carpani Mesafe", "2.0",
                     tip="ROI=0 ise kullanilir. Trailing mesafesi")
 
         # ──────────────── KAR HEDEFI ────────────────
@@ -432,6 +492,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
                 self._kline_var.set(val)
             elif key == "tp_exit_mode":
                 self._tp_mode_var.set(val)
+            elif key == "trailing_mode":
+                self._trailing_mode_var.set(val)
 
         self._update_info()
 
@@ -475,6 +537,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
         self._kline_var.set(kline)
         tp_mode = strat.get("tp_exit_mode", "immediate")
         self._tp_mode_var.set(tp_mode)
+        trailing_mode = strat.get("trailing_mode", "roi")
+        self._trailing_mode_var.set(trailing_mode)
 
         preset = strat.get("preset", "")
         self._preset_var.set(preset)
@@ -493,6 +557,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
             "preset": self._preset_var.get(),
             "kline_interval": self._kline_var.get(),
             "tp_exit_mode": self._tp_mode_var.get(),
+            "trailing_mode": self._trailing_mode_var.get(),
         }
 
         # Entries (numeric)
@@ -529,6 +594,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
         c.set("leverage.min_leverage", strat.get("min_leverage", 50))
         c.set("leverage.max_leverage", strat.get("max_leverage", 100))
         c.set("leverage.portfolio_percent", strat.get("portfolio_percent", 25))
+        c.set("strategy.portfolio_divider", strat.get("portfolio_divider", 0))
         c.set("leverage.max_hold_minutes", strat.get("time_limit_minutes", 480))
 
         c.save()
@@ -583,26 +649,50 @@ class StrategySettingsPanel(ctk.CTkFrame):
                     f"  TP:                      %{tp_price_pct:.2f} fiyat = %{tp_roi:.0f} ROI kar")
             else:
                 lines.append("  TP:                      KAPALI (trailing yonetir)")
-            # Check for direct ROI trailing
-            try:
-                direct_act = float(self._entries.get("trailing_activate_roi",
-                                   type("", (), {"get": lambda s: "0"})()).get() or 0)
-                direct_dist = float(self._entries.get("trailing_distance_roi",
-                                    type("", (), {"get": lambda s: "0"})()).get() or 0)
-            except (ValueError, AttributeError):
-                direct_act, direct_dist = 0, 0
-
-            if direct_act > 0 and direct_dist > 0:
+            # Trailing info based on mode
+            t_mode = self._trailing_mode_var.get()
+            if t_mode == "atr":
+                try:
+                    atr_act = float(self._entries.get("trailing_atr_activate_mult",
+                                    type("", (), {"get": lambda s: "4.0"})()).get() or 4.0)
+                    atr_dist = float(self._entries.get("trailing_atr_distance_mult",
+                                     type("", (), {"get": lambda s: "1.0"})()).get() or 1.0)
+                except (ValueError, AttributeError):
+                    atr_act, atr_dist = 4.0, 1.0
+                # ATR ref at 100x: SL/2 = 0.175%
+                atr_ref = sl_price_pct / 2  # half of SL = 1 ATR reference
+                act_pct = atr_ref * atr_act
+                dist_pct = atr_ref * atr_dist
+                act_roi = act_pct / 100 * max_lev * 100
+                dist_roi = dist_pct / 100 * max_lev * 100
                 lines.extend([
-                    f"  Trailing aktivasyon:     %{direct_act:.0f} ROI (sabit)",
-                    f"  Trailing mesafe:         %{direct_dist:.0f} ROI geri cekilme",
-                    f"  Min cikis:               %{direct_act - direct_dist:.0f} ROI garanti",
+                    f"  Trailing modu:           ATR bazli",
+                    f"  Trailing aktivasyon:     {atr_act}x ATR = %{act_pct:.3f} fiyat = %{act_roi:.0f} ROI",
+                    f"  Trailing mesafe:         {atr_dist}x ATR = %{dist_pct:.3f} fiyat = %{dist_roi:.0f} ROI geri",
+                    f"  Min cikis:               %{act_roi - dist_roi:.0f} ROI garanti",
                 ])
             else:
-                lines.extend([
-                    f"  Trailing aktivasyon:     %{trail_act_roi:.1f} ROI ({trail_act}x fee)",
-                    f"  Trailing mesafe:         %{trail_dist_roi:.1f} ROI ({trail_dist}x fee)",
-                ])
+                try:
+                    direct_act = float(self._entries.get("trailing_activate_roi",
+                                       type("", (), {"get": lambda s: "0"})()).get() or 0)
+                    direct_dist = float(self._entries.get("trailing_distance_roi",
+                                        type("", (), {"get": lambda s: "0"})()).get() or 0)
+                except (ValueError, AttributeError):
+                    direct_act, direct_dist = 0, 0
+
+                if direct_act > 0 and direct_dist > 0:
+                    lines.extend([
+                        f"  Trailing modu:           ROI bazli (sabit)",
+                        f"  Trailing aktivasyon:     %{direct_act:.0f} ROI",
+                        f"  Trailing mesafe:         %{direct_dist:.0f} ROI geri cekilme",
+                        f"  Min cikis:               %{direct_act - direct_dist:.0f} ROI garanti",
+                    ])
+                else:
+                    lines.extend([
+                        f"  Trailing modu:           ROI bazli (fee carpani)",
+                        f"  Trailing aktivasyon:     %{trail_act_roi:.1f} ROI ({trail_act}x fee)",
+                        f"  Trailing mesafe:         %{trail_dist_roi:.1f} ROI ({trail_dist}x fee)",
+                    ])
 
             self._info_label.configure(text="\n".join(lines))
         except (ValueError, ZeroDivisionError):
@@ -634,6 +724,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
             vals[key] = var.get()
         vals["kline_interval"] = self._kline_var.get()
         vals["tp_exit_mode"] = self._tp_mode_var.get()
+        vals["trailing_mode"] = self._trailing_mode_var.get()
         return vals
 
     def _apply_values(self, vals: dict) -> None:
@@ -650,6 +741,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
                 self._kline_var.set(val)
             elif key == "tp_exit_mode":
                 self._tp_mode_var.set(val)
+            elif key == "trailing_mode":
+                self._trailing_mode_var.set(val)
         self._update_info()
 
     def _refresh_template_list(self) -> None:
