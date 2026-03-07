@@ -106,8 +106,8 @@ class ScannerPanel(ctk.CTkFrame):
         # Position table header
         pos_hdr = ctk.CTkFrame(pos_frame)
         pos_hdr.pack(fill="x", padx=5)
-        pos_headers = ["Sembol", "Yon", "Lev", "Giris", "SL", "Trailing", "Sure", "Marjin"]
-        pos_widths = [90, 50, 40, 80, 80, 70, 60, 55]
+        pos_headers = ["Sembol", "Yon", "Lev", "TF", "Giris", "SL", "Trailing", "Sure", "Marjin"]
+        pos_widths = [90, 50, 40, 35, 80, 80, 70, 60, 55]
         for h, w in zip(pos_headers, pos_widths):
             ctk.CTkLabel(pos_hdr, text=h, width=w,
                          font=ctk.CTkFont(size=10, weight="bold"),
@@ -236,7 +236,7 @@ class ScannerPanel(ctk.CTkFrame):
                          text_color="gray", font=ctk.CTkFont(size=10)).pack(side="left", padx=10)
             return
 
-        widths = [90, 50, 40, 80, 80, 70, 60, 55]
+        widths = [90, 50, 40, 35, 80, 80, 70, 60, 55]
         for pos in positions:
             row_frame = ctk.CTkFrame(self._pos_scroll, fg_color="transparent")
             row_frame.pack(fill="x", pady=1)
@@ -250,6 +250,7 @@ class ScannerPanel(ctk.CTkFrame):
             hold_sec = pos.get("hold_seconds", 0)
             lev = pos.get("leverage", 1)
             margin = pos.get("margin_usdt", 0)
+            tf = pos.get("timeframe", "1m")
 
             fmt = ".6f" if entry < 1 else ".4f" if entry < 10 else ".2f"
             side_short = "L" if "Buy" in side else "S"
@@ -262,6 +263,7 @@ class ScannerPanel(ctk.CTkFrame):
                 (symbol, "white"),
                 (side_short, side_color),
                 (f"{lev}x", "#FF9800"),
+                (tf, "#2196F3"),
                 (f"{entry:{fmt}}", "white"),
                 (f"{sl:{fmt}}", "#FF1744"),
                 (f"{trailing:{fmt}}", trail_color),

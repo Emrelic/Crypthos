@@ -28,6 +28,7 @@ class ActivePosition:
     margin_usdt: float = 0.0
     liquidation_price: float = 0.0
     emergency_close_price: float = 0.0  # 80% of liq distance — last line of defense
+    timeframe: str = "1m"  # chart timeframe for this position's indicators
 
 
 class PositionManager:
@@ -84,7 +85,8 @@ class PositionManager:
     def open_position(self, symbol: str, side: OrderSide, price: float,
                       size: float, atr: float,
                       leverage: int = 1,
-                      margin_usdt: float = 0.0) -> ActivePosition:
+                      margin_usdt: float = 0.0,
+                      timeframe: str = "1m") -> ActivePosition:
         """Create and track a new position."""
         if symbol in self._positions:
             logger.warning(f"Already holding {symbol}, skipping duplicate")
@@ -97,11 +99,12 @@ class PositionManager:
             fee_pct = 0.001  # 0.1% round-trip
             fee_roi = fee_pct * leverage * 100
 
-            # Liquidation: (1/L) with 85% effective (maintenance margin eats rest)
-            liq_pct = (1.0 / leverage) * 0.85
-
             # Read from strategy config (with sensible defaults)
             strat = self._config.get("strategy", {})
+
+            # Liquidation: (1/L) with practical factor (maintenance margin eats rest)
+            liq_factor = strat.get("liq_factor", 70) / 100.0
+            liq_pct = (1.0 / leverage) * liq_factor
             sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
             emergency_liq_pct = strat.get("emergency_liq_percent", 80) / 100.0
             tp_liq_mult = strat.get("tp_liq_multiplier", 3.0)
@@ -159,6 +162,7 @@ class PositionManager:
             margin_usdt=margin_usdt if margin_usdt > 0 else size * price,
             liquidation_price=liq_price,
             emergency_close_price=emergency_price if lev_enabled else 0.0,
+            timeframe=timeframe,
         )
 
         self._positions[symbol] = pos
@@ -348,10 +352,17 @@ class PositionManager:
         """Battle mode trailing: very wide distance, lets profits run."""
         lev = pos.leverage
         fee_roi = 0.001 * lev * 100
+        strat = self._config.get("strategy", {})
 
-        # Activate at 2x fee, trail distance = 4x fee (very wide)
-        activate_roi = fee_roi * 2.0   # 75x → 15% ROI
-        trail_roi = fee_roi * 4.0      # 75x → 30% ROI distance
+        # Direct ROI values take priority
+        direct_activate = strat.get("trailing_activate_roi", 0)
+        direct_distance = strat.get("trailing_distance_roi", 0)
+        if direct_activate > 0 and direct_distance > 0:
+            activate_roi = direct_activate
+            trail_roi = direct_distance
+        else:
+            activate_roi = fee_roi * 2.0   # 75x → 15% ROI
+            trail_roi = fee_roi * 4.0      # 75x → 30% ROI distance
 
         trail_price_pct = trail_roi / (lev * 100)
 
@@ -462,10 +473,18 @@ class PositionManager:
             lev = pos.leverage
             fee_roi = 0.001 * lev * 100
             strat = self._config.get("strategy", {})
-            activate_mult = strat.get("trailing_activate_fee_mult", 3.0)
-            distance_mult = strat.get("trailing_distance_fee_mult", 2.0)
-            activate_roi = fee_roi * activate_mult
-            trail_roi = fee_roi * distance_mult
+
+            # Direct ROI values take priority over fee multipliers
+            direct_activate = strat.get("trailing_activate_roi", 0)
+            direct_distance = strat.get("trailing_distance_roi", 0)
+            if direct_activate > 0 and direct_distance > 0:
+                activate_roi = direct_activate
+                trail_roi = direct_distance
+            else:
+                activate_mult = strat.get("trailing_activate_fee_mult", 3.0)
+                distance_mult = strat.get("trailing_distance_fee_mult", 2.0)
+                activate_roi = fee_roi * activate_mult
+                trail_roi = fee_roi * distance_mult
 
             # Convert ROI% to price%: price_pct = roi_pct / (leverage * 100)
             trail_price_pct = trail_roi / (lev * 100)
@@ -713,4 +732,5 @@ class PositionManager:
             "margin_usdt": pos.margin_usdt,
             "liquidation_price": pos.liquidation_price,
             "emergency_price": pos.emergency_close_price,
+            "timeframe": pos.timeframe,
         }

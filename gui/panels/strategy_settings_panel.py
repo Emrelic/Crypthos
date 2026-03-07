@@ -1,6 +1,8 @@
 """Strategy Settings Panel - comprehensive strategy configuration with presets."""
+import json
+import os
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 
 # ── Standard Presets ──
 PRESETS = {
@@ -18,7 +20,7 @@ PRESETS = {
             "min_leverage": 10, "max_leverage": 25,
             "max_positions": 2, "portfolio_percent": 30,
             # SL
-            "sl_enabled": True, "sl_liq_percent": 40,
+            "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 40,
             "emergency_enabled": True, "emergency_liq_percent": 70,
             # Trailing
             "trailing_enabled": True,
@@ -47,7 +49,7 @@ PRESETS = {
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_leverage": 25, "max_leverage": 50,
             "max_positions": 4, "portfolio_percent": 25,
-            "sl_enabled": True, "sl_liq_percent": 50,
+            "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "emergency_enabled": True, "emergency_liq_percent": 80,
             "trailing_enabled": True,
             "trailing_activate_fee_mult": 3.0, "trailing_distance_fee_mult": 2.0,
@@ -71,7 +73,7 @@ PRESETS = {
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_leverage": 50, "max_leverage": 100,
             "max_positions": 6, "portfolio_percent": 25,
-            "sl_enabled": True, "sl_liq_percent": 50,
+            "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "emergency_enabled": True, "emergency_liq_percent": 80,
             "trailing_enabled": True,
             "trailing_activate_fee_mult": 2.0, "trailing_distance_fee_mult": 4.0,
@@ -85,6 +87,28 @@ PRESETS = {
         },
     },
 }
+
+
+TEMPLATES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "data", "strategy_templates.json")
+
+
+def _load_templates() -> dict:
+    """Load user templates from JSON file."""
+    if os.path.exists(TEMPLATES_FILE):
+        try:
+            with open(TEMPLATES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_templates(templates: dict) -> None:
+    """Save user templates to JSON file."""
+    os.makedirs(os.path.dirname(TEMPLATES_FILE), exist_ok=True)
+    with open(TEMPLATES_FILE, "w", encoding="utf-8") as f:
+        json.dump(templates, f, indent=2, ensure_ascii=False)
 
 
 class StrategySettingsPanel(ctk.CTkFrame):
@@ -217,8 +241,10 @@ class StrategySettingsPanel(ctk.CTkFrame):
         # ──────────────── STOP LOSS ────────────────
         self._section(s, "Stop Loss")
         self._checkbox(s, "sl_enabled", "Stop Loss Aktif")
-        self._field(s, "sl_liq_percent", "SL Yuzde (liq mesafesi %)", "50",
-                    tip="Likidasyon mesafesinin yuzde kacinda SL olsun (ornek: 50 = yaridaki mesafe)")
+        self._field(s, "liq_factor", "Pratik Liq Faktoru (%)", "70",
+                    tip="Teorik liq mesafesinin yuzde kaci pratik liq (Binance erken likide eder, 70=gercekci)")
+        self._field(s, "sl_liq_percent", "SL Yuzde (pratik liq %)", "50",
+                    tip="Pratik liq mesafesinin yuzde kacinda SL olsun (50 = yaridaki mesafe)")
         self._checkbox(s, "emergency_enabled", "Emergency Close (yazilim korumasi)")
         self._field(s, "emergency_liq_percent", "Emergency Yuzde (liq mesafesi %)", "80",
                     tip="Likidasyon mesafesinin yuzde kacinda acil kapat (SL'den sonra, son savunma)")
@@ -226,10 +252,14 @@ class StrategySettingsPanel(ctk.CTkFrame):
         # ──────────────── TRAILING STOP ────────────────
         self._section(s, "Iz Suren Stop (Trailing)")
         self._checkbox(s, "trailing_enabled", "Trailing Stop Aktif")
+        self._field(s, "trailing_activate_roi", "Aktivasyon ROI (%)", "0",
+                    tip="Dogrudan ROI% (ornek: 90 = %90 ROI'de basla). 0=fee carpani kullan")
+        self._field(s, "trailing_distance_roi", "Mesafe ROI (%)", "0",
+                    tip="Geri cekilme ROI% (ornek: 20 = %20 geri gelince sat). 0=fee carpani kullan")
         self._field(s, "trailing_activate_fee_mult", "Aktivasyon (fee carpani)", "3.0",
-                    tip="Kac x fee ROI'de trailing baslasin (3.0 = 75x'te %22.5 ROI)")
+                    tip="ROI=0 ise kullanilir. Kac x fee ROI'de trailing baslasin")
         self._field(s, "trailing_distance_fee_mult", "Mesafe (fee carpani)", "2.0",
-                    tip="Trailing mesafesi (2.0 = 75x'te %15 ROI mesafe)")
+                    tip="ROI=0 ise kullanilir. Trailing mesafesi")
 
         # ──────────────── KAR HEDEFI ────────────────
         self._section(s, "Kar Hedefi (Take Profit)")
@@ -289,12 +319,39 @@ class StrategySettingsPanel(ctk.CTkFrame):
 
         # ── Save / Reset buttons ──
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=10)
+        btn_frame.pack(fill="x", padx=10, pady=(5, 2))
         ctk.CTkButton(btn_frame, text="Kaydet", width=120, fg_color="#00C853",
                       hover_color="#00A846",
                       command=self._save).pack(side="left", padx=5)
         ctk.CTkButton(btn_frame, text="Sifirla (Varsayilan)", width=150,
                       fg_color="gray30", command=self._reset_to_default).pack(side="left", padx=5)
+
+        # ── Template system (visible in manuel mode) ──
+        self._tmpl_frame = ctk.CTkFrame(self, fg_color="#1a1a2e")
+        self._tmpl_frame.pack(fill="x", padx=10, pady=(2, 10))
+
+        ctk.CTkLabel(self._tmpl_frame, text="Sablonlar:",
+                     font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10, pady=8)
+
+        self._tmpl_var = ctk.StringVar(value="")
+        self._tmpl_menu = ctk.CTkOptionMenu(
+            self._tmpl_frame, variable=self._tmpl_var,
+            values=["(sablon sec)"], width=200,
+            command=self._on_template_select,
+        )
+        self._tmpl_menu.pack(side="left", padx=5, pady=8)
+
+        ctk.CTkButton(self._tmpl_frame, text="Yukle", width=80,
+                      fg_color="#2196F3", hover_color="#1976D2",
+                      command=self._load_template).pack(side="left", padx=3)
+        ctk.CTkButton(self._tmpl_frame, text="Kaydet", width=100,
+                      fg_color="#FF9800", hover_color="#F57C00",
+                      command=self._save_template).pack(side="left", padx=3)
+        ctk.CTkButton(self._tmpl_frame, text="Sil", width=60,
+                      fg_color="#FF1744", hover_color="#D50000",
+                      command=self._delete_template).pack(side="left", padx=3)
+
+        self._refresh_template_list()
 
     # ════════════════════════════════════════
     # UI HELPERS
@@ -493,13 +550,14 @@ class StrategySettingsPanel(ctk.CTkFrame):
         """Show calculated values based on current settings."""
         try:
             max_lev = int(self._entries["max_leverage"].get() or 100)
+            liq_f = int(self._entries["liq_factor"].get() or 70)
             sl_pct = int(self._entries["sl_liq_percent"].get() or 50)
             em_pct = int(self._entries["emergency_liq_percent"].get() or 80)
             tp_mult = float(self._entries["tp_liq_multiplier"].get() or 3.0)
             trail_act = float(self._entries["trailing_activate_fee_mult"].get() or 3.0)
             trail_dist = float(self._entries["trailing_distance_fee_mult"].get() or 2.0)
 
-            liq_dist = (1.0 / max_lev) * 0.85 * 100  # % price move to liq
+            liq_dist = (1.0 / max_lev) * (liq_f / 100.0) * 100  # % price move to liq
             fee_roi = 0.1 * max_lev  # fee as % of margin
 
             sl_price_pct = liq_dist * sl_pct / 100
@@ -510,9 +568,11 @@ class StrategySettingsPanel(ctk.CTkFrame):
             trail_act_roi = fee_roi * trail_act
             trail_dist_roi = fee_roi * trail_dist
 
+            theo_liq = (1.0 / max_lev) * 100
             lines = [
-                f"  {max_lev}x Kaldirac Hesaplamalari:",
-                f"  Likidasyon mesafesi:     %{liq_dist:.2f} fiyat hareketi",
+                f"  {max_lev}x Kaldirac Hesaplamalari (liq_factor=%{liq_f}):",
+                f"  Teorik liq:              %{theo_liq:.2f} geri gelme",
+                f"  Pratik liq:              %{liq_dist:.2f} fiyat hareketi",
                 f"  Fee (round-trip):        %{fee_roi:.1f} ROI (marjinin yuzde kaci)",
                 f"  Fee breakeven:           %{fee_roi/max_lev:.3f} fiyat hareketi",
                 f"  SL:                      %{sl_price_pct:.2f} fiyat = %{sl_roi:.0f} ROI kayip",
@@ -523,10 +583,26 @@ class StrategySettingsPanel(ctk.CTkFrame):
                     f"  TP:                      %{tp_price_pct:.2f} fiyat = %{tp_roi:.0f} ROI kar")
             else:
                 lines.append("  TP:                      KAPALI (trailing yonetir)")
-            lines.extend([
-                f"  Trailing aktivasyon:     %{trail_act_roi:.1f} ROI ({trail_act}x fee)",
-                f"  Trailing mesafe:         %{trail_dist_roi:.1f} ROI ({trail_dist}x fee)",
-            ])
+            # Check for direct ROI trailing
+            try:
+                direct_act = float(self._entries.get("trailing_activate_roi",
+                                   type("", (), {"get": lambda s: "0"})()).get() or 0)
+                direct_dist = float(self._entries.get("trailing_distance_roi",
+                                    type("", (), {"get": lambda s: "0"})()).get() or 0)
+            except (ValueError, AttributeError):
+                direct_act, direct_dist = 0, 0
+
+            if direct_act > 0 and direct_dist > 0:
+                lines.extend([
+                    f"  Trailing aktivasyon:     %{direct_act:.0f} ROI (sabit)",
+                    f"  Trailing mesafe:         %{direct_dist:.0f} ROI geri cekilme",
+                    f"  Min cikis:               %{direct_act - direct_dist:.0f} ROI garanti",
+                ])
+            else:
+                lines.extend([
+                    f"  Trailing aktivasyon:     %{trail_act_roi:.1f} ROI ({trail_act}x fee)",
+                    f"  Trailing mesafe:         %{trail_dist_roi:.1f} ROI ({trail_dist}x fee)",
+                ])
 
             self._info_label.configure(text="\n".join(lines))
         except (ValueError, ZeroDivisionError):
@@ -535,3 +611,119 @@ class StrategySettingsPanel(ctk.CTkFrame):
     def _show_feedback(self, msg: str, color: str = "white") -> None:
         self._feedback.configure(text=msg, text_color=color)
         self.after(5000, lambda: self._feedback.configure(text=""))
+
+    # ════════════════════════════════════════
+    # TEMPLATE SYSTEM
+    # ════════════════════════════════════════
+
+    def _collect_current_values(self) -> dict:
+        """Collect all current settings as a dict."""
+        vals = {}
+        for key, entry in self._entries.items():
+            entry.configure(state="normal")
+            raw = entry.get().strip()
+            if self._mode_var.get() == "standard":
+                entry.configure(state="disabled")
+            if not raw:
+                continue
+            try:
+                vals[key] = float(raw) if "." in raw else int(raw)
+            except ValueError:
+                vals[key] = raw
+        for key, var in self._cb_vars.items():
+            vals[key] = var.get()
+        vals["kline_interval"] = self._kline_var.get()
+        vals["tp_exit_mode"] = self._tp_mode_var.get()
+        return vals
+
+    def _apply_values(self, vals: dict) -> None:
+        """Apply a values dict to all fields."""
+        for key, val in vals.items():
+            if key in self._entries:
+                entry = self._entries[key]
+                entry.configure(state="normal")
+                entry.delete(0, "end")
+                entry.insert(0, str(val))
+            elif key in self._cb_vars:
+                self._cb_vars[key].set(val)
+            elif key == "kline_interval":
+                self._kline_var.set(val)
+            elif key == "tp_exit_mode":
+                self._tp_mode_var.set(val)
+        self._update_info()
+
+    def _refresh_template_list(self) -> None:
+        """Refresh the template dropdown with saved templates."""
+        templates = _load_templates()
+        names = list(templates.keys())
+        if names:
+            self._tmpl_menu.configure(values=names)
+            if self._tmpl_var.get() not in names:
+                self._tmpl_var.set(names[0])
+        else:
+            self._tmpl_menu.configure(values=["(sablon yok)"])
+            self._tmpl_var.set("(sablon yok)")
+
+    def _on_template_select(self, name: str) -> None:
+        pass  # just updates the variable
+
+    def _save_template(self) -> None:
+        """Save current settings as a named template."""
+        name = simpledialog.askstring(
+            "Sablon Kaydet",
+            "Sablon adi girin:",
+            parent=self,
+        )
+        if not name or not name.strip():
+            return
+        name = name.strip()
+
+        templates = _load_templates()
+        if name in templates:
+            overwrite = messagebox.askyesno(
+                "Sablon Mevcut",
+                f"'{name}' zaten var. Uzerine yazilsin mi?",
+            )
+            if not overwrite:
+                return
+
+        templates[name] = self._collect_current_values()
+        _save_templates(templates)
+        self._refresh_template_list()
+        self._tmpl_var.set(name)
+        self._show_feedback(f"Sablon '{name}' kaydedildi!", "#FF9800")
+
+    def _load_template(self) -> None:
+        """Load selected template into fields."""
+        name = self._tmpl_var.get()
+        templates = _load_templates()
+        if name not in templates:
+            self._show_feedback("Gecerli bir sablon secin", "#FF1744")
+            return
+
+        # Switch to manuel mode
+        self._mode_var.set("manuel")
+        self._on_mode_change("manuel")
+
+        self._apply_values(templates[name])
+        self._show_feedback(f"Sablon '{name}' yuklendi!", "#2196F3")
+
+    def _delete_template(self) -> None:
+        """Delete selected template."""
+        name = self._tmpl_var.get()
+        templates = _load_templates()
+        if name not in templates:
+            self._show_feedback("Silinecek sablon yok", "#FF1744")
+            return
+
+        confirm = messagebox.askyesno(
+            "Sablon Sil",
+            f"'{name}' sablonu silinsin mi?",
+        )
+        if not confirm:
+            return
+
+        del templates[name]
+        _save_templates(templates)
+        self._refresh_template_list()
+        self._show_feedback(f"Sablon '{name}' silindi", "#FF1744")

@@ -192,6 +192,14 @@ class BinanceRestClient:
             logger.warning(f"Failed to get max leverage for {symbol}: {e}")
         return fallback
 
+    def get_leverage_brackets(self) -> list:
+        """Get leverage brackets for ALL symbols (authenticated)."""
+        try:
+            return self._signed_get("/fapi/v1/leverageBracket", {})
+        except Exception as e:
+            logger.warning(f"Failed to get all leverage brackets: {e}")
+            return []
+
     # ─── orders ───────────────────────────────────────────────
 
     # Conditional order types that must use Algo Order API (since 2025-12-09)

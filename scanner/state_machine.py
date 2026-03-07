@@ -13,6 +13,7 @@ from scanner.symbol_universe import SymbolUniverse
 from scanner.batch_fetcher import BatchKlineFetcher
 from scanner.scanner_scorer import ScannerScorer, ScanResult
 from scanner.position_manager import PositionManager
+from scanner.timeframe_selector import TimeframeSelector
 from indicators.indicator_engine import IndicatorEngine
 from analysis.confluence import ConfluenceScorer
 from analysis.market_regime import MarketRegimeDetector
@@ -52,6 +53,7 @@ class ScannerStateMachine:
         )
         self._scorer = ScannerScorer(config)
         self._position_mgr = PositionManager(config, event_bus)
+        self._tf_selector = TimeframeSelector(rest_client, config=config)
 
         # Holding-phase analysis (separate engine for held symbols)
         self._hold_engine = IndicatorEngine(config)
@@ -188,12 +190,26 @@ class ScannerStateMachine:
             time.sleep(10)
             return
 
-        # 2. Batch fetch klines
-        interval = self._config.get("indicators.kline_interval", "1m")
-        limit = self._config.get("scanner.kline_limit_scan", 200)
-        klines_map = self._fetcher.fetch_batch(symbols, interval, limit)
+        # 2. Dynamic timeframe analysis (refreshes every 5 min)
+        dynamic_tf = self._config.get("strategy", {}).get("dynamic_timeframe", True)
+        symbol_intervals = {}
+        if dynamic_tf and self._tf_selector.needs_refresh():
+            lev_override = self._config.get("leverage.max_leverage", 0)
+            self._tf_selector.refresh(symbols, leverage_override=lev_override)
 
-        # 3. Score all symbols
+        if dynamic_tf:
+            for sym in symbols:
+                symbol_intervals[sym] = self._tf_selector.get_timeframe(sym)
+
+        # 3. Batch fetch klines (each coin at its own timeframe)
+        default_interval = self._config.get("indicators.kline_interval", "1m")
+        limit = self._config.get("scanner.kline_limit_scan", 200)
+        klines_map = self._fetcher.fetch_batch(
+            symbols, default_interval, limit,
+            symbol_intervals=symbol_intervals if dynamic_tf else None,
+        )
+
+        # 4. Score all symbols
         results = self._scorer.score_batch(klines_map, self._universe.get_all_tickers())
         self._last_scan_results = results
 
@@ -276,10 +292,12 @@ class ScannerStateMachine:
                 if not self._check_trade_frequency():
                     break
 
+                cand_tf = symbol_intervals.get(candidate.symbol, default_interval) if dynamic_tf else default_interval
                 logger.info(f"Candidate found: {candidate.symbol} "
                             f"score={candidate.score:+.1f} dir={candidate.direction} "
                             f"regime={candidate.regime.get('regime')} "
-                            f"confluence={candidate.confluence.get('score', 0):+.1f}")
+                            f"confluence={candidate.confluence.get('score', 0):+.1f} "
+                            f"tf={cand_tf}")
                 self._last_candidate = candidate
                 if self._do_buying_inline():
                     bought_any = True
@@ -317,12 +335,13 @@ class ScannerStateMachine:
             except Exception:
                 continue
 
-            # Full indicator analysis for held position
+            # Full indicator analysis for held position (using position's timeframe)
             confluence = {}
             regime = {}
             divergences = []
             try:
-                interval = self._config.get("indicators.kline_interval", "1m")
+                pos = self._position_mgr._positions.get(symbol)
+                interval = pos.timeframe if pos else self._config.get("indicators.kline_interval", "1m")
                 klines = self._rest.get_klines(symbol, interval, limit=200)
                 if klines and len(klines) > 50:
                     self._hold_engine.update(klines)
@@ -369,7 +388,7 @@ class ScannerStateMachine:
     # ──── Check Held Positions ────
 
     def _check_held_positions(self) -> None:
-        """Check all held positions for exit signals. Sell any that need closing."""
+        """Check all held positions for exit signals with full indicator analysis."""
         for symbol in list(self._position_mgr.get_held_symbols()):
             try:
                 ticker = self._rest.get_ticker_price(symbol)
@@ -377,12 +396,31 @@ class ScannerStateMachine:
             except Exception:
                 continue
 
-            # Quick check with just price
+            # Full indicator analysis using position's timeframe
+            confluence = {}
+            divergences = []
+            try:
+                pos = self._position_mgr._positions.get(symbol)
+                interval = pos.timeframe if pos else "1m"
+                klines = self._rest.get_klines(symbol, interval, limit=200)
+                if klines is not None and len(klines) > 50:
+                    self._hold_engine.update(klines)
+                    indicators = self._hold_engine.get_all_values()
+                    confluence = self._hold_confluence.score(indicators)
+                    divergences = self._hold_divergence.scan(indicators)
+            except Exception:
+                pass
+
             exit_reason = self._position_mgr.check_position(
-                symbol, current_price)
+                symbol, current_price,
+                confluence=confluence,
+                divergences=divergences,
+            )
 
             if exit_reason != "HOLD":
-                logger.info(f"Exit signal for {symbol}: {exit_reason} @ {current_price:.6f}")
+                pos = self._position_mgr._positions.get(symbol)
+                tf_str = f" tf={pos.timeframe}" if pos else ""
+                logger.info(f"Exit signal for {symbol}: {exit_reason} @ {current_price:.6f}{tf_str}")
                 self._sell_position(symbol, current_price, exit_reason)
 
     def _sell_position(self, symbol: str, exit_price: float, reason: str) -> None:
@@ -634,9 +672,13 @@ class ScannerStateMachine:
             # Dynamic SL/TP from leverage (dual-layer protection)
             # Katman 1: Server SL at 50% of liq distance
             # Katman 2: Emergency software close at 80% (in position_manager)
-            liq_pct = (1.0 / leverage) * 0.85
-            sl_price_pct = liq_pct * 0.50
-            tp_price_pct = liq_pct * 3.0  # safety net, trailing does real work
+            strat = self._config.get("strategy", {})
+            liq_factor = strat.get("liq_factor", 70) / 100.0
+            liq_pct = (1.0 / leverage) * liq_factor
+            sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
+            tp_liq_mult = strat.get("tp_liq_multiplier", 3.0)
+            sl_price_pct = liq_pct * sl_liq_pct
+            tp_price_pct = liq_pct * tp_liq_mult
             sl_roi = round(sl_price_pct * leverage * 100, 1)
             tp_roi = round(tp_price_pct * leverage * 100, 1)
 
@@ -693,11 +735,15 @@ class ScannerStateMachine:
                 self._failed_symbols[symbol] = time.time()
                 return False
 
-        # 5. Open position tracking
+        # 5. Open position tracking (with optimal timeframe)
+        pos_tf = self._tf_selector.get_timeframe(symbol) if \
+            self._config.get("strategy", {}).get("dynamic_timeframe", True) else \
+            self._config.get("indicators.kline_interval", "1m")
         self._position_mgr.open_position(
             symbol, side, price, size_qty, atr,
             leverage=leverage if lev_enabled else 1,
             margin_usdt=margin_usdt if lev_enabled else 0.0,
+            timeframe=pos_tf,
         )
 
         if self._risk_manager:
@@ -853,13 +899,19 @@ class ScannerStateMachine:
                 continue
 
             lev = pos.leverage
-            liq_pct = (1.0 / lev) * 0.85
+            strat_cfg = self._config.get("strategy", {})
+            liq_factor = strat_cfg.get("liq_factor", 70) / 100.0
+            liq_pct = (1.0 / lev) * liq_factor
 
             entry_side = "BUY" if pos.side == OrderSide.BUY_LONG else "SELL"
 
+            sl_liq_pct2 = strat_cfg.get("sl_liq_percent", 50) / 100.0
+            tp_liq_mult2 = strat_cfg.get("tp_liq_multiplier", 3.0)
+
             if battle_mode:
                 # Battle mode: emergency SL only, NO TP
-                sl_price_pct = liq_pct * 0.65
+                em_liq_pct = strat_cfg.get("emergency_liq_percent", 70) / 100.0
+                sl_price_pct = liq_pct * em_liq_pct
                 sl_roi = round(sl_price_pct * lev * 100, 1)
                 try:
                     self._order_executor.update_tp_sl(
@@ -875,8 +927,8 @@ class ScannerStateMachine:
                 except Exception as e:
                     logger.warning(f"Failed to update SL for {symbol}: {e}")
             else:
-                sl_price_pct = liq_pct * 0.50
-                tp_price_pct = liq_pct * 3.0
+                sl_price_pct = liq_pct * sl_liq_pct2
+                tp_price_pct = liq_pct * tp_liq_mult2
                 sl_roi = round(sl_price_pct * lev * 100, 1)
                 tp_roi = round(tp_price_pct * lev * 100, 1)
                 try:

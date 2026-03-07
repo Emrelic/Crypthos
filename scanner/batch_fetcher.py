@@ -38,8 +38,15 @@ class BatchKlineFetcher:
         self._cache_ttl = 45.0  # seconds
 
     def fetch_batch(self, symbols: list[str], interval: str = "15m",
-                    limit: int = 200) -> dict[str, pd.DataFrame]:
+                    limit: int = 200,
+                    symbol_intervals: dict[str, str] = None) -> dict[str, pd.DataFrame]:
         """Fetch klines for all symbols in parallel.
+
+        Args:
+            symbols: list of symbol names
+            interval: default interval (used if symbol not in symbol_intervals)
+            limit: number of candles
+            symbol_intervals: optional dict {symbol: interval} for per-symbol timeframes
 
         Returns dict of symbol -> DataFrame.
         Uses cache to avoid re-fetching within TTL.
@@ -48,13 +55,15 @@ class BatchKlineFetcher:
         to_fetch = []
         now = time.time()
 
-        # Check cache first
+        # Check cache first (cache key includes interval)
         for symbol in symbols:
-            cached = self._cache.get(symbol)
+            sym_interval = (symbol_intervals or {}).get(symbol, interval)
+            cache_key = f"{symbol}_{sym_interval}"
+            cached = self._cache.get(cache_key)
             if cached and (now - cached[0]) < self._cache_ttl:
                 results[symbol] = cached[1]
             else:
-                to_fetch.append(symbol)
+                to_fetch.append((symbol, sym_interval))
 
         if not to_fetch:
             return results
@@ -66,8 +75,8 @@ class BatchKlineFetcher:
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
             futures = {
-                executor.submit(self._fetch_one, symbol, interval, limit): symbol
-                for symbol in to_fetch
+                executor.submit(self._fetch_one, symbol, sym_interval, limit): symbol
+                for symbol, sym_interval in to_fetch
             }
             for future in as_completed(futures):
                 symbol = futures[future]
@@ -75,7 +84,11 @@ class BatchKlineFetcher:
                     df = future.result()
                     if df is not None and not df.empty:
                         results[symbol] = df
-                        self._cache[symbol] = (time.time(), df)
+                        # Find the interval used for this symbol
+                        sym_interval = next(
+                            (si for s, si in to_fetch if s == symbol), interval)
+                        cache_key = f"{symbol}_{sym_interval}"
+                        self._cache[cache_key] = (time.time(), df)
                 except Exception as e:
                     logger.debug(f"Kline fetch failed for {symbol}: {e}")
 
