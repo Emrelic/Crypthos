@@ -90,31 +90,31 @@ PRESETS = {
     },
     "emre_ortalama": {
         "name": "Emre Ortalama",
-        "desc": "100x, 1/12 portfoy, ATR trailing (4x/1x), sinyal her zaman cikis",
+        "desc": "Max kaldirac, 1/12 portfoy, ATR trailing (7x/1x), sinyal her zaman cikis",
         "color": "#9C27B0",
         "values": {
             # Entry: agresif giris, guclu sinyal gerektir
             "min_buy_score": 55, "min_confluence": 4.0, "min_adx": 18,
             "max_rsi_long": 62, "min_rsi_short": 38,
-            "macd_filter": True, "volume_filter": True, "volatile_filter": True,
-            "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
+            "macd_filter": True, "volume_filter": True, "volatile_filter": False,
+            "scan_interval_seconds": 30, "kline_interval": "5m", "kline_limit": 200,
             # Kaldirac: max mumkun (20x bile olsa ac)
-            "min_leverage": 1, "max_leverage": 100,
+            "min_leverage": 1, "max_leverage": 20,
             # Pozisyon: 4 cephede, 1/12 portfoy
             "max_positions": 4, "portfolio_percent": 8, "portfolio_divider": 12,
             # SL: pratik liq %70, SL %50 (= %0.35 at 100x)
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "emergency_enabled": True, "emergency_liq_percent": 80,
-            # Trailing: ATR bazli (4x tetik, 1x geri cekilme)
+            # Trailing: ATR bazli (7x tetik, 1x geri cekilme)
             "trailing_enabled": True, "trailing_mode": "atr",
-            "trailing_atr_activate_mult": 4.0, "trailing_atr_distance_mult": 1.0,
+            "trailing_atr_activate_mult": 7.0, "trailing_atr_distance_mult": 1.0,
             "trailing_activate_roi": 0, "trailing_distance_roi": 0,
-            "trailing_activate_fee_mult": 2.0, "trailing_distance_fee_mult": 4.0,
+            "trailing_activate_fee_mult": 3.0, "trailing_distance_fee_mult": 2.0,
             # TP: kapali, trailing ve sinyal yonetir
             "tp_enabled": False, "tp_liq_multiplier": 3.0, "tp_exit_mode": "signal",
             # Sinyal: HER ZAMAN cikis (zararda bile), override trailing
-            "signal_exit_enabled": True, "signal_exit_threshold": 5.0,
-            "signal_min_hold_seconds": 30, "signal_only_in_profit": False,
+            "signal_exit_enabled": True, "signal_exit_threshold": 4.0,
+            "signal_min_hold_seconds": 60, "signal_only_in_profit": False,
             "divergence_exit_enabled": False,
             # Zaman: 8 saat, trailing aktifse uzat
             "time_limit_enabled": True, "time_limit_minutes": 480,
@@ -733,17 +733,14 @@ class StrategySettingsPanel(ctk.CTkFrame):
             # Re-pack it after the top frame
             self._preset_frame.pack(fill="x", padx=10, pady=3, before=self._feedback)
 
-        # Enable/disable all field widgets
+        # Both modes: fields always editable (preset fills defaults, user can fine-tune)
         for widget, wtype in self._all_widgets:
             if wtype == "entry":
-                widget.configure(state="normal" if is_manual else "disabled")
+                widget.configure(state="normal")
             elif wtype == "checkbox":
-                if is_manual:
-                    widget.configure(state="normal")
-                else:
-                    widget.configure(state="disabled")
+                widget.configure(state="normal")
             elif wtype in ("menu", "seg"):
-                widget.configure(state="normal" if is_manual else "disabled")
+                widget.configure(state="normal")
 
     def _apply_preset(self, preset_key: str) -> None:
         preset = PRESETS[preset_key]
@@ -758,8 +755,6 @@ class StrategySettingsPanel(ctk.CTkFrame):
                 entry.configure(state="normal")
                 entry.delete(0, "end")
                 entry.insert(0, str(val))
-                if self._mode_var.get() == "standard":
-                    entry.configure(state="disabled")
             elif key in self._cb_vars:
                 self._cb_vars[key].set(val)
             elif key == "kline_interval":
@@ -799,8 +794,6 @@ class StrategySettingsPanel(ctk.CTkFrame):
                 entry.configure(state="normal")
                 entry.delete(0, "end")
                 entry.insert(0, str(val))
-                if mode == "standard":
-                    entry.configure(state="disabled")
 
         for key in self._cb_vars:
             val = strat.get(key)
@@ -836,10 +829,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
 
         # Entries (numeric)
         for key, entry in self._entries.items():
-            entry.configure(state="normal")
             raw = entry.get().strip()
-            if self._mode_var.get() == "standard":
-                entry.configure(state="disabled")
             if not raw:
                 continue
             try:

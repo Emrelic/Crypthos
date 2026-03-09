@@ -100,6 +100,7 @@ def main():
                                       symbol_info_cache=symbol_info_cache)
         scanner.set_order_executor(api_executor)
         scanner.set_risk_manager(risk_manager)
+        scanner.set_order_logger(order_logger)
         controller.set_scanner(scanner)
 
         # In API mode, skip Binance Desktop entirely — no window needed
@@ -126,6 +127,7 @@ def main():
         scanner.set_market_service(market_service)
         scanner.set_risk_manager(risk_manager)
         scanner.set_binance_app(binance_app)
+        scanner.set_order_logger(order_logger)
         controller.set_scanner(scanner)
 
     # Start services

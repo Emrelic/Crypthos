@@ -218,17 +218,20 @@ class BinanceRestClient:
                     quantity: float = None, price: float = None,
                     stop_price: float = None, close_position: bool = False,
                     reduce_only: bool = False,
-                    time_in_force: str = None) -> dict:
+                    time_in_force: str = None,
+                    callback_rate: float = None) -> dict:
         """Place a new order. Automatically routes conditional orders
         (STOP_MARKET, TAKE_PROFIT_MARKET etc.) to Algo Order API.
 
         side: "BUY" or "SELL"
-        order_type: "MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"
+        order_type: "MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET",
+                    "TRAILING_STOP_MARKET"
+        callback_rate: for TRAILING_STOP_MARKET, callback % (0.1 to 5.0)
         """
         if order_type in self._ALGO_TYPES:
             return self._place_algo_order(
                 symbol, side, order_type, quantity, price,
-                stop_price, close_position)
+                stop_price, close_position, callback_rate=callback_rate)
 
         params = {
             "symbol": symbol,
@@ -252,9 +255,11 @@ class BinanceRestClient:
     def _place_algo_order(self, symbol: str, side: str, order_type: str,
                           quantity: float = None, price: float = None,
                           trigger_price: float = None,
-                          close_position: bool = False) -> dict:
-        """POST /fapi/v1/algoOrder — conditional orders (SL/TP).
-        Binance migrated these from /fapi/v1/order on 2025-12-09."""
+                          close_position: bool = False,
+                          callback_rate: float = None) -> dict:
+        """POST /fapi/v1/algoOrder — conditional orders (SL/TP/TRAILING).
+        Binance migrated these from /fapi/v1/order on 2025-12-09.
+        callback_rate: for TRAILING_STOP_MARKET, callback % (0.1 to 5.0)."""
         params = {
             "algoType": "CONDITIONAL",
             "symbol": symbol,
@@ -263,12 +268,15 @@ class BinanceRestClient:
         }
         if trigger_price is not None:
             params["triggerPrice"] = str(trigger_price)
-        if quantity is not None and not close_position:
+        if quantity is not None:
             params["quantity"] = str(quantity)
         if price is not None:
             params["price"] = str(price)
-        if close_position:
+        # TRAILING_STOP_MARKET does not support closePosition in algo API
+        if close_position and order_type != "TRAILING_STOP_MARKET":
             params["closePosition"] = "true"
+        if callback_rate is not None:
+            params["callbackRate"] = str(callback_rate)
 
         return self._signed_post("/fapi/v1/algoOrder", params)
 

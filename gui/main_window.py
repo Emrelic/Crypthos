@@ -22,6 +22,7 @@ class MainWindow(ctk.CTk):
         self.title("Crypthos Trading Bot")
         self.geometry("1200x800")
         self.minsize(900, 600)
+        self.after(50, lambda: self.state("zoomed"))  # maximize on startup
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -59,6 +60,12 @@ class MainWindow(ctk.CTk):
         controller.event_bus.subscribe(EventType.STRATEGY_SIGNAL, self._on_strategy_event)
         controller.event_bus.subscribe(EventType.LOG_MESSAGE, self._on_log_event)
         controller.event_bus.subscribe(EventType.KILL_SWITCH, self._on_kill_event)
+        controller.event_bus.subscribe(EventType.POSITION_OPENED, self._on_position_opened)
+        controller.event_bus.subscribe(EventType.POSITION_CLOSED, self._on_position_closed)
+        controller.event_bus.subscribe(EventType.TRADE_RESULT, self._on_trade_result)
+        controller.event_bus.subscribe(EventType.SCANNER_STATE_CHANGE, self._on_scanner_state)
+        controller.event_bus.subscribe(EventType.CONNECTION_STATUS, self._on_connection_status)
+        controller.event_bus.subscribe(EventType.REGIME_CHANGE, self._on_regime_change)
 
         # Start UI refresh
         self._refresh_ui()
@@ -188,6 +195,63 @@ class MainWindow(ctk.CTk):
     def _on_kill_event(self, data: dict) -> None:
         self.after(0, lambda: self._activity_panel.add_log_entry(
             "CRITICAL", "KILL SWITCH AKTIF!"))
+
+    def _on_position_opened(self, data: dict) -> None:
+        d = data.copy()
+        msg = (f"POZISYON ACILDI: {d.get('symbol', '?')} "
+               f"{d.get('side', '?')} {d.get('leverage', '?')}x "
+               f"@ {d.get('entry_price', 0):.6g} "
+               f"margin=${d.get('margin_usdt', 0):.2f} "
+               f"SL={d.get('sl_price', 0):.6g}")
+        self.after(0, lambda: self._activity_panel.add_log_entry("BUY", msg))
+        self.after(0, self._activity_panel.refresh_orders)
+
+    def _on_position_closed(self, data: dict) -> None:
+        d = data.copy()
+        pnl = d.get("pnl_usdt", 0)
+        level = "SELL+" if pnl >= 0 else "SELL-"
+        msg = (f"POZISYON KAPANDI: {d.get('symbol', '?')} "
+               f"cikis={d.get('exit_reason', '?')} "
+               f"PnL={pnl:+.4f}$")
+        self.after(0, lambda: self._activity_panel.add_log_entry(level, msg))
+        self.after(0, self._activity_panel.refresh_orders)
+
+    def _on_trade_result(self, data: dict) -> None:
+        d = data.copy()
+        pnl = d.get("pnl_usdt", 0)
+        level = "TRADE+" if pnl >= 0 else "TRADE-"
+        dur = d.get("hold_seconds", 0)
+        dur_m = int(dur // 60)
+        dur_s = int(dur % 60)
+        msg = (f"ISLEM SONUCU: {d.get('symbol', '?')} "
+               f"{d.get('side', '?')} "
+               f"PnL={pnl:+.4f}$ "
+               f"ROI={d.get('roi_percent', 0):+.1f}% "
+               f"sure={dur_m}dk{dur_s:02d}sn "
+               f"({d.get('exit_reason', '?')})")
+        self.after(0, lambda: self._activity_panel.add_log_entry(level, msg))
+
+    def _on_scanner_state(self, data: dict) -> None:
+        d = data.copy()
+        old_s = d.get("old_state", "?")
+        new_s = d.get("new_state", "?")
+        msg = f"Tarayici: {old_s} -> {new_s}"
+        self.after(0, lambda: self._activity_panel.add_log_entry("SCAN", msg))
+
+    def _on_connection_status(self, data: dict) -> None:
+        d = data.copy()
+        source = d.get("source", "?")
+        connected = d.get("connected", False)
+        status = "BAGLI" if connected else "KOPUK"
+        level = "INFO" if connected else "WARNING"
+        msg = f"Baglanti: {source} {status}"
+        self.after(0, lambda: self._activity_panel.add_log_entry(level, msg))
+
+    def _on_regime_change(self, data: dict) -> None:
+        d = data.copy()
+        msg = (f"Rejim degisti: {d.get('old_regime', '?')} -> {d.get('new_regime', '?')} "
+               f"({d.get('symbol', '?')})")
+        self.after(0, lambda: self._activity_panel.add_log_entry("REGIME", msg))
 
     def _on_close(self) -> None:
         try:

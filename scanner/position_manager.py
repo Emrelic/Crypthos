@@ -237,9 +237,31 @@ class PositionManager:
             "position_count": len(self._positions),
         })
         lev_str = f" LEV={leverage}x" if lev_enabled else ""
+        # ATR trailing hesaplamalari
+        atr_pct = (atr / price * 100) if price > 0 and atr > 0 else 0
+        strat = self._config.get("strategy", {})
+        activate_mult = strat.get("trailing_atr_activate_mult", 7.0)
+        distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+        trailing_activate_pct = atr_pct * activate_mult  # 7xATR yuzde hareket
+        trailing_distance_pct = atr_pct * distance_mult  # 1xATR geri gelme yuzde
+        trailing_activate_roi = trailing_activate_pct * leverage if lev_enabled else trailing_activate_pct
+
+        if side == OrderSide.BUY_LONG:
+            trailing_activate_price = price * (1 + trailing_activate_pct / 100)
+            trailing_distance_price = atr * distance_mult
+        else:
+            trailing_activate_price = price * (1 - trailing_activate_pct / 100)
+            trailing_distance_price = atr * distance_mult
+
         logger.info(f"Position opened: {side.value} {size} {symbol} @ {price:.6f} "
                     f"SL={sl:.6f} TP={tp:.6f}{lev_str} "
                     f"[{len(self._positions)}/{self._max_positions}]")
+        logger.info(f"  ATR: {atr:.8f} ({atr_pct:.3f}%) TF={timeframe} | "
+                    f"Trailing aktif={activate_mult}xATR ({trailing_activate_pct:.2f}% hareket, "
+                    f"ROI={trailing_activate_roi:.1f}%, "
+                    f"fiyat={trailing_activate_price:.6f}) | "
+                    f"Geri gelme={distance_mult}xATR ({trailing_distance_pct:.3f}%, "
+                    f"{trailing_distance_price:.8f})")
         return pos
 
     def check_position(self, symbol: str, current_price: float,
@@ -981,6 +1003,18 @@ class PositionManager:
         if pos.leverage > 1 and pos.margin_usdt > 0:
             pnl = self._get_pnl(pos, current)
             roi = pnl / pos.margin_usdt * 100
+        # ATR trailing hesaplamalari
+        atr = pos.atr_at_entry
+        price = pos.entry_price
+        lev = pos.leverage if pos.leverage >= 1 else 1
+        strat = self._config.get("strategy", {})
+        activate_mult = strat.get("trailing_atr_activate_mult", 7.0)
+        distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+        atr_pct = (atr / price * 100) if price > 0 and atr > 0 else 0
+        trailing_activate_pct = atr_pct * activate_mult
+        trailing_distance_pct = atr_pct * distance_mult
+        trailing_activate_roi = trailing_activate_pct * lev
+
         return {
             "symbol": pos.symbol,
             "side": pos.side.value,
@@ -999,6 +1033,10 @@ class PositionManager:
             "emergency_price": pos.emergency_close_price,
             "timeframe": pos.timeframe,
             "atr_at_entry": pos.atr_at_entry,
+            "atr_pct": atr_pct,
+            "trailing_activate_pct": trailing_activate_pct,
+            "trailing_activate_roi": trailing_activate_roi,
+            "trailing_distance_pct": trailing_distance_pct,
             "entry_score": pos.entry_score,
             "entry_confluence": pos.entry_confluence,
             "entry_adx": pos.entry_adx,

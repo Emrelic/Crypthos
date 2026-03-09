@@ -67,6 +67,7 @@ class ScannerStateMachine:
         self._market_service = None
         self._risk_manager = None
         self._binance_app = None
+        self._order_logger = None
 
         # Scan results (for GUI)
         self._last_scan_results: list[ScanResult] = []
@@ -74,7 +75,12 @@ class ScannerStateMachine:
         self._scan_count = 0
         self._last_trade_result: dict = {}
         self._failed_symbols: dict[str, float] = {}  # symbol -> fail timestamp
+        # Current indicators for held positions (updated every check cycle)
+        self._held_indicators: dict[str, dict] = {}  # symbol -> indicator snapshot
         self._failed_cooldown = 300  # skip failed symbols for 5 minutes
+
+        # Track server-side trailing stops: symbol -> {callback_pct, timestamp, activation_price}
+        self._server_trailing: dict[str, dict] = {}
 
         # Anti-churning: track trade frequency
         self._trade_timestamps: list[float] = []
@@ -100,6 +106,9 @@ class ScannerStateMachine:
 
     def set_binance_app(self, app) -> None:
         self._binance_app = app
+
+    def set_order_logger(self, ol) -> None:
+        self._order_logger = ol
 
     # ──── Control ────
 
@@ -357,6 +366,7 @@ class ScannerStateMachine:
                 continue
 
             # Full indicator analysis for held position (using position's timeframe)
+            indicators = {}
             confluence = {}
             regime = {}
             divergences = []
@@ -365,8 +375,7 @@ class ScannerStateMachine:
                 interval = pos.timeframe if pos else self._config.get("indicators.kline_interval", "1m")
                 klines = self._rest.get_klines(symbol, interval, limit=200)
                 if klines and len(klines) > 50:
-                    self._hold_engine.update(klines)
-                    indicators = self._hold_engine.get_all_values()
+                    indicators = self._hold_engine.compute_all(klines)
                     confluence = self._hold_confluence.score(indicators)
                     regime = self._hold_regime.detect(indicators)
                     if self._config.get("strategy.divergence_exit_enabled", False):
@@ -374,12 +383,25 @@ class ScannerStateMachine:
             except Exception as e:
                 logger.debug(f"Focus analysis error for {symbol}: {e}")
 
+            # Save current indicators for GUI
+            if indicators or confluence:
+                self._held_indicators[symbol] = {
+                    "indicators": indicators,
+                    "confluence": confluence,
+                    "price": current_price,
+                }
+
             exit_reason = self._position_mgr.check_position(
                 symbol, current_price,
                 confluence=confluence,
                 regime=regime,
                 divergences=divergences,
             )
+
+            # Server-side trailing stop management
+            pos_now = self._position_mgr.get_position(symbol)
+            if pos_now:
+                self._sync_server_trailing(symbol, pos_now, current_price, confluence)
 
             if exit_reason != "HOLD":
                 logger.info(f"[FOCUS] Exit signal for {symbol}: "
@@ -410,15 +432,22 @@ class ScannerStateMachine:
     # ──── Check Held Positions ────
 
     def _check_held_positions(self) -> None:
-        """Check all held positions for exit signals with full indicator analysis."""
+        """Check all held positions for exit signals with full indicator analysis.
+        Also detects positions closed externally (manual close, server SL/TP)."""
+
+        # === Detect externally closed positions ===
+        self._detect_external_closes()
+
         for symbol in list(self._position_mgr.get_held_symbols()):
             try:
                 ticker = self._rest.get_ticker_price(symbol)
                 current_price = float(ticker.get("price", 0))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Price fetch failed for held {symbol}: {e}")
                 continue
 
             # Full indicator analysis using position's timeframe
+            indicators = {}
             confluence = {}
             divergences = []
             try:
@@ -426,13 +455,26 @@ class ScannerStateMachine:
                 interval = pos.timeframe if pos else "1m"
                 klines = self._rest.get_klines(symbol, interval, limit=200)
                 if klines is not None and len(klines) > 50:
-                    self._hold_engine.update(klines)
-                    indicators = self._hold_engine.get_all_values()
+                    indicators = self._hold_engine.compute_all(klines)
                     confluence = self._hold_confluence.score(indicators)
                     if self._config.get("strategy.divergence_exit_enabled", False):
                         divergences = self._hold_divergence.scan(indicators)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Indicator analysis failed for held {symbol}: {e}")
+
+            # Save current indicators for GUI
+            if indicators or confluence:
+                self._held_indicators[symbol] = {
+                    "indicators": indicators,
+                    "confluence": confluence,
+                    "price": current_price,
+                }
+                logger.debug(f"Held indicators updated for {symbol}: "
+                             f"conf_score={confluence.get('score', 'N/A')}, "
+                             f"ind_count={len(indicators)}")
+            else:
+                logger.warning(f"No indicators computed for held {symbol} "
+                               f"(klines may have failed or returned <50 candles)")
 
             exit_reason = self._position_mgr.check_position(
                 symbol, current_price,
@@ -440,11 +482,84 @@ class ScannerStateMachine:
                 divergences=divergences,
             )
 
+            # Server-side trailing stop management
+            pos_now = self._position_mgr.get_position(symbol)
+            if pos_now:
+                self._sync_server_trailing(symbol, pos_now, current_price, confluence)
+
             if exit_reason != "HOLD":
                 pos = self._position_mgr.get_position(symbol)
                 tf_str = f" tf={pos.timeframe}" if pos else ""
                 logger.info(f"Exit signal for {symbol}: {exit_reason} @ {current_price:.6f}{tf_str}")
                 self._sell_position(symbol, current_price, exit_reason)
+
+    def _detect_external_closes(self) -> None:
+        """Check Binance API for positions closed externally (manual, SL, TP, trailing).
+        Removes phantom positions from internal tracking."""
+        if not self._order_executor or not hasattr(self._order_executor, 'get_open_positions'):
+            return
+
+        held_symbols = set(self._position_mgr.get_held_symbols())
+        if not held_symbols:
+            return
+
+        try:
+            api_positions = self._order_executor.get_open_positions()
+            api_symbols = {p.get("symbol", "") for p in api_positions}
+
+            # Find positions we think are open but Binance says closed
+            closed_externally = held_symbols - api_symbols
+
+            for symbol in closed_externally:
+                pos = self._position_mgr.get_position(symbol)
+                if not pos:
+                    continue
+
+                # Get last price for PnL calculation
+                try:
+                    ticker = self._rest.get_ticker_price(symbol)
+                    exit_price = float(ticker.get("price", 0))
+                except Exception:
+                    exit_price = pos.entry_price
+
+                logger.warning(f"[EXTERNAL CLOSE] {symbol} kapatilmis "
+                               f"(manuel/SL/TP/trailing) — dahili takipten siliniyor. "
+                               f"Giris={pos.entry_price:.6f} Cikis={exit_price:.6f}")
+
+                # Clean up internal state
+                self._held_indicators.pop(symbol, None)
+                self._server_trailing.pop(symbol, None)
+                self._close_retries.pop(symbol, None)
+
+                result = self._position_mgr.close_position(
+                    symbol, exit_price, "external_close")
+                self._last_trade_result = result
+
+                if self._risk_manager and result:
+                    pnl = result.get("pnl_usdt", 0)
+                    self._risk_manager.record_trade_result(pnl)
+                    notional = result.get("size", 0) * result.get("exit_price", 0)
+                    self._risk_manager.release_exposure(
+                        notional_usdt=notional,
+                        margin_usdt=result.get("margin_usdt"),
+                    )
+
+                self._event_bus.publish(EventType.TRADE_RESULT, result or {})
+
+                # Log to database
+                if self._order_logger and pos:
+                    close_side = (OrderSide.SELL_SHORT if pos.side == OrderSide.BUY_LONG
+                                  else OrderSide.BUY_LONG)
+                    self._order_logger.log_order(
+                        symbol=symbol, side=close_side.value, order_type="Market",
+                        price=exit_price, size=pos.size,
+                        notional_usdt=pos.size * exit_price,
+                        status="placed",
+                        trigger_source="exit:external_close",
+                    )
+
+        except Exception as e:
+            logger.debug(f"External close detection error: {e}")
 
     def _sell_position(self, symbol: str, exit_price: float, reason: str) -> None:
         """Sell a specific position."""
@@ -476,6 +591,14 @@ class ScannerStateMachine:
 
         if success:
             self._close_retries.pop(symbol, None)  # Clear retry counter on success
+            self._held_indicators.pop(symbol, None)  # Clean up indicator cache
+            self._server_trailing.pop(symbol, None)  # Clean up server trailing tracking
+            # Cancel orphan server orders (SL + trailing) after position closed
+            if self._order_executor and hasattr(self._order_executor, '_rest'):
+                try:
+                    self._order_executor._rest.cancel_all_orders(symbol)
+                except Exception:
+                    pass
             result = self._position_mgr.close_position(symbol, exit_price, reason)
             self._last_trade_result = result
 
@@ -489,6 +612,16 @@ class ScannerStateMachine:
                 )
 
             self._event_bus.publish(EventType.TRADE_RESULT, result)
+
+            # Log sell order to database
+            if self._order_logger:
+                self._order_logger.log_order(
+                    symbol=symbol, side=close_side.value, order_type="Market",
+                    price=exit_price, size=pos.size,
+                    notional_usdt=pos.size * exit_price,
+                    status="placed",
+                    trigger_source=f"exit:{reason}",
+                )
         else:
             # Track retry count with exponential backoff
             retry_info = self._close_retries.get(symbol, {"count": 0})
@@ -794,15 +927,15 @@ class ScannerStateMachine:
                 self._failed_symbols[symbol] = time.time()
                 return False
 
-        # 4. Execute order
+        # 4. Execute order (SL/TP handled by _place_initial_trailing, not here)
         lev_str = f" LEV={leverage}x" if leverage else ""
         logger.info(f"Placing order: {side.value} {size_qty} {symbol} @ {price:.6f}"
-                    f"{lev_str} TP_ROI={tp_roi:.1f}% SL_ROI={sl_roi:.1f}%")
+                    f"{lev_str} SL_ROI={sl_roi:.1f}%")
 
         if self._order_executor:
             success = self._order_executor.execute_order(
                 symbol=symbol, side=side, order_type=OrderType.MARKET,
-                size=size_qty, tp_percent=tp_roi, sl_percent=sl_roi,
+                size=size_qty, tp_percent=0, sl_percent=0,
                 leverage=leverage,
                 qty_precision=qty_precision,
                 ensure_isolated=(lev_enabled and
@@ -834,6 +967,24 @@ class ScannerStateMachine:
                 size_qty, price,
                 margin_usdt=margin_usdt if lev_enabled else None,
             )
+
+        # Log order to database
+        if self._order_logger:
+            self._order_logger.log_order(
+                symbol=symbol, side=side.value, order_type="Market",
+                price=price, size=size_qty,
+                tp_percent=tp_roi if tp_roi else None,
+                sl_percent=sl_roi if sl_roi else None,
+                notional_usdt=notional_usdt if lev_enabled else size_qty * price,
+                status="placed",
+                trigger_source=f"scanner:{candidate.score:+.0f}",
+            )
+
+        # 7. Place initial server-side trailing stop (safety net from start)
+        if lev_enabled and self._order_executor and hasattr(self._order_executor, '_rest'):
+            pos_obj = self._position_mgr.get_position(symbol)
+            if pos_obj:
+                self._place_initial_trailing(symbol, pos_obj, price, atr)
 
         # Record trade timestamp for frequency limiter
         self._trade_timestamps.append(time.time())
@@ -1049,18 +1200,25 @@ class ScannerStateMachine:
                 side = OrderSide.BUY_LONG if amt > 0 else OrderSide.SELL_SHORT
                 size = abs(amt)
 
-                # Get ATR for this symbol
+                # Get ATR for this symbol (use strategy timeframe, enough data)
                 atr = 0.0
                 try:
-                    interval = self._config.get("indicators.kline_interval", "1m")
-                    klines = self._rest.get_klines(symbol, interval, limit=50)
-                    if klines is not None and len(klines) > 14:
+                    interval = self._config.get("strategy.kline_interval",
+                               self._config.get("indicators.kline_interval", "5m"))
+                    kline_limit = self._config.get("strategy.kline_limit", 200)
+                    klines = self._rest.get_klines(symbol, interval, limit=kline_limit)
+                    if klines is not None and len(klines) > 50:
                         from indicators.indicator_engine import IndicatorEngine
                         eng = IndicatorEngine(self._config)
                         indicators = eng.compute_all(klines)
                         atr = indicators.get("ATR", 0)
-                except Exception:
-                    pass
+                        logger.info(f"Sync ATR for {symbol}: {atr:.8f} "
+                                    f"({atr/entry_price*100:.3f}%) tf={interval}")
+                    else:
+                        logger.warning(f"Not enough klines for {symbol} ATR "
+                                       f"(got {len(klines) if klines else 0})")
+                except Exception as e:
+                    logger.warning(f"ATR calculation failed for sync {symbol}: {e}")
 
                 # Open position in manager (will set SL/TP/trailing)
                 self._position_mgr.open_position(
@@ -1144,6 +1302,336 @@ class ScannerStateMachine:
                 except Exception as e:
                     logger.warning(f"Failed to update TP/SL for {symbol}: {e}")
 
+    # ──── Server-side Trailing Stop ────
+    #
+    # Pozisyon açılışında: SL + TRAILING_STOP_MARKET hemen gönderilir
+    # Sonraki döngülerde: değişen koşullara göre güncellenir/silinir/yenisi konur
+    #
+    # Mimari: Çift katmanlı koruma
+    #   Katman 1: Yazılımsal trailing (akıllı — sinyal, renew, confluence)
+    #   Katman 2: Server-side trailing (güvenlik ağı — program çökerse)
+    #
+    # Yazılım her 30 saniyede server emrini günceller:
+    #   - İlk kez trailing aktif olunca → server'a gönder
+    #   - Trailing renew olunca → eski emri sil, yenisini gönder
+    #   - Sinyal güçlüyse → callback'i genişlet (daha sabırlı)
+    #   - Sinyal zayıflarsa → callback'i daralt (daha hızlı kar al)
+    #   - Pozisyon kapanınca → server emrini temizle
+
+    def _place_initial_trailing(self, symbol: str, pos, entry_price: float,
+                                atr: float) -> None:
+        """Pozisyon açılır açılmaz Binance'e ATR-bazlı emirler gönderir:
+
+        1. STOP_MARKET (SL): giriş ± 2×ATR (zarar koruması)
+        2. TRAILING_STOP_MARKET: 7×ATR'de aktif, 1×ATR geri gelme (kar alma)
+
+        Risk:Reward = 2:6 = 1:3 (SL=2ATR kayıp, min kar=6ATR)
+        """
+        try:
+            rest = self._order_executor._rest
+            pp = self._order_executor._get_price_precision(symbol)
+            strat = self._config.get("strategy", {})
+            sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
+            activate_mult = strat.get("trailing_atr_activate_mult", 7.0)
+            distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+
+            is_long = pos.side == OrderSide.BUY_LONG
+            close_side = "SELL" if is_long else "BUY"
+
+            atr_pct = atr / entry_price * 100 if entry_price > 0 and atr > 0 else 0
+
+            # === 1. STOP_MARKET: 2×ATR mesafede ===
+            if is_long:
+                sl_price = round(entry_price - (atr * sl_atr_mult), pp)
+            else:
+                sl_price = round(entry_price + (atr * sl_atr_mult), pp)
+
+            sl_pct = atr_pct * sl_atr_mult
+            sl_roi = sl_pct * pos.leverage
+
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="STOP_MARKET",
+                    stop_price=sl_price,
+                    close_position=True,
+                )
+                logger.info(f"[SERVER SL] {symbol}: "
+                            f"SL={sl_price:.{pp}f} "
+                            f"({sl_atr_mult}xATR = %{sl_pct:.2f}, "
+                            f"ROI -%{sl_roi:.0f})")
+            except Exception as e:
+                logger.warning(f"Server SL failed for {symbol}: {e}")
+
+            # === 2. TRAILING_STOP_MARKET: 7×ATR'de aktif, 1×ATR callback ===
+            if atr > 0 and entry_price > 0:
+                callback_pct = (atr * distance_mult) / entry_price * 100
+            else:
+                callback_pct = 1.0
+            callback_pct = max(0.1, min(5.0, round(callback_pct, 1)))
+
+            if is_long:
+                activation_price = round(entry_price + (atr * activate_mult), pp)
+            else:
+                activation_price = round(entry_price - (atr * activate_mult), pp)
+
+            rest.place_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="TRAILING_STOP_MARKET",
+                quantity=pos.size,
+                stop_price=activation_price,
+                callback_rate=callback_pct,
+            )
+
+            self._server_trailing[symbol] = {
+                "callback_pct": callback_pct,
+                "activation_price": activation_price,
+                "sl_price": sl_price,
+                "timestamp": time.time(),
+                "renewal_count": 0,
+            }
+
+            activate_pct = atr_pct * activate_mult
+            activate_roi = activate_pct * pos.leverage
+            min_profit_pct = atr_pct * (activate_mult - distance_mult)
+            min_profit_roi = min_profit_pct * pos.leverage
+
+            logger.info(f"[SERVER TRAILING] {symbol}: "
+                        f"aktivasyon={activation_price:.{pp}f} "
+                        f"({activate_mult}xATR = %{activate_pct:.2f}, "
+                        f"ROI %{activate_roi:.0f}) | "
+                        f"callback={callback_pct:.1f}% ({distance_mult}xATR) | "
+                        f"SL={sl_price:.{pp}f} ({sl_atr_mult}xATR) | "
+                        f"R:R = {sl_atr_mult:.0f}:{activate_mult-distance_mult:.0f}")
+
+        except Exception as e:
+            logger.warning(f"Initial server orders failed for {symbol}: {e}")
+
+    def _calc_trailing_callback(self, pos, current_price: float,
+                                 confluence: dict = None) -> float:
+        """Calculate optimal callback rate based on ATR and signal strength.
+        Returns callback % (0.1 to 5.0) for Binance TRAILING_STOP_MARKET."""
+        atr = pos.atr_at_entry
+        strat = self._config.get("strategy", {})
+        distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+
+        # Base callback = 1×ATR distance
+        if atr > 0 and current_price > 0:
+            base_callback = (atr * distance_mult) / current_price * 100
+        else:
+            base_callback = 1.0
+
+        # Adjust based on confluence signal strength
+        if confluence:
+            conf_score = confluence.get("score", 0)
+            is_long = pos.side == OrderSide.BUY_LONG
+
+            # Signal supports position → widen callback (be patient)
+            if (is_long and conf_score >= 4.0) or (not is_long and conf_score <= -4.0):
+                base_callback *= 1.5  # 50% wider — strong trend
+            elif (is_long and conf_score >= 2.0) or (not is_long and conf_score <= -2.0):
+                base_callback *= 1.2  # 20% wider — moderate support
+
+            # Signal against position → tighten callback (take profit faster)
+            elif (is_long and conf_score <= -2.0) or (not is_long and conf_score >= 2.0):
+                base_callback *= 0.5  # 50% tighter — signal weakening
+            elif (is_long and conf_score <= 0) or (not is_long and conf_score >= 0):
+                base_callback *= 0.8  # 20% tighter — neutral/weak
+
+        # Clamp to Binance limits (0.1% - 5.0%)
+        return max(0.1, min(5.0, round(base_callback, 1)))
+
+    def _sync_server_trailing(self, symbol: str, pos, current_price: float,
+                               confluence: dict = None) -> None:
+        """Sync server-side trailing stop with current software state.
+        Called every check cycle (30s). Decides when to update server trailing.
+
+        Mantık:
+        - Server'da HER ZAMAN trailing var (pozisyon açılışında konuyor)
+        - Yazılımsal trailing aktif olunca → callback sinyal gücüne göre ayarlanır
+        - Trailing renew olunca → server emri güncellenir (yeni callback)
+        - Sinyal güçlüyse → callback genişler (sabırlı)
+        - Sinyal zayıfsa → callback daralır (hızlı kar al)
+        """
+        if not self._order_executor or not hasattr(self._order_executor, '_rest'):
+            return
+
+        strat = self._config.get("strategy", {})
+        if not strat.get("trailing_enabled", True):
+            return
+
+        existing = self._server_trailing.get(symbol)
+        if not existing:
+            # Server trailing yok — pozisyon sync'den gelmis olabilir, hemen koy
+            base_callback = self._calc_trailing_callback(pos, current_price, None)
+            self._send_server_trailing(symbol, pos, current_price, base_callback)
+            return
+
+        new_callback = self._calc_trailing_callback(pos, current_price, confluence)
+        old_callback = existing.get("callback_pct", 0)
+        old_renewal = existing.get("renewal_count", 0)
+
+        # Update if: callback changed significantly OR trailing was renewed
+        needs_update = (abs(new_callback - old_callback) >= 0.1 or
+                        pos.trailing_renewal_count != old_renewal)
+
+        if needs_update:
+            reason = ""
+            if pos.trailing_renewal_count != old_renewal:
+                reason = f" (renew #{pos.trailing_renewal_count})"
+            elif new_callback < old_callback:
+                reason = " (sinyal zayifliyor, daraltiliyor)"
+            elif new_callback > old_callback:
+                reason = " (sinyal guclu, genisletiliyor)"
+
+            logger.info(f"[SERVER TRAILING] {symbol}: "
+                        f"callback {old_callback:.1f}% -> {new_callback:.1f}%{reason}")
+            self._send_server_trailing(symbol, pos, current_price, new_callback)
+
+    def _send_server_trailing(self, symbol: str, pos, current_price: float,
+                               callback_pct: float) -> None:
+        """Place or replace TRAILING_STOP_MARKET on Binance.
+        Activation price:
+          - Trailing aktifse: current_price (hemen devreye gir)
+          - Trailing henüz aktif değilse: entry + 7×ATR (bekle)"""
+        try:
+            rest = self._order_executor._rest
+            pp = self._order_executor._get_price_precision(symbol)
+            is_long = pos.side == OrderSide.BUY_LONG
+            close_side = "SELL" if is_long else "BUY"
+            strat = self._config.get("strategy", {})
+
+            if pos.trailing_active:
+                # Yazılımsal trailing zaten aktif — server da hemen aktif olsun
+                activation_price = round(current_price, pp)
+            else:
+                # Henüz aktif değil — 7×ATR'de aktif olsun
+                atr = pos.atr_at_entry
+                activate_mult = strat.get("trailing_atr_activate_mult", 7.0)
+                ref_price = pos.virtual_entry_price if pos.virtual_entry_price > 0 else pos.entry_price
+                if is_long:
+                    activation_price = round(ref_price + (atr * activate_mult), pp)
+                else:
+                    activation_price = round(ref_price - (atr * activate_mult), pp)
+
+
+            # Cancel existing orders and re-place SL + trailing
+            try:
+                rest.cancel_all_orders(symbol)
+            except Exception:
+                pass
+
+            # Re-place SL (2×ATR from entry — consistent with _place_initial_trailing)
+            atr = pos.atr_at_entry
+            sl_mult = strat.get("server_sl_atr_mult", 2.0)
+            ref_price = pos.virtual_entry_price if pos.virtual_entry_price > 0 else pos.entry_price
+
+            if atr > 0:
+                if is_long:
+                    sl_price = round(ref_price - (atr * sl_mult), pp)
+                else:
+                    sl_price = round(ref_price + (atr * sl_mult), pp)
+            else:
+                # Fallback: liq-based SL if ATR unknown
+                lev = pos.leverage
+                liq_factor = strat.get("liq_factor", 70) / 100.0
+                liq_pct = (1.0 / lev) * liq_factor
+                sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
+                sl_price_pct = liq_pct * sl_liq_pct
+                if is_long:
+                    sl_price = round(pos.entry_price * (1 - sl_price_pct), pp)
+                else:
+                    sl_price = round(pos.entry_price * (1 + sl_price_pct), pp)
+
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="STOP_MARKET",
+                    stop_price=sl_price,
+                    close_position=True,
+                )
+            except Exception as e:
+                logger.warning(f"Re-place SL failed for {symbol}: {e}")
+
+            # Place TRAILING_STOP_MARKET
+            rest.place_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="TRAILING_STOP_MARKET",
+                quantity=pos.size,
+                stop_price=activation_price,
+                callback_rate=callback_pct,
+            )
+
+            self._server_trailing[symbol] = {
+                "callback_pct": callback_pct,
+                "activation_price": activation_price,
+                "timestamp": time.time(),
+                "renewal_count": pos.trailing_renewal_count,
+            }
+
+            logger.info(f"[SERVER TRAILING] {symbol}: "
+                        f"callback={callback_pct:.1f}% "
+                        f"activation={activation_price} "
+                        f"(server koruma aktif)")
+
+        except Exception as e:
+            logger.warning(f"Server trailing failed for {symbol}: {e} "
+                           f"(software trailing devam ediyor)")
+
+    def _remove_server_trailing(self, symbol: str, pos) -> None:
+        """Remove server-side trailing stop (trailing was renewed/deactivated).
+        Re-places only the SL order."""
+        try:
+            rest = self._order_executor._rest
+            pp = self._order_executor._get_price_precision(symbol)
+            is_long = pos.side == OrderSide.BUY_LONG
+            close_side = "SELL" if is_long else "BUY"
+
+            # Cancel all (removes trailing + old SL)
+            try:
+                rest.cancel_all_orders(symbol)
+            except Exception:
+                pass
+
+            # Re-place SL only (2×ATR from entry)
+            strat = self._config.get("strategy", {})
+            atr = pos.atr_at_entry
+            sl_mult = strat.get("server_sl_atr_mult", 2.0)
+            ref_price = pos.virtual_entry_price if pos.virtual_entry_price > 0 else pos.entry_price
+
+            if atr > 0:
+                if is_long:
+                    sl_price = round(ref_price - (atr * sl_mult), pp)
+                else:
+                    sl_price = round(ref_price + (atr * sl_mult), pp)
+            else:
+                # Fallback: liq-based SL if ATR unknown
+                lev = pos.leverage
+                liq_factor = strat.get("liq_factor", 70) / 100.0
+                liq_pct = (1.0 / lev) * liq_factor
+                sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
+                sl_price_pct = liq_pct * sl_liq_pct
+                if is_long:
+                    sl_price = round(pos.entry_price * (1 - sl_price_pct), pp)
+                else:
+                    sl_price = round(pos.entry_price * (1 + sl_price_pct), pp)
+
+            rest.place_order(
+                symbol=symbol, side=close_side,
+                order_type="STOP_MARKET",
+                stop_price=sl_price,
+                close_position=True,
+            )
+
+            self._server_trailing.pop(symbol, None)
+            logger.info(f"[SERVER TRAILING] {symbol}: server trailing kaldirildi, "
+                        f"sadece SL aktif @ {sl_price}")
+
+        except Exception as e:
+            logger.warning(f"Remove server trailing failed for {symbol}: {e}")
+
     # ──── Helpers ────
 
     def _wait(self, seconds: float) -> None:
@@ -1173,6 +1661,10 @@ class ScannerStateMachine:
 
     def get_all_positions(self) -> list[dict]:
         return self._position_mgr.get_all_positions_info()
+
+    def get_held_indicators(self) -> dict[str, dict]:
+        """Get current indicator snapshots for held positions (for GUI)."""
+        return dict(self._held_indicators)
 
     def get_last_trade(self) -> dict:
         return self._last_trade_result
