@@ -79,17 +79,18 @@ class ScannerPanel(ctk.CTkFrame):
         table_frame = ctk.CTkFrame(self)
         table_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        ctk.CTkLabel(table_frame, text="Tarama Sonuclari (Top 20)",
+        ctk.CTkLabel(table_frame, text="Tarama Sonuclari (Top 100)",
                      font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=5, pady=3)
 
         # Header
         hdr = ctk.CTkFrame(table_frame)
         hdr.pack(fill="x", padx=5)
-        headers = ["#", "Sembol", "Skor", "Yon", "Rejim", "Confluence", "RSI", "ADX", "ATR%"]
-        widths = [30, 100, 60, 60, 80, 80, 50, 50, 50]
-        for i, (h, w) in enumerate(zip(headers, widths)):
+        self._scan_headers = ["#", "Sembol", "Skor", "Yon", "Lev", "TF",
+                              "Rejim", "Conf", "RSI", "ADX", "ATR%", "Red"]
+        self._scan_widths = [25, 90, 50, 40, 35, 30, 65, 50, 40, 40, 45, 120]
+        for h, w in zip(self._scan_headers, self._scan_widths):
             ctk.CTkLabel(hdr, text=h, width=w, font=ctk.CTkFont(size=10, weight="bold"),
-                         text_color="gray").pack(side="left", padx=2)
+                         text_color="gray").pack(side="left", padx=1)
 
         # Scrollable results
         self._results_scroll = ctk.CTkScrollableFrame(table_frame, height=250)
@@ -103,17 +104,21 @@ class ScannerPanel(ctk.CTkFrame):
         ctk.CTkLabel(pos_frame, text="Aktif Pozisyonlar",
                      font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=5)
 
-        # Position table header
+        # Position table header - two rows for more data
         pos_hdr = ctk.CTkFrame(pos_frame)
         pos_hdr.pack(fill="x", padx=5)
-        pos_headers = ["Sembol", "Yon", "Lev", "TF", "Giris", "SL", "Trailing", "Sure", "Marjin"]
-        pos_widths = [90, 50, 40, 35, 80, 80, 70, 60, 55]
-        for h, w in zip(pos_headers, pos_widths):
+        self._pos_headers = ["Sembol", "Yon", "Lev", "TF", "Skor", "Conf",
+                             "RSI", "ADX", "Giris", "SL", "Emrgncy",
+                             "Trail", "ROI%", "Sure", "Marjin"]
+        self._pos_widths = [80, 30, 35, 30, 40, 40,
+                            35, 35, 70, 70, 70,
+                            70, 50, 50, 50]
+        for h, w in zip(self._pos_headers, self._pos_widths):
             ctk.CTkLabel(pos_hdr, text=h, width=w,
-                         font=ctk.CTkFont(size=10, weight="bold"),
-                         text_color="gray").pack(side="left", padx=2)
+                         font=ctk.CTkFont(size=9, weight="bold"),
+                         text_color="gray").pack(side="left", padx=1)
 
-        self._pos_scroll = ctk.CTkScrollableFrame(pos_frame, height=120)
+        self._pos_scroll = ctk.CTkScrollableFrame(pos_frame, height=140)
         self._pos_scroll.pack(fill="x", padx=5, pady=3)
         self._pos_rows = []
 
@@ -178,37 +183,42 @@ class ScannerPanel(ctk.CTkFrame):
             row.destroy()
         self._result_rows.clear()
 
-        # Show top 20
-        widths = [30, 100, 60, 60, 80, 80, 50, 50, 50]
-        for i, r in enumerate(results[:20]):
+        # Show top 100
+        widths = self._scan_widths
+        for i, r in enumerate(results[:100]):
             row_frame = ctk.CTkFrame(self._results_scroll, fg_color="transparent")
-            row_frame.pack(fill="x", pady=1)
+            row_frame.pack(fill="x", pady=0)
             self._result_rows.append(row_frame)
 
-            score_color = "#00C853" if r.score > 0 else "#FF1744" if r.score < 0 else "white"
-            eligible_marker = "*" if r.eligible else ""
+            score_color = "#00C853" if r.score > 0 else "#FF1744" if r.score < 0 else "gray"
+            dir_color = "#00C853" if r.direction == "LONG" else "#FF1744"
+            eligible_marker = " *" if r.eligible else ""
+            lev_str = f"{r.leverage}x" if r.leverage > 0 else "--"
+            tf_str = getattr(r, 'timeframe', '1m')
+            reject_short = r.reject_reason[:18] if r.reject_reason else ""
+
+            # Highlight eligible rows
+            row_color = score_color if r.eligible else "gray"
 
             vals = [
-                f"{i+1}",
-                f"{r.symbol}{eligible_marker}",
-                f"{r.score:+.0f}",
-                r.direction,
-                r.regime.get("regime", "?")[:6],
-                f"{r.confluence.get('score', 0):+.1f}",
-                f"{r.rsi:.0f}",
-                f"{r.adx:.0f}",
-                f"{r.atr_percent:.1f}",
-            ]
-            colors = [
-                "white", score_color, score_color,
-                "#00C853" if r.direction == "LONG" else "#FF1744",
-                "white", "white", "white", "white", "white",
+                (f"{i+1}", "gray"),
+                (f"{r.symbol}{eligible_marker}", row_color),
+                (f"{r.score:+.0f}", score_color),
+                (r.direction[:1], dir_color),
+                (lev_str, "#FF9800" if r.leverage >= 75 else "white"),
+                (tf_str, "#2196F3"),
+                (r.regime.get("regime", "?")[:5], "white"),
+                (f"{r.confluence.get('score', 0):+.1f}", "white"),
+                (f"{r.rsi:.0f}", "#FF9800" if r.rsi > 70 or r.rsi < 30 else "white"),
+                (f"{r.adx:.0f}", "#00C853" if r.adx >= 25 else "gray"),
+                (f"{r.atr_percent:.2f}", "white"),
+                (reject_short, "#FF5252" if reject_short else "gray"),
             ]
 
-            for val, w, c in zip(vals, widths, colors):
+            for (val, color), w in zip(vals, widths):
                 ctk.CTkLabel(row_frame, text=val, width=w,
-                             font=ctk.CTkFont(size=10),
-                             text_color=c).pack(side="left", padx=2)
+                             font=ctk.CTkFont(size=9),
+                             text_color=color).pack(side="left", padx=1)
 
         # Update candidate
         candidate = self.controller.get_scanner_candidate()
@@ -236,7 +246,7 @@ class ScannerPanel(ctk.CTkFrame):
                          text_color="gray", font=ctk.CTkFont(size=10)).pack(side="left", padx=10)
             return
 
-        widths = [90, 50, 40, 35, 80, 80, 70, 60, 55]
+        widths = self._pos_widths
         for pos in positions:
             row_frame = ctk.CTkFrame(self._pos_scroll, fg_color="transparent")
             row_frame.pack(fill="x", pady=1)
@@ -246,16 +256,23 @@ class ScannerPanel(ctk.CTkFrame):
             side = pos.get("side", "--")
             entry = pos.get("entry_price", 0)
             sl = pos.get("sl", 0)
+            emergency = pos.get("emergency_price", 0)
             trailing = pos.get("trailing", 0)
             hold_sec = pos.get("hold_seconds", 0)
             lev = pos.get("leverage", 1)
             margin = pos.get("margin_usdt", 0)
             tf = pos.get("timeframe", "1m")
+            score = pos.get("entry_score", 0)
+            conf = pos.get("entry_confluence", 0)
+            rsi = pos.get("entry_rsi", 50)
+            adx = pos.get("entry_adx", 0)
+            roi = pos.get("roi_percent", 0)
 
             fmt = ".6f" if entry < 1 else ".4f" if entry < 10 else ".2f"
             side_short = "L" if "Buy" in side else "S"
             side_color = "#00C853" if "Buy" in side else "#FF1744"
             trail_color = "#FF9800" if pos.get("trailing_active") else "gray"
+            roi_color = "#00C853" if roi > 0 else "#FF1744" if roi < 0 else "white"
             mins = int(hold_sec // 60)
             secs = int(hold_sec % 60)
 
@@ -264,17 +281,23 @@ class ScannerPanel(ctk.CTkFrame):
                 (side_short, side_color),
                 (f"{lev}x", "#FF9800"),
                 (tf, "#2196F3"),
+                (f"{score:+.0f}", "#00C853" if score > 0 else "#FF1744"),
+                (f"{conf:+.1f}", "white"),
+                (f"{rsi:.0f}", "white"),
+                (f"{adx:.0f}", "white"),
                 (f"{entry:{fmt}}", "white"),
                 (f"{sl:{fmt}}", "#FF1744"),
+                (f"{emergency:{fmt}}", "#FF5252" if emergency > 0 else "gray"),
                 (f"{trailing:{fmt}}", trail_color),
+                (f"{roi:+.1f}%", roi_color),
                 (f"{mins}m{secs:02d}s", "white"),
                 (f"${margin:.2f}", "white"),
             ]
 
             for (val, color), w in zip(vals, widths):
                 ctk.CTkLabel(row_frame, text=val, width=w,
-                             font=ctk.CTkFont(size=10),
-                             text_color=color).pack(side="left", padx=2)
+                             font=ctk.CTkFont(size=9),
+                             text_color=color).pack(side="left", padx=1)
 
     def _update_trade(self) -> None:
         trade = self.controller.get_last_trade()

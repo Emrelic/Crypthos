@@ -31,6 +31,8 @@ class ScanResult:
     adx: float = 0.0
     eligible: bool = False          # passes all hard filters
     reject_reason: str = ""
+    leverage: int = 0               # max leverage for this coin
+    timeframe: str = "1m"           # optimal timeframe
 
 
 class ScannerScorer:
@@ -360,13 +362,19 @@ class ScannerScorer:
         """Score 0-100 based on risk quality (ATR, divergences)."""
         score = 60.0
 
-        # ATR% in sweet spot (0.3% - 3.0%)
+        # ATR% in sweet spot (adjusted for leverage)
+        max_lev = self._config.get("leverage.max_leverage", 20)
         atr_pct = r.atr_percent
-        if 0.3 <= atr_pct <= 3.0:
+        # 20x: liq=%5, SL~%1.75 -> sweet spot 0.2%-1.5%
+        # 75x: liq=%1.3, SL~%0.3 -> sweet spot 0.05%-0.3%
+        safe_atr = (1.0 / max(max_lev, 1)) * 100 * 0.25
+        if atr_pct <= safe_atr:
             score += 20
-        elif atr_pct > 5.0:
+        elif atr_pct <= safe_atr * 2:
+            score += 10  # borderline
+        elif atr_pct > safe_atr * 4:
             score -= 30  # too volatile
-        elif atr_pct < 0.1:
+        if atr_pct < 0.05:
             score -= 20  # no movement
 
         # Divergence check

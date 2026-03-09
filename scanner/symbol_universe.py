@@ -6,6 +6,9 @@ from market.binance_rest import BinanceRestClient
 
 EXCLUDED_SYMBOLS = {"BUSDUSDT", "USDCUSDT", "TUSDUSDT", "DAIUSDT", "EURUSDT", "GBPUSDT"}
 
+# TradFi symbols that require special agreement on Binance
+TRADFI_PREFIXES = ("XAG", "XAU", "XPT", "XPD")  # silver, gold, platinum, palladium
+
 
 class SymbolUniverse:
     """Fetches and filters Binance Futures symbols for scanning."""
@@ -36,6 +39,8 @@ class SymbolUniverse:
             if not symbol.endswith("USDT"):
                 continue
             if symbol in EXCLUDED_SYMBOLS:
+                continue
+            if symbol.startswith(TRADFI_PREFIXES):
                 continue
 
             volume_24h = float(t.get("quoteVolume", 0))

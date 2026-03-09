@@ -1,6 +1,7 @@
 """Position Manager - tracks multiple active positions, trailing stops,
 and evaluates 7 different exit signals per position."""
 import time
+import threading
 from dataclasses import dataclass
 from loguru import logger
 from core.config_manager import ConfigManager
@@ -29,6 +30,14 @@ class ActivePosition:
     liquidation_price: float = 0.0
     emergency_close_price: float = 0.0  # 80% of liq distance — last line of defense
     timeframe: str = "1m"  # chart timeframe for this position's indicators
+    current_price: float = 0.0     # last known price (updated by check_position)
+    entry_score: float = 0.0       # composite score at entry
+    entry_confluence: float = 0.0  # confluence score at entry
+    entry_adx: float = 0.0        # ADX at entry
+    entry_rsi: float = 50.0       # RSI at entry
+    # Hybrid trailing: virtual entry for renewed trailing
+    virtual_entry_price: float = 0.0   # reset point for ATR trailing (0 = use real entry)
+    trailing_renewal_count: int = 0    # how many times trailing was renewed
 
 
 class PositionManager:
@@ -42,6 +51,7 @@ class PositionManager:
     EXIT_SL = "STOP_LOSS"
     EXIT_TP = "TAKE_PROFIT"
     EXIT_TRAILING = "TRAILING_STOP"
+    EXIT_TRAILING_RENEW = "TRAILING_RENEW"  # trailing hit but signal strong → needs re-eval
     EXIT_CONFLUENCE = "CONFLUENCE_REVERSAL"
     EXIT_DIVERGENCE = "DIVERGENCE_WARNING"
     EXIT_REGIME = "REGIME_DETERIORATION"
@@ -50,6 +60,7 @@ class PositionManager:
     def __init__(self, config: ConfigManager, event_bus: EventBus):
         self._config = config
         self._event_bus = event_bus
+        self._lock = threading.RLock()  # Thread safety for _positions dict
         self._positions: dict[str, ActivePosition] = {}  # symbol -> position
         self._max_positions = config.get("scanner.max_positions", 5)
 
@@ -59,45 +70,80 @@ class PositionManager:
 
     @property
     def has_capacity(self) -> bool:
-        return len(self._positions) < self._max_positions
+        with self._lock:
+            return len(self._positions) < self._max_positions
 
     @property
     def position_count(self) -> int:
-        return len(self._positions)
+        with self._lock:
+            return len(self._positions)
 
     @property
     def has_position(self) -> bool:
-        return len(self._positions) > 0
+        with self._lock:
+            return len(self._positions) > 0
 
     @property
     def position(self) -> ActivePosition:
         """Legacy: return first position (for backward compat)."""
-        if self._positions:
-            return next(iter(self._positions.values()))
-        return None
+        with self._lock:
+            if self._positions:
+                return next(iter(self._positions.values()))
+            return None
 
     def is_holding(self, symbol: str) -> bool:
-        return symbol in self._positions
+        with self._lock:
+            return symbol in self._positions
 
     def get_held_symbols(self) -> list[str]:
-        return list(self._positions.keys())
+        with self._lock:
+            return list(self._positions.keys())
+
+    def get_position(self, symbol: str) -> ActivePosition:
+        with self._lock:
+            return self._positions.get(symbol)
+
+    def get_all_positions(self) -> dict[str, 'ActivePosition']:
+        """Return a snapshot copy of all positions. Thread-safe."""
+        with self._lock:
+            return dict(self._positions)
 
     def open_position(self, symbol: str, side: OrderSide, price: float,
                       size: float, atr: float,
                       leverage: int = 1,
                       margin_usdt: float = 0.0,
-                      timeframe: str = "1m") -> ActivePosition:
+                      timeframe: str = "1m",
+                      entry_score: float = 0.0,
+                      entry_confluence: float = 0.0,
+                      entry_adx: float = 0.0,
+                      entry_rsi: float = 50.0) -> ActivePosition:
         """Create and track a new position."""
+        with self._lock:
+            return self._open_position_locked(
+                symbol, side, price, size, atr, leverage, margin_usdt,
+                timeframe, entry_score, entry_confluence, entry_adx, entry_rsi)
+
+    def _open_position_locked(self, symbol: str, side: OrderSide, price: float,
+                              size: float, atr: float,
+                              leverage: int = 1,
+                              margin_usdt: float = 0.0,
+                              timeframe: str = "1m",
+                              entry_score: float = 0.0,
+                              entry_confluence: float = 0.0,
+                              entry_adx: float = 0.0,
+                              entry_rsi: float = 50.0) -> ActivePosition:
+        """Internal: create position (caller must hold lock)."""
         if symbol in self._positions:
             logger.warning(f"Already holding {symbol}, skipping duplicate")
             return self._positions[symbol]
 
-        lev_enabled = leverage > 1
+        lev_enabled = leverage >= 1
 
         if lev_enabled:
-            # === DYNAMIC CALCULATION FROM LEVERAGE ===
+            # === DYNAMIC CALCULATION FROM LEVERAGE (FEE-AWARE) ===
             fee_pct = 0.001  # 0.1% round-trip
-            fee_roi = fee_pct * leverage * 100
+            fee_roi = fee_pct * leverage * 100  # fee as % of margin
+            slippage_roi = fee_roi * 0.5  # estimated slippage
 
             # Read from strategy config (with sensible defaults)
             strat = self._config.get("strategy", {})
@@ -109,19 +155,26 @@ class PositionManager:
             emergency_liq_pct = strat.get("emergency_liq_percent", 80) / 100.0
             tp_liq_mult = strat.get("tp_liq_multiplier", 3.0)
 
-            sl_pct = liq_pct * sl_liq_pct
+            # Fee-aware SL: gerçek kayıp = SL fiyat hareketi + fee + slippage
+            # Hedef toplam kayıp ROI'den fee ve slippage düşülür
+            raw_sl_roi = liq_pct * sl_liq_pct * leverage * 100
+            net_sl_roi = max(raw_sl_roi - fee_roi - slippage_roi, fee_roi)
+            sl_pct = net_sl_roi / (leverage * 100)
+
             emergency_pct = liq_pct * emergency_liq_pct
             tp_pct = liq_pct * tp_liq_mult
 
             # ROI calculations for logging
-            sl_roi = sl_pct * leverage * 100
+            sl_roi = net_sl_roi
+            total_sl_roi = raw_sl_roi  # fee dahil toplam kayıp
             emergency_roi = emergency_pct * leverage * 100
             tp_roi = tp_pct * leverage * 100
 
             logger.info(f"[{leverage}x] Liq={liq_pct*100:.3f}% "
                         f"SL={sl_pct*100:.3f}%(ROI-{sl_roi:.0f}%) "
-                        f"Emergency={emergency_pct*100:.3f}%(ROI-{emergency_roi:.0f}%) "
-                        f"Fee={fee_roi:.0f}%margin")
+                        f"fee={fee_roi:.0f}%+slip={slippage_roi:.0f}% "
+                        f"toplam_kayip={total_sl_roi:.0f}% "
+                        f"Emergency={emergency_pct*100:.3f}%(ROI-{emergency_roi:.0f}%)")
 
             if side == OrderSide.BUY_LONG:
                 sl = price * (1 - sl_pct)
@@ -165,6 +218,11 @@ class PositionManager:
             timeframe=timeframe,
         )
 
+        pos.entry_score = entry_score
+        pos.entry_confluence = entry_confluence
+        pos.entry_adx = entry_adx
+        pos.entry_rsi = entry_rsi
+
         self._positions[symbol] = pos
 
         self._event_bus.publish(EventType.POSITION_OPENED, {
@@ -189,10 +247,11 @@ class PositionManager:
                        confluence: dict = None, regime: dict = None,
                        divergences: list = None) -> str:
         """Check a single position for exit signals. Returns 'HOLD' or exit reason."""
-        if symbol not in self._positions:
-            return "HOLD"
-
-        pos = self._positions[symbol]
+        with self._lock:
+            if symbol not in self._positions:
+                return "HOLD"
+            pos = self._positions[symbol]
+        pos.current_price = current_price
         indicator_values = indicator_values or {}
         confluence = confluence or {}
         divergences = divergences or []
@@ -212,42 +271,63 @@ class PositionManager:
 
         strat = self._config.get("strategy", {})
 
-        # === 0. EMERGENCY ANTI-LIQUIDATION (highest priority) ===
+        # === 0. EMERGENCY ANTI-LIQUIDATION (highest priority, ALWAYS active) ===
         if strat.get("emergency_enabled", True):
             if self._check_emergency_close(pos, current_price):
                 return self.EXIT_EMERGENCY
 
-        # === 1. HARD STOP LOSS ===
+        # === 1. HARD STOP LOSS (ALWAYS active) ===
         if strat.get("sl_enabled", True):
             if self._check_stop_loss(pos, current_price):
                 return self.EXIT_SL
 
-        # === 2. TAKE PROFIT ===
-        if strat.get("tp_enabled", True):
-            if self._check_take_profit(pos, current_price):
-                return self.EXIT_TP
-
-        # === 3. TRAILING STOP ===
-        if strat.get("trailing_enabled", True):
-            self._update_trailing(pos, current_price)
-            if self._check_trailing(pos, current_price):
-                return self.EXIT_TRAILING
-
-        # === 4. CONFLUENCE REVERSAL ===
+        # === 2. SINYAL CIKIS (EN KRITIK KURAL — her seviyede aktif) ===
+        # Sinyal SAT derse → trailing, profit zone, her seyi override et.
+        # Zararda bile kapat (signal_only_in_profit=false).
+        # Mantik: erken cikis kucultur kayiplari, firsat maliyetini azaltir,
+        # 3:1 R:R'i korur. Tek iyi trade 3 kotu trade'i karsilar.
         if strat.get("signal_exit_enabled", True):
             if self._check_confluence_reversal(pos, confluence, current_price):
                 return self.EXIT_CONFLUENCE
 
-        # === 5. DIVERGENCE WARNING ===
-        if strat.get("divergence_exit_enabled", True):
+        # === PROFIT ZONE CHECK (trailing icin) ===
+        # Hybrid: virtual_entry_price varsa, trailing hesabi oraya gore yapilir
+        atr = pos.atr_at_entry
+        trailing_activate_mult = strat.get("trailing_atr_activate_mult", 7.0)
+        ref_price = pos.virtual_entry_price if pos.virtual_entry_price > 0 else pos.entry_price
+        profit_atr = 0.0
+        if atr > 0:
+            if pos.side == OrderSide.BUY_LONG:
+                profit_atr = (current_price - ref_price) / atr
+            else:
+                profit_atr = (ref_price - current_price) / atr
+
+        in_profit_zone = profit_atr >= trailing_activate_mult
+
+        # === 3. TAKE PROFIT (only if enabled) ===
+        if strat.get("tp_enabled", False):
+            if self._check_take_profit(pos, current_price):
+                return self.EXIT_TP
+
+        # === 4. TRAILING STOP (Hybrid) ===
+        # N×ATR'de aktive olur, 1×ATR geri cekilmede tetiklenir.
+        # Tetiklenince: sinyal hala gucluyse → trailing sifirla (RENEW)
+        #               sinyal zayifsa → kapat (TRAILING_STOP)
+        if strat.get("trailing_enabled", True):
+            self._update_trailing(pos, current_price)
+            if self._check_trailing(pos, current_price):
+                return self.EXIT_TRAILING_RENEW
+
+        # === 5. DIVERGENCE WARNING (profit zone'da) ===
+        if in_profit_zone and strat.get("divergence_exit_enabled", False):
             if self._check_divergence(pos, current_price, divergences):
                 return self.EXIT_DIVERGENCE
 
-        # === 6. REGIME DETERIORATION ===
-        if regime:
+        # === 6. REGIME DETERIORATION (profit zone'da) ===
+        if in_profit_zone and regime:
             self._handle_regime_change(pos, regime)
 
-        # === 7. TIME LIMIT ===
+        # === 7. TIME LIMIT (her seviyede) ===
         if strat.get("time_limit_enabled", True):
             if self._check_time_limit(pos, current_price):
                 return self.EXIT_TIME
@@ -274,10 +354,10 @@ class PositionManager:
 
         Rules:
         - ALWAYS: Emergency close at 80% liq distance (survive)
-        - Below fee breakeven (<10% ROI): ONLY emergency close, nothing else
+        - Below fee breakeven (net_roi < 0): ONLY emergency close, nothing else
         - Above fee but <50% ROI: sell only if signals strongly reversed
         - Above 50% ROI: sell if signals reversed, otherwise HOLD
-        - Trailing: very wide (4x fee distance), lets profits run to 200-300%+
+        - Trailing: very wide (uses normal ATR config but battle-specific thresholds)
         - NO time limit, NO take profit, NO divergence exit below fee
         - NO SL exit (server SL handles that, we just track)
         """
@@ -349,7 +429,8 @@ class PositionManager:
         return "HOLD"
 
     def _update_battle_trailing(self, pos: ActivePosition, price: float) -> None:
-        """Battle mode trailing: very wide distance, lets profits run."""
+        """Battle mode trailing: very wide distance, lets profits run.
+        Uses 2x the normal ATR activation to be more patient."""
         lev = pos.leverage
         fee_roi = 0.001 * lev * 100
         strat = self._config.get("strategy", {})
@@ -357,8 +438,11 @@ class PositionManager:
 
         if trailing_mode == "atr" and pos.atr_at_entry > 0:
             atr = pos.atr_at_entry
-            activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
-            distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+            # Battle mode: 2x normal activation, 2x normal distance (more patient)
+            normal_activate = strat.get("trailing_atr_activate_mult", 7.0)
+            normal_distance = strat.get("trailing_atr_distance_mult", 1.0)
+            activate_mult = normal_activate * 2.0
+            distance_mult = normal_distance * 2.0
             activate_price = atr * activate_mult
             trail_distance = atr * distance_mult
 
@@ -396,18 +480,20 @@ class PositionManager:
 
             if pos.side == OrderSide.BUY_LONG:
                 roi = (price - pos.entry_price) / pos.entry_price * lev * 100
-                if roi >= activate_roi:
+                net_roi = roi - fee_roi  # fee-aware
+                if net_roi >= activate_roi:
                     if not pos.trailing_active:
-                        logger.info(f"[SAVAS] {pos.symbol} trailing activated @ ROI {roi:.1f}%")
+                        logger.info(f"[SAVAS] {pos.symbol} trailing activated @ net ROI {net_roi:.1f}%")
                     pos.trailing_active = True
                     new_trail = price * (1 - trail_price_pct)
                     if new_trail > pos.trailing_stop:
                         pos.trailing_stop = new_trail
             else:
                 roi = (pos.entry_price - price) / pos.entry_price * lev * 100
-                if roi >= activate_roi:
+                net_roi = roi - fee_roi  # fee-aware
+                if net_roi >= activate_roi:
                     if not pos.trailing_active:
-                        logger.info(f"[SAVAS] {pos.symbol} trailing activated @ ROI {roi:.1f}%")
+                        logger.info(f"[SAVAS] {pos.symbol} trailing activated @ net ROI {net_roi:.1f}%")
                     pos.trailing_active = True
                     new_trail = price * (1 + trail_price_pct)
                     if new_trail < pos.trailing_stop:
@@ -423,40 +509,42 @@ class PositionManager:
             return price >= pos.trailing_stop
 
     def close_position(self, symbol: str, exit_price: float, reason: str) -> dict:
-        """Close a specific position and return trade result."""
-        if symbol not in self._positions:
-            return {}
+        """Close a specific position and return trade result. Thread-safe."""
+        with self._lock:
+            if symbol not in self._positions:
+                return {}
 
-        pos = self._positions[symbol]
-        pnl = self._get_pnl(pos, exit_price)
-        pnl_pct = self._get_pnl_pct(pos, exit_price)
-        hold_duration = time.time() - pos.entry_time
-        roi_pct = self._get_margin_roi(pos, exit_price)
+            pos = self._positions[symbol]
+            pnl = self._get_pnl(pos, exit_price)
+            pnl_pct = self._get_pnl_pct(pos, exit_price)
+            hold_duration = time.time() - pos.entry_time
+            roi_pct = self._get_margin_roi(pos, exit_price)
 
-        result = {
-            "symbol": pos.symbol,
-            "side": pos.side.value,
-            "entry_price": pos.entry_price,
-            "exit_price": exit_price,
-            "size": pos.size,
-            "pnl_usdt": round(pnl, 4),
-            "pnl_percent": round(pnl_pct, 2),
-            "roi_percent": round(roi_pct, 2),
-            "hold_seconds": round(hold_duration, 0),
-            "exit_reason": reason,
-            "highest_price": pos.highest_price,
-            "lowest_price": pos.lowest_price,
-            "leverage": pos.leverage,
-            "margin_usdt": pos.margin_usdt,
-        }
+            result = {
+                "symbol": pos.symbol,
+                "side": pos.side.value,
+                "entry_price": pos.entry_price,
+                "exit_price": exit_price,
+                "size": pos.size,
+                "pnl_usdt": round(pnl, 4),
+                "pnl_percent": round(pnl_pct, 2),
+                "roi_percent": round(roi_pct, 2),
+                "hold_seconds": round(hold_duration, 0),
+                "exit_reason": reason,
+                "highest_price": pos.highest_price,
+                "lowest_price": pos.lowest_price,
+                "leverage": pos.leverage,
+                "margin_usdt": pos.margin_usdt,
+            }
+
+            del self._positions[symbol]
 
         self._event_bus.publish(EventType.POSITION_CLOSED, result)
         logger.info(f"Position closed: {pos.symbol} PnL={pnl:+.4f} USDT "
                     f"({pnl_pct:+.2f}%) reason={reason} "
                     f"held={hold_duration:.0f}s "
-                    f"[{len(self._positions)-1}/{self._max_positions}]")
+                    f"[{self.position_count}/{self._max_positions}]")
 
-        del self._positions[symbol]
         return result
 
     # ──── Exit Signal Checks ────
@@ -496,7 +584,7 @@ class PositionManager:
             return price <= pos.initial_tp
 
     def _update_trailing(self, pos: ActivePosition, price: float) -> None:
-        if pos.leverage > 1:
+        if pos.leverage >= 1:
             lev = pos.leverage
             fee_roi = 0.001 * lev * 100
             strat = self._config.get("strategy", {})
@@ -504,14 +592,16 @@ class PositionManager:
 
             if trailing_mode == "atr" and pos.atr_at_entry > 0:
                 # ATR-based trailing: activate at N*ATR profit, trail at M*ATR distance
+                # Uses virtual_entry_price for renewed trailing (hybrid system)
                 atr = pos.atr_at_entry
                 activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
                 distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
                 activate_price = atr * activate_mult
                 trail_distance = atr * distance_mult
+                ref_price = pos.virtual_entry_price if pos.virtual_entry_price > 0 else pos.entry_price
 
                 if pos.side == OrderSide.BUY_LONG:
-                    profit = price - pos.entry_price
+                    profit = price - ref_price
                     if profit >= activate_price:
                         if not pos.trailing_active:
                             roi = profit / pos.entry_price * lev * 100
@@ -523,7 +613,7 @@ class PositionManager:
                         if new_trail > pos.trailing_stop:
                             pos.trailing_stop = new_trail
                 else:
-                    profit = pos.entry_price - price
+                    profit = ref_price - price
                     if profit >= activate_price:
                         if not pos.trailing_active:
                             roi = profit / pos.entry_price * lev * 100
@@ -590,6 +680,8 @@ class PositionManager:
                         pos.trailing_stop = new_trail
 
     def _check_trailing(self, pos: ActivePosition, price: float) -> bool:
+        """Trailing stop tetiklendi mi? 7×ATR'de aktive olur, 1×ATR geri cekilmede kapatir.
+        Min kar = 6×ATR. Risk/Reward 1:3."""
         if not pos.trailing_active:
             return False
 
@@ -599,24 +691,131 @@ class PositionManager:
         else:
             triggered = price >= pos.trailing_stop
 
-        if triggered and pos.leverage > 1:
-            # Don't close unless net profit (after fees) is positive
-            lev = pos.leverage
-            fee_roi = 0.001 * lev * 100
-            if pos.side == OrderSide.BUY_LONG:
-                roi = (price - pos.entry_price) / pos.entry_price * lev * 100
-            else:
-                roi = (pos.entry_price - price) / pos.entry_price * lev * 100
-            net_roi = roi - fee_roi
-            if net_roi < fee_roi * 0.5:
-                # Net profit too small, deactivate trailing and wait for better exit
-                logger.debug(f"[{pos.symbol}] Trailing triggered but net ROI {net_roi:.1f}% "
-                             f"< min {fee_roi * 0.5:.1f}%, holding")
-                pos.trailing_active = False
-                pos.trailing_stop = pos.initial_sl  # reset to SL
-                return False
+        if triggered:
+            # Log the profit at close
+            atr = pos.atr_at_entry
+            if atr > 0:
+                if pos.side == OrderSide.BUY_LONG:
+                    profit_atr = (price - pos.entry_price) / atr
+                else:
+                    profit_atr = (pos.entry_price - price) / atr
+                lev = pos.leverage if pos.leverage > 1 else 1
+                roi = profit_atr * (atr / pos.entry_price) * lev * 100
+                logger.info(f"[{pos.symbol}] Trailing kapaniyor: "
+                            f"{profit_atr:.1f}×ATR kar, ROI {roi:.1f}%")
 
         return triggered
+
+    def renew_trailing(self, symbol: str, current_price: float, new_atr: float = 0) -> None:
+        """Hybrid trailing: sinyal güçlü, trailing sıfırlanıyor.
+        Sanki bu fiyattan yeni pozisyon açılmış gibi davran:
+        - virtual_entry_price = current_price
+        - trailing_active = False (yeniden 7×ATR bekle)
+        - SL'i ileri taşı (yeni sanal girişe göre)
+        - ATR güncelle (opsiyonel)
+        """
+        with self._lock:
+            if symbol not in self._positions:
+                return
+
+            pos = self._positions[symbol]
+            old_virtual = pos.virtual_entry_price or pos.entry_price
+            pos.virtual_entry_price = current_price
+            pos.trailing_active = False
+            pos.trailing_renewal_count += 1
+
+            # Update ATR if provided (fresh ATR from current candles)
+            if new_atr > 0:
+                pos.atr_at_entry = new_atr
+
+            atr = pos.atr_at_entry
+            strat = self._config.get("strategy", {})
+            liq_factor = strat.get("liq_factor", 70) / 100.0
+            sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
+            lev = pos.leverage
+
+            # New SL from virtual entry (fee-aware, same formula as initial SL)
+            fee_pct = 0.001  # 0.1% round-trip
+            fee_roi = fee_pct * lev * 100
+            slippage_roi = fee_roi * 0.5
+            liq_pct = (1.0 / lev) * liq_factor
+            raw_sl_roi = liq_pct * sl_liq_pct * lev * 100
+            net_sl_roi = max(raw_sl_roi - fee_roi - slippage_roi, fee_roi)
+            sl_pct = net_sl_roi / (lev * 100)
+
+            if pos.side == OrderSide.BUY_LONG:
+                new_sl = current_price * (1 - sl_pct)
+                # SL must never go backwards
+                if new_sl > pos.initial_sl:
+                    pos.initial_sl = new_sl
+                pos.highest_price = current_price
+                pos.trailing_stop = 0.0
+            else:
+                new_sl = current_price * (1 + sl_pct)
+                if new_sl < pos.initial_sl:
+                    pos.initial_sl = new_sl
+                pos.lowest_price = current_price
+                pos.trailing_stop = float('inf')
+
+            # Calculate profit from real entry for logging
+            if pos.side == OrderSide.BUY_LONG:
+                total_profit_atr = (current_price - pos.entry_price) / atr if atr > 0 else 0
+            else:
+                total_profit_atr = (pos.entry_price - current_price) / atr if atr > 0 else 0
+            roi = total_profit_atr * (atr / pos.entry_price) * lev * 100 if atr > 0 else 0
+
+        logger.info(f"[{pos.symbol}] TRAILING RENEWED #{pos.trailing_renewal_count}: "
+                    f"virtual_entry={current_price:.6f} "
+                    f"new_SL={pos.initial_sl:.6f} "
+                    f"total_profit={total_profit_atr:.1f}×ATR (ROI {roi:.1f}%) "
+                    f"waiting for next 7×ATR move")
+
+    def _signal_supports_position(self, pos: ActivePosition, confluence: dict) -> bool:
+        """Check if current signals still support the position direction.
+        Returns True if signal says HOLD/BUY for LONG or HOLD/SELL for SHORT."""
+        if not confluence:
+            return False  # no data = no support, close to be safe
+        score = confluence.get("score", 0)
+        signal = confluence.get("signal", "NEUTRAL")
+
+        if pos.side == OrderSide.BUY_LONG:
+            # LONG position: signal must be BUY or at least not SELL
+            return score > 0 and signal != "SELL"
+        else:
+            # SHORT position: signal must be SELL or at least not BUY
+            return score < 0 and signal != "BUY"
+
+    def _widen_trailing(self, pos: ActivePosition, price: float) -> None:
+        """Widen trailing distance by 2x when signal still supports position.
+        This gives the trend more room to breathe."""
+        strat = self._config.get("strategy", {})
+        trailing_mode = strat.get("trailing_mode", "roi")
+
+        if trailing_mode == "atr" and pos.atr_at_entry > 0:
+            # Double the ATR distance
+            distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+            wide_distance = pos.atr_at_entry * distance_mult * 2.0
+
+            if pos.side == OrderSide.BUY_LONG:
+                new_trail = price - wide_distance
+                if new_trail > pos.initial_sl:  # never below SL
+                    pos.trailing_stop = new_trail
+            else:
+                new_trail = price + wide_distance
+                if new_trail < pos.initial_sl:  # never above SL (for short)
+                    pos.trailing_stop = new_trail
+        else:
+            # ROI mode: widen by moving trailing stop back
+            lev = pos.leverage if pos.leverage > 1 else 1
+            wide_pct = 0.002 / lev  # 2x normal distance
+            if pos.side == OrderSide.BUY_LONG:
+                new_trail = price * (1 - wide_pct)
+                if new_trail > pos.initial_sl:
+                    pos.trailing_stop = new_trail
+            else:
+                new_trail = price * (1 + wide_pct)
+                if new_trail < pos.initial_sl:
+                    pos.trailing_stop = new_trail
 
     def _check_confluence_reversal(self, pos: ActivePosition, confluence: dict,
                                     current_price: float = 0) -> bool:
@@ -626,14 +825,14 @@ class PositionManager:
         score = confluence.get("score", 0)
 
         strat = self._config.get("strategy", {})
-        min_hold = strat.get("signal_min_hold_seconds", 30) if pos.leverage > 1 \
+        min_hold = strat.get("signal_min_hold_seconds", 30) if pos.leverage >= 1 \
             else self._config.get("scanner.min_hold_time_seconds", 120)
         if time.time() - pos.entry_time < min_hold:
             return False
 
         # For leverage: only exit on reversal if we're in profit
         only_profit = strat.get("signal_only_in_profit", True)
-        if only_profit and pos.leverage > 1 and current_price > 0:
+        if only_profit and pos.leverage >= 1 and current_price > 0:
             fee_roi = 0.001 * pos.leverage * 100
             if pos.side == OrderSide.BUY_LONG:
                 roi = (current_price - pos.entry_price) / pos.entry_price * pos.leverage * 100
@@ -685,7 +884,7 @@ class PositionManager:
 
     def _check_time_limit(self, pos: ActivePosition, price: float) -> bool:
         strat = self._config.get("strategy", {})
-        if pos.leverage > 1:
+        if pos.leverage >= 1:
             max_hold = strat.get("time_limit_minutes", 480) * 60
             held = time.time() - pos.entry_time
             if held >= max_hold:
@@ -728,12 +927,12 @@ class PositionManager:
         return raw_pnl - fee
 
     def _get_pnl_pct(self, pos: ActivePosition, price: float) -> float:
-        if pos.entry_price == 0:
+        """PnL percentage including fees (consistent with _get_pnl)."""
+        if pos.entry_price == 0 or pos.size == 0:
             return 0.0
-        if pos.side == OrderSide.BUY_LONG:
-            return (price - pos.entry_price) / pos.entry_price * 100
-        else:
-            return (pos.entry_price - price) / pos.entry_price * 100
+        pnl = self._get_pnl(pos, price)
+        notional = pos.size * pos.entry_price
+        return (pnl / notional) * 100
 
     def _get_margin_roi(self, pos: ActivePosition, price: float) -> float:
         if pos.margin_usdt <= 0:
@@ -776,6 +975,12 @@ class PositionManager:
         return [self._pos_info(p) for p in self._positions.values()]
 
     def _pos_info(self, pos: ActivePosition) -> dict:
+        # Calculate current ROI
+        roi = 0.0
+        current = pos.current_price if pos.current_price > 0 else pos.entry_price
+        if pos.leverage > 1 and pos.margin_usdt > 0:
+            pnl = self._get_pnl(pos, current)
+            roi = pnl / pos.margin_usdt * 100
         return {
             "symbol": pos.symbol,
             "side": pos.side.value,
@@ -793,4 +998,10 @@ class PositionManager:
             "liquidation_price": pos.liquidation_price,
             "emergency_price": pos.emergency_close_price,
             "timeframe": pos.timeframe,
+            "atr_at_entry": pos.atr_at_entry,
+            "entry_score": pos.entry_score,
+            "entry_confluence": pos.entry_confluence,
+            "entry_adx": pos.entry_adx,
+            "entry_rsi": pos.entry_rsi,
+            "roi_percent": roi,
         }

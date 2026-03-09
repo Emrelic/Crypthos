@@ -83,12 +83,15 @@ def main():
             use_api = False
 
     if use_api and api_key and api_secret:
-        # Sync risk manager with real API balance
+        # Sync risk manager with real API balance and reset drawdown
         try:
             real_bal = api_executor.get_balance()
             if real_bal > 0:
                 risk_manager.update_balance(real_bal)
-                logger.info(f"Risk manager synced with API balance: {real_bal:.2f} USDT")
+                risk_manager.reset_drawdown()
+                risk_manager.reset_consecutive_losses()
+                logger.info(f"Risk manager synced with API balance: {real_bal:.2f} USDT "
+                            f"(drawdown reset, fresh start)")
         except Exception as e:
             logger.warning(f"Could not sync risk manager balance: {e}")
 

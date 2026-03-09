@@ -228,6 +228,14 @@ class ApiOrderExecutor:
             logger.error(f"get_balance failed: {e}")
             return 0.0
 
+    def get_total_balance(self) -> float:
+        """Get total USDT wallet balance (including locked margin)."""
+        try:
+            return self._rest.get_total_balance()
+        except Exception as e:
+            logger.error(f"get_total_balance failed: {e}")
+            return 0.0
+
     def get_open_positions(self) -> list[dict]:
         """Get all open positions from API."""
         try:

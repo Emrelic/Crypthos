@@ -211,9 +211,20 @@ class ScannerStateMachine:
 
         # 4. Score all symbols
         results = self._scorer.score_batch(klines_map, self._universe.get_all_tickers())
+
+        # Enrich results with leverage and timeframe data
+        if dynamic_tf:
+            for r in results:
+                coin_info = self._tf_selector.get_coin_info(r.symbol)
+                if coin_info:
+                    r.leverage = coin_info.max_leverage
+                    r.timeframe = coin_info.optimal_tf
+                else:
+                    r.timeframe = symbol_intervals.get(r.symbol, default_interval)
+
         self._last_scan_results = results
 
-        # 4. Find best eligible candidate
+        # 5. Find best eligible candidate
         now = time.time()
         self._failed_symbols = {
             s: t for s, t in self._failed_symbols.items()
@@ -241,6 +252,16 @@ class ScannerStateMachine:
                     continue
                 if self._position_mgr.is_holding(r.symbol):
                     continue
+                # ATR safety check: skip coins where no timeframe provides safe ATR
+                # Math: if ATR > target at every timeframe, SL will be too tight
+                if dynamic_tf:
+                    coin_info = self._tf_selector.get_coin_info(r.symbol)
+                    if coin_info and not coin_info.is_safe:
+                        logger.info(f"Skipping {r.symbol}: ATR unsafe at all timeframes "
+                                    f"(best={coin_info.optimal_tf} "
+                                    f"ATR={coin_info.optimal_atr_pct:.3f}% "
+                                    f"> target={coin_info.target_atr_pct:.3f}%)")
+                        continue
                 candidates.append(r)
 
         # Publish scan results for GUI
@@ -278,7 +299,7 @@ class ScannerStateMachine:
                     real_balance = self._order_executor.get_balance()
                 except Exception:
                     pass
-            if real_balance > 0 and real_balance < 0.90:
+            if real_balance > 0 and real_balance < 0.30:
                 logger.info(f"Available balance too low ({real_balance:.2f}$), waiting for positions to close")
                 scan_interval = self._config.get("scanner.scan_interval_seconds", 30)
                 self._wait(scan_interval)
@@ -302,7 +323,7 @@ class ScannerStateMachine:
                 if self._do_buying_inline():
                     bought_any = True
                 else:
-                    break  # likely margin issue, stop trying
+                    continue  # try next candidate (might be coin-specific issue)
 
             # Short wait then scan again if still have capacity
             if self._position_mgr.has_capacity and bought_any:
@@ -340,7 +361,7 @@ class ScannerStateMachine:
             regime = {}
             divergences = []
             try:
-                pos = self._position_mgr._positions.get(symbol)
+                pos = self._position_mgr.get_position(symbol)
                 interval = pos.timeframe if pos else self._config.get("indicators.kline_interval", "1m")
                 klines = self._rest.get_klines(symbol, interval, limit=200)
                 if klines and len(klines) > 50:
@@ -348,7 +369,8 @@ class ScannerStateMachine:
                     indicators = self._hold_engine.get_all_values()
                     confluence = self._hold_confluence.score(indicators)
                     regime = self._hold_regime.detect(indicators)
-                    divergences = self._hold_divergence.scan(indicators)
+                    if self._config.get("strategy.divergence_exit_enabled", False):
+                        divergences = self._hold_divergence.scan(indicators)
             except Exception as e:
                 logger.debug(f"Focus analysis error for {symbol}: {e}")
 
@@ -400,14 +422,15 @@ class ScannerStateMachine:
             confluence = {}
             divergences = []
             try:
-                pos = self._position_mgr._positions.get(symbol)
+                pos = self._position_mgr.get_position(symbol)
                 interval = pos.timeframe if pos else "1m"
                 klines = self._rest.get_klines(symbol, interval, limit=200)
                 if klines is not None and len(klines) > 50:
                     self._hold_engine.update(klines)
                     indicators = self._hold_engine.get_all_values()
                     confluence = self._hold_confluence.score(indicators)
-                    divergences = self._hold_divergence.scan(indicators)
+                    if self._config.get("strategy.divergence_exit_enabled", False):
+                        divergences = self._hold_divergence.scan(indicators)
             except Exception:
                 pass
 
@@ -418,14 +441,14 @@ class ScannerStateMachine:
             )
 
             if exit_reason != "HOLD":
-                pos = self._position_mgr._positions.get(symbol)
+                pos = self._position_mgr.get_position(symbol)
                 tf_str = f" tf={pos.timeframe}" if pos else ""
                 logger.info(f"Exit signal for {symbol}: {exit_reason} @ {current_price:.6f}{tf_str}")
                 self._sell_position(symbol, current_price, exit_reason)
 
     def _sell_position(self, symbol: str, exit_price: float, reason: str) -> None:
         """Sell a specific position."""
-        pos = self._position_mgr._positions.get(symbol)
+        pos = self._position_mgr.get_position(symbol)
         if not pos:
             return
 
@@ -543,7 +566,7 @@ class ScannerStateMachine:
             min_lev = self._config.get("leverage.min_leverage", 10)
             max_lev = self._config.get("leverage.max_leverage", 125)
 
-            # Read balance from API (or executor)
+            # Read available (free) balance from API
             real_balance = 0.0
             if self._order_executor and hasattr(self._order_executor, "get_balance"):
                 try:
@@ -554,43 +577,51 @@ class ScannerStateMachine:
             # Position sizing mode: "percentage" or "fixed"
             sizing_mode = self._config.get("leverage.position_sizing", "fixed")
             if sizing_mode == "percentage":
-                if real_balance > 0:
-                    available = real_balance
-                else:
-                    balance = self._config.get("risk.initial_balance", 5.0)
-                    if self._risk_manager:
-                        balance = self._risk_manager._current_balance
-                    used_margin = self._position_mgr.get_total_margin()
-                    available = balance - used_margin
-
-                # Emre Ortalama: portfolio_divider (1/N of balance)
-                # Below 12 USDT: dynamic divider = floor(balance), min 1 USDT per position
-                # Above 12 USDT: use configured divider (default 12)
+                # Emre Ortalama: portfolio_divider (1/N of REALIZED portfolio)
+                # Portfolio = free cash + sum of entry margins (NOT unrealized PnL)
+                # Unrealized profits don't count until position is closed.
+                # Example: 9$ free + 3 positions × 1$ margin = 12$ portfolio
+                # When one closes at +1$ profit: 11$ free + 2×1$ = 13$
                 divider = self._config.get("strategy.portfolio_divider", 0)
                 if divider > 0:
-                    if available < 12.0:
-                        divider = max(1, int(available))
-                    margin_usdt = round(available / divider, 2)
-                    sizing_label = f"1/{divider}"
+                    locked_margin = self._position_mgr.get_total_margin()
+                    wallet = real_balance + locked_margin
+                    if wallet <= 0:
+                        balance = self._config.get("risk.initial_balance", 5.0)
+                        if self._risk_manager:
+                            balance = self._risk_manager._current_balance
+                        wallet = balance
+
+                    if wallet < 12.0:
+                        divider = max(1, int(wallet))
+                    margin_usdt = round(wallet / divider, 2)
+                    sizing_label = f"1/{divider} of {wallet:.2f}$"
+
+                    logger.info(f"Portfolio: {wallet:.2f}$ "
+                                f"(free={real_balance:.2f}$ + locked={locked_margin:.2f}$)")
                 else:
+                    available = real_balance if real_balance > 0 else (
+                        self._config.get("risk.initial_balance", 5.0))
                     portfolio_pct = self._config.get("leverage.portfolio_percent", 25)
                     margin_usdt = round(available * portfolio_pct / 100.0, 2)
                     sizing_label = f"{portfolio_pct}%"
 
-                # Minimum 1$ margin rule
+                # Minimum margin: use all available if below 1$
                 if margin_usdt < 1.0:
-                    if available >= 0.90:
-                        margin_usdt = 1.0
+                    if real_balance >= 0.30:
+                        margin_usdt = round(min(real_balance * 0.95, real_balance - 0.01), 2)
+                        logger.info(f"Low balance mode: using {margin_usdt}$ "
+                                    f"(avbl={real_balance:.2f}$)")
                     else:
-                        logger.warning(f"Balance too low: {available:.2f}$ "
-                                       f"(need at least 0.90$)")
+                        logger.warning(f"Balance too low: {real_balance:.2f}$ "
+                                       f"(need at least 0.30$)")
                         return False
 
                 if real_balance > 0 and margin_usdt > real_balance * 0.95:
                     margin_usdt = round(real_balance * 0.95, 2)
 
-                logger.info(f"Position sizing: {sizing_label} of "
-                            f"{available:.2f}$ = {margin_usdt}$ margin")
+                logger.info(f"Position sizing: {sizing_label} = "
+                            f"{margin_usdt}$ margin (avbl={real_balance:.2f}$)")
             else:
                 margin_usdt = self._config.get("leverage.margin_usdt", 1.0)
                 max_pos = self._config.get("leverage.max_position_usdt", 50.0)
@@ -638,9 +669,21 @@ class ScannerStateMachine:
                 except Exception:
                     pass
 
+            # Save original margin for limit checks
+            original_margin = margin_usdt
+
             if notional_usdt < min_notional and price > 0:
                 needed_margin = min_notional / leverage * 1.05
                 max_allowed = self._config.get("risk.max_single_order_usdt", 50.0)
+                # Don't let min_notional blow up position size beyond 2x target
+                # This prevents BTC etc. from consuming disproportionate portfolio
+                original_margin = margin_usdt
+                if needed_margin > original_margin * 2.0:
+                    logger.warning(f"{symbol} min notional {min_notional}$ needs "
+                                   f"{needed_margin:.2f}$ margin (target was "
+                                   f"{original_margin:.2f}$, >2x), skipping")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
                 if needed_margin <= max_allowed:
                     logger.info(f"Adjusting margin {margin_usdt}$ -> {needed_margin:.2f}$ "
                                 f"to meet min notional {min_notional}$")
@@ -668,6 +711,13 @@ class ScannerStateMachine:
                 needed_notional = min_qty * price * 1.05
                 needed_margin = needed_notional / leverage
                 max_allowed = self._config.get("risk.max_single_order_usdt", 50.0)
+                # Don't let min_qty blow up position size beyond 2x target
+                if needed_margin > original_margin * 2.0:
+                    logger.warning(f"{symbol} min qty {min_qty} needs "
+                                   f"{needed_margin:.2f}$ margin (target was "
+                                   f"{original_margin:.2f}$, >2x), skipping")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
                 if needed_margin <= max_allowed:
                     logger.info(f"Adjusting margin for min qty: {margin_usdt}$ -> "
                                 f"{needed_margin:.2f}$ (min_qty={min_qty})")
@@ -681,21 +731,39 @@ class ScannerStateMachine:
                     return False
 
             # Dynamic SL/TP from leverage (dual-layer protection)
-            # Katman 1: Server SL at 50% of liq distance
+            # Katman 1: Server SL at 50% of liq distance (FEE + SLIPPAGE DAHIL)
             # Katman 2: Emergency software close at 80% (in position_manager)
             strat = self._config.get("strategy", {})
             liq_factor = strat.get("liq_factor", 70) / 100.0
             liq_pct = (1.0 / leverage) * liq_factor
             sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
             tp_liq_mult = strat.get("tp_liq_multiplier", 3.0)
-            sl_price_pct = liq_pct * sl_liq_pct
-            tp_price_pct = liq_pct * tp_liq_mult
-            sl_roi = round(sl_price_pct * leverage * 100, 1)
-            tp_roi = round(tp_price_pct * leverage * 100, 1)
+
+            # Fee-aware SL: hedef kayıp = SL + fee + slippage
+            # Fee ROI = round-trip %0.1 × leverage
+            # Slippage tahmini = fee × 0.5
+            # SL ROI = hedef_ROI - fee_ROI - slippage_ROI
+            fee_pct = 0.001  # round-trip fee %0.1
+            fee_roi = fee_pct * leverage * 100  # fee as % of margin
+            slippage_roi = fee_roi * 0.5  # estimated slippage
+            raw_sl_roi = liq_pct * sl_liq_pct * leverage * 100  # hedef toplam kayıp
+            net_sl_roi = max(raw_sl_roi - fee_roi - slippage_roi, fee_roi)  # fee düşülmüş SL
+            sl_price_pct = net_sl_roi / (leverage * 100)  # geri fiyat mesafesine çevir
+
+            sl_roi = round(net_sl_roi, 1)
+
+            # Only calculate TP if tp_enabled in config
+            if strat.get("tp_enabled", False):
+                tp_price_pct = liq_pct * tp_liq_mult
+                tp_roi = round(tp_price_pct * leverage * 100, 1)
+            else:
+                tp_roi = 0
 
             logger.info(f"LEVERAGE: {leverage}x margin={margin_usdt}$ "
                         f"notional={notional_usdt:.1f}$ qty={size_qty} "
-                        f"SL={sl_price_pct*100:.2f}%(ROI-{sl_roi}%) "
+                        f"SL={sl_price_pct*100:.3f}%(ROI-{sl_roi}%) "
+                        f"fee_ROI={fee_roi:.0f}% slip={slippage_roi:.0f}% "
+                        f"toplam_kayip={raw_sl_roi:.0f}% "
                         f"Emergency@80%liq")
         else:
             # Legacy non-leverage sizing
@@ -755,6 +823,10 @@ class ScannerStateMachine:
             leverage=leverage if lev_enabled else 1,
             margin_usdt=margin_usdt if lev_enabled else 0.0,
             timeframe=pos_tf,
+            entry_score=candidate.score,
+            entry_confluence=candidate.confluence.get("score", 0),
+            entry_adx=candidate.adx,
+            entry_rsi=candidate.rsi,
         )
 
         if self._risk_manager:
@@ -828,17 +900,127 @@ class ScannerStateMachine:
                         if retry_info and time.time() < retry_info.get("next_retry", 0):
                             continue  # Skip until backoff expires
 
+                        # === HYBRID TRAILING: Re-evaluate before closing ===
+                        if exit_reason == self._position_mgr.EXIT_TRAILING_RENEW:
+                            should_renew = self._evaluate_trailing_renew(
+                                symbol, current_price)
+                            if should_renew:
+                                continue  # Trailing renewed, don't close
+                            else:
+                                exit_reason = self._position_mgr.EXIT_TRAILING
+
                         logger.warning(
                             f"[MONITOR] Exit signal for {symbol}: "
                             f"{exit_reason} @ {current_price:.6f}")
                         # Only do software close if not in BUYING state
                         if self._state != ScannerState.BUYING:
-                            self._sell_position(symbol, current_price, exit_reason)
+                            try:
+                                self._sell_position(symbol, current_price, exit_reason)
+                                logger.info(f"[MONITOR] {symbol} closed successfully, "
+                                            f"slots: {self._position_mgr.position_count}/"
+                                            f"{self._position_mgr.max_positions}")
+                            except Exception as sell_err:
+                                logger.error(f"[MONITOR] Error closing {symbol}: {sell_err}")
 
                 time.sleep(check_interval)
             except Exception as e:
                 logger.error(f"Position monitor error: {e}")
+                import traceback
+                logger.error(f"Position monitor traceback: {traceback.format_exc()}")
                 time.sleep(5)
+
+    # ──── Hybrid Trailing Evaluation ────
+
+    def _evaluate_trailing_renew(self, symbol: str, current_price: float) -> bool:
+        """Trailing stop tetiklendi ama kapatmadan önce değerlendir:
+        1. Bu coinin şu anki sinyali hala güçlü mü?
+        2. Dışarıda bu coinden daha iyi fırsat var mı?
+
+        True → trailing yenile (kapat değil)
+        False → kapat (normal trailing stop)
+        """
+        try:
+            pos = self._position_mgr.get_position(symbol)
+            if not pos:
+                return False
+
+            strat = self._config.get("strategy", {})
+            min_buy_score = strat.get("min_buy_score", 55)
+
+            # 1. Bu coinin güncel kline'larını çek ve skoru hesapla
+            tf = self._tf_selector.get_timeframe(symbol) if \
+                self._config.get("strategy", {}).get("dynamic_timeframe", True) else \
+                self._config.get("indicators.kline_interval", "5m")
+            limit = self._config.get("scanner.kline_limit_scan", 200)
+
+            klines = self._rest.get_klines(symbol, tf, limit=limit)
+            if klines is None or klines.empty:
+                logger.info(f"[HYBRID] {symbol} kline çekilemedi, trailing kapatılıyor")
+                return False
+
+            # Score this symbol
+            coin_result = self._scorer.score_symbol(symbol, klines)
+
+            # Check: sinyal hala aynı yönde ve güçlü mü?
+            score = coin_result.score
+            direction_match = (
+                (pos.side == OrderSide.BUY_LONG and coin_result.direction == "LONG") or
+                (pos.side == OrderSide.SELL_SHORT and coin_result.direction == "SHORT")
+            )
+
+            if not direction_match:
+                logger.info(f"[HYBRID] {symbol} sinyal yön değiştirdi "
+                            f"({coin_result.direction}), trailing kapatılıyor")
+                return False
+
+            if not coin_result.eligible:
+                logger.info(f"[HYBRID] {symbol} artık eligible değil "
+                            f"({coin_result.reject_reason}), trailing kapatılıyor")
+                return False
+
+            abs_score = abs(score)
+            if abs_score < min_buy_score:
+                logger.info(f"[HYBRID] {symbol} skor düşük ({abs_score:.1f} < {min_buy_score}), "
+                            f"trailing kapatılıyor")
+                return False
+
+            # 2. Dışarıda daha iyi fırsat var mı? (Basit kontrol: son scan sonuçlarından)
+            # Eğer son scanda bu coinden daha yüksek skorlu eligible coin varsa → kapat
+            # (ama sadece o coin için slot boşsa önemli, 4/4 doluysa zaten açamayız)
+            # Şimdilik: sinyal güçlüyse yenile, basit tut
+            # İleride _last_scan_results ile karşılaştırma eklenebilir
+
+            # 3. Sinyal güçlü → trailing'i yenile!
+            new_atr = coin_result.atr if coin_result.atr > 0 else pos.atr_at_entry
+
+            self._position_mgr.renew_trailing(symbol, current_price, new_atr)
+
+            # 4. Binance'deki SL emrini güncelle (yeni sanal girişe göre)
+            if self._order_executor:
+                try:
+                    updated_pos = self._position_mgr.get_position(symbol)
+                    if updated_pos:
+                        strat = self._config.get("strategy", {})
+                        tp_price = updated_pos.initial_tp if strat.get("tp_enabled", False) else None
+                        self._order_executor.update_tp_sl(
+                            symbol=symbol,
+                            side="SELL" if pos.side == OrderSide.BUY_LONG else "BUY",
+                            quantity=pos.size,
+                            sl_price=updated_pos.initial_sl,
+                            tp_price=tp_price,
+                        )
+                        logger.info(f"[HYBRID] {symbol} Binance SL güncellendi: "
+                                    f"yeni SL={updated_pos.initial_sl:.6f}")
+                except Exception as e:
+                    logger.error(f"[HYBRID] {symbol} SL güncelleme hatası: {e}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[HYBRID] {symbol} değerlendirme hatası: {e}")
+            import traceback
+            logger.error(f"[HYBRID] traceback: {traceback.format_exc()}")
+            return False  # hata durumunda güvenli taraf: kapat
 
     # ──── API Position Sync ────
 
@@ -905,7 +1087,7 @@ class ScannerStateMachine:
 
         battle_mode = self._config.get("scanner.battle_mode", False)
 
-        for symbol, pos in self._position_mgr._positions.items():
+        for symbol, pos in self._position_mgr.get_all_positions().items():
             if pos.leverage <= 1:
                 continue
 
@@ -939,9 +1121,14 @@ class ScannerStateMachine:
                     logger.warning(f"Failed to update SL for {symbol}: {e}")
             else:
                 sl_price_pct = liq_pct * sl_liq_pct2
-                tp_price_pct = liq_pct * tp_liq_mult2
                 sl_roi = round(sl_price_pct * lev * 100, 1)
-                tp_roi = round(tp_price_pct * lev * 100, 1)
+
+                # Only send TP to Binance if tp_enabled in config
+                tp_roi = None
+                if strat_cfg.get("tp_enabled", False):
+                    tp_price_pct = liq_pct * tp_liq_mult2
+                    tp_roi = round(tp_price_pct * lev * 100, 1)
+
                 try:
                     self._order_executor.update_tp_sl(
                         symbol=symbol,
@@ -952,7 +1139,8 @@ class ScannerStateMachine:
                         tp_roi_pct=tp_roi,
                         sl_roi_pct=sl_roi,
                     )
-                    logger.info(f"Updated TP/SL for {symbol}: SL_ROI={sl_roi}% TP_ROI={tp_roi}%")
+                    tp_str = f" TP_ROI={tp_roi}%" if tp_roi else " (no TP)"
+                    logger.info(f"Updated SL for {symbol}: SL_ROI={sl_roi}%{tp_str}")
                 except Exception as e:
                     logger.warning(f"Failed to update TP/SL for {symbol}: {e}")
 

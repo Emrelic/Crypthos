@@ -126,11 +126,19 @@ class BinanceRestClient:
         return self._signed_get("/fapi/v2/account")
 
     def get_balance(self) -> float:
-        """Return available USDT balance."""
+        """Return available USDT balance (free, not locked in positions)."""
         data = self._signed_get("/fapi/v2/balance")
         for asset in data:
             if asset.get("asset") == "USDT":
                 return float(asset.get("availableBalance", 0))
+        return 0.0
+
+    def get_total_balance(self) -> float:
+        """Return total USDT wallet balance (including margin locked in positions)."""
+        data = self._signed_get("/fapi/v2/balance")
+        for asset in data:
+            if asset.get("asset") == "USDT":
+                return float(asset.get("balance", 0))
         return 0.0
 
     def get_positions(self, symbol: str = None) -> list:

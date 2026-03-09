@@ -8,8 +8,9 @@ Logic:
      SL = practical_liq * 0.50
      target_ATR = SL / 2  (SL = 2x ATR rule)
 
-  2. Check ATR across timeframes (1m, 3m, 5m, 15m, 30m, 1h, 4h)
-  3. Pick shortest timeframe where ATR <= target_ATR
+  2. Check ATR across timeframes (longest to shortest)
+  3. Pick the LONGEST timeframe where ATR <= target_ATR
+     (longer TF = less noise, better signals, closer to optimal risk usage)
   4. If no timeframe is safe, mark coin as too volatile for that leverage
 """
 import time
@@ -22,9 +23,10 @@ from loguru import logger
 from market.binance_rest import BinanceRestClient
 
 
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "4h"]
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h"]
 TF_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900,
-              "30m": 1800, "1h": 3600, "4h": 14400}
+              "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400,
+              "6h": 21600, "8h": 28800, "12h": 43200}
 
 
 @dataclass
@@ -123,16 +125,18 @@ class TimeframeSelector:
                 "target_atr": target_atr,
             }
 
-        # 3. Fetch ATR for each symbol across timeframes
-        # Strategy: start with 1m, only fetch longer TFs if needed
+        # 3. Pick LONGEST safe timeframe: start from longest TF, work down
+        # Goal: use the longest timeframe where ATR <= target_ATR
+        # Longer TF = less noise, better signals, closer to optimal risk usage
+        # Strategy: iterate LONGEST→SHORTEST. If ATR <= target, coin is done.
+        # If ATR > target, try next shorter TF. This minimizes API calls.
         results = {}
         remaining = list(symbols)
 
-        for tf in TIMEFRAMES:
+        for tf in reversed(TIMEFRAMES):  # 4h, 1h, 30m, 15m, 5m, 3m, 1m
             if not remaining:
                 break
 
-            # Fetch klines for remaining symbols at this timeframe
             atrs = self._batch_fetch_atr(remaining, tf)
 
             still_remaining = []
@@ -146,14 +150,14 @@ class TimeframeSelector:
                 if atr_pct is not None:
                     results[sym]["all_atrs"][tf] = atr_pct
 
-                    # Check if this TF is safe
                     if atr_pct <= t["target_atr"]:
+                        # This TF is safe — it's the longest we've tried
                         results[sym]["optimal_tf"] = tf
                         results[sym]["optimal_atr"] = atr_pct
                         results[sym]["is_safe"] = True
-                        # Don't need to check longer TFs for this symbol
-                        continue
+                        continue  # done with this symbol
 
+                # ATR too high or no data — try shorter TF
                 still_remaining.append(sym)
 
             remaining = still_remaining
@@ -194,9 +198,19 @@ class TimeframeSelector:
 
         elapsed = time.time() - start
         safe_count = sum(1 for r in results.values() if r["is_safe"])
+
+        # Log timeframe distribution
+        tf_counts = {}
+        for r in results.values():
+            tf = r.get("optimal_tf", "?")
+            tf_counts[tf] = tf_counts.get(tf, 0) + 1
+        tf_summary = ", ".join(f"{tf}={n}" for tf, n in sorted(tf_counts.items(),
+                               key=lambda x: TIMEFRAMES.index(x[0]) if x[0] in TIMEFRAMES else 99))
+
         logger.info(f"Timeframe analysis done in {elapsed:.1f}s: "
                     f"{safe_count}/{len(symbols)} safe, "
-                    f"{len(symbols)-safe_count} risky")
+                    f"{len(symbols)-safe_count} risky | "
+                    f"TF distribution: {tf_summary}")
 
         return {s: self._cache[s] for s in symbols if s in self._cache}
 

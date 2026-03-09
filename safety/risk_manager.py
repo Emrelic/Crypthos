@@ -420,6 +420,11 @@ class RiskManager:
         self._consecutive_losses = 0
         logger.info("Consecutive loss counter reset")
 
+    def reset_drawdown(self) -> None:
+        """Reset drawdown by setting peak = current balance (fresh start)."""
+        self._peak_balance = self._current_balance
+        logger.info(f"Drawdown reset: peak set to {self._peak_balance:.2f}$")
+
     @property
     def is_killed(self) -> bool:
         return self._killed
