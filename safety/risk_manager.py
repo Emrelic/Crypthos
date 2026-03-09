@@ -250,8 +250,8 @@ class RiskManager:
             return self._config.get("leverage.margin_usdt", 1.0)
 
         total_trades = self._win_count + self._loss_count
-        if total_trades < 10:
-            # Not enough data, use fixed fraction
+        if total_trades < 100:
+            # Not enough data for Kelly (need 100+ trades for statistical significance)
             fraction = self._config.get("risk.default_position_fraction", 0.02)
             return balance * fraction
 
@@ -376,7 +376,7 @@ class RiskManager:
 
     def _get_kelly_fraction(self) -> float:
         total = self._win_count + self._loss_count
-        if total < 10:
+        if total < 100:
             return self._config.get("risk.default_position_fraction", 0.02)
         win_rate = self._win_count / total
         if self._total_loss_amount == 0:
@@ -390,15 +390,17 @@ class RiskManager:
     # ──────────────────── Daily Reset ────────────────────
 
     def _reset_daily_if_needed(self) -> None:
-        """Reset daily loss counter at midnight."""
-        now = time.time()
-        # Check if a new day started (simple: every 24h from first call)
-        if self._daily_reset_time == 0:
-            self._daily_reset_time = now
-        elif now - self._daily_reset_time > 86400:
+        """Reset daily loss counter at UTC midnight."""
+        import datetime
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        today_midnight = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_ts = today_midnight.timestamp()
+
+        if self._daily_reset_time < today_ts:
             self._daily_loss = 0.0
-            self._daily_reset_time = now
-            logger.info("Daily loss counter reset")
+            self._daily_reset_time = today_ts
+            if self._daily_reset_time > 0:
+                logger.info("Daily loss counter reset (UTC midnight)")
 
     # ──────────────────── Kill Switch ────────────────────
 

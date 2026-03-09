@@ -922,9 +922,9 @@ class PositionManager:
         else:
             raw_pnl = (pos.entry_price - price) * pos.size
         # Subtract round-trip fee (0.05% taker each side)
-        notional = pos.size * pos.entry_price
-        fee = notional * 0.001  # 0.05% entry + 0.05% exit = 0.1%
-        return raw_pnl - fee
+        entry_fee = pos.size * pos.entry_price * 0.0005
+        exit_fee = pos.size * price * 0.0005
+        return raw_pnl - entry_fee - exit_fee
 
     def _get_pnl_pct(self, pos: ActivePosition, price: float) -> float:
         """PnL percentage including fees (consistent with _get_pnl)."""
