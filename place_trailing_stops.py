@@ -35,7 +35,7 @@ def main():
         return
 
     strat = config.get("strategy", {})
-    activate_mult = strat.get("trailing_atr_activate_mult", 7.0)
+    activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
     distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
     interval = config.get("strategy.kline_interval",
                           config.get("indicators.kline_interval", "5m"))

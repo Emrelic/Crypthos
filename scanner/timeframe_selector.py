@@ -130,10 +130,16 @@ class TimeframeSelector:
         # Longer TF = less noise, better signals, closer to optimal risk usage
         # Strategy: iterate LONGEST→SHORTEST. If ATR <= target, coin is done.
         # If ATR > target, try next shorter TF. This minimizes API calls.
+        # min_timeframe config: alt vadeleri engeller (ör. "5m" → 1m ve 3m kullanılmaz)
+        strat_cfg = self._config.get("strategy", {}) if self._config else {}
+        min_tf = strat_cfg.get("min_timeframe", "1m")
+        min_tf_seconds = TF_SECONDS.get(min_tf, 60)
+        allowed_tfs = [tf for tf in TIMEFRAMES if TF_SECONDS[tf] >= min_tf_seconds]
+
         results = {}
         remaining = list(symbols)
 
-        for tf in reversed(TIMEFRAMES):  # 4h, 1h, 30m, 15m, 5m, 3m, 1m
+        for tf in reversed(allowed_tfs):  # filtered: min_timeframe'den kısa vadeler atlanır
             if not remaining:
                 break
 
@@ -173,7 +179,7 @@ class TimeframeSelector:
                     r["optimal_tf"] = best_tf
                     r["optimal_atr"] = all_atrs[best_tf]
                 else:
-                    r["optimal_tf"] = "1m"
+                    r["optimal_tf"] = min_tf
                     r["optimal_atr"] = 0
                 r["is_safe"] = False
 
@@ -250,8 +256,12 @@ class TimeframeSelector:
                         np.abs(lows[1:] - closes[:-1])
                     )
                 )
-                atr14 = np.mean(tr[-14:])
-                atr_pct = (atr14 / price) * 100
+                # Wilder smoothing (EMA with alpha=1/14) — matches IndicatorEngine ATR
+                period = 14
+                atr_val = tr[0]
+                for t in tr[1:]:
+                    atr_val = atr_val * (period - 1) / period + t / period
+                atr_pct = (atr_val / price) * 100
                 return sym, atr_pct
             except Exception:
                 return sym, None

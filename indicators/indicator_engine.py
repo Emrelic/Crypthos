@@ -53,39 +53,39 @@ class IndicatorEngine:
         )
 
         # === MOMENTUM ===
-        self._indicators["Stochastic"] = StochasticOscillator(14, 3, 3)
+        # self._indicators["Stochastic"] = StochasticOscillator(14, 3, 3)  # DEVRE DISI: skorlanmiyor
         self._indicators["StochRSI"] = StochasticRSI(14, 14, 3, 3)
         self._indicators["CCI"] = CCI(20)
-        self._indicators["WilliamsR"] = WilliamsR(14)
+        # self._indicators["WilliamsR"] = WilliamsR(14)  # DEVRE DISI: skorlanmiyor
         self._indicators["MFI"] = MFI(14)
-        self._indicators["ROC"] = ROC(12)
-        self._indicators["UltOsc"] = UltimateOscillator(7, 14, 28)
+        # self._indicators["ROC"] = ROC(12)  # DEVRE DISI: skorlanmiyor
+        # self._indicators["UltOsc"] = UltimateOscillator(7, 14, 28)  # DEVRE DISI: skorlanmiyor
 
         # === TREND ===
         self._indicators["ADX"] = ADX(14)
         self._indicators["PSAR"] = ParabolicSAR()
         self._indicators["Supertrend"] = Supertrend(10, 3.0)
         self._indicators["Ichimoku"] = IchimokuCloud(9, 26, 52)
-        self._indicators["Aroon"] = Aroon(25)
+        # self._indicators["Aroon"] = Aroon(25)  # DEVRE DISI: skorlanmiyor
 
         # === VOLATILITY ===
         self._indicators["BB"] = BollingerBands(20, 2.0)
-        self._indicators["KC"] = KeltnerChannels(20, 14, 2.0)
+        # self._indicators["KC"] = KeltnerChannels(20, 14, 2.0)  # DEVRE DISI: skorlanmiyor
         self._indicators["Donchian"] = DonchianChannels(20)
         self._indicators["ATR"] = ATR(14)
 
         # === VOLUME ===
         self._indicators["OBV"] = OBV()
-        self._indicators["VWAP"] = VWAP()
+        # self._indicators["VWAP"] = VWAP()  # DEVRE DISI: skorlanmiyor
         self._indicators["CMF"] = CMF(20)
-        self._indicators["ADLine"] = ADLine()
-        self._indicators["ElderForce"] = ElderForceIndex(13)
+        # self._indicators["ADLine"] = ADLine()  # DEVRE DISI: skorlanmiyor
+        # self._indicators["ElderForce"] = ElderForceIndex(13)  # DEVRE DISI: skorlanmiyor
 
-        # === ADVANCED MAs ===
-        self._indicators["HMA"] = HullMA(20)
-        self._indicators["DEMA"] = DEMA(20)
-        self._indicators["TEMA"] = TEMA(20)
-        self._indicators["VWMA"] = VWMA(20)
+        # === ADVANCED MAs === (hicbiri skorlanmiyor, tamami devre disi)
+        # self._indicators["HMA"] = HullMA(20)
+        # self._indicators["DEMA"] = DEMA(20)
+        # self._indicators["TEMA"] = TEMA(20)
+        # self._indicators["VWMA"] = VWMA(20)
 
         logger.info(f"Initialized {len(self._indicators)} indicators")
 

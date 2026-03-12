@@ -38,9 +38,9 @@ class SettingsPanel(ctk.CTkFrame):
         # ═══════════════════════════════════════════════════════
         self._section(scroll, "Kaldirac & Pozisyon Boyutu")
         self._field(scroll, "max_positions", "Max Esanli Pozisyon",
-                    str(self.controller.config.get("scanner.max_positions", 1)))
+                    str(self.controller.config.get("strategy.max_positions", 6)))
         self._checkbox(scroll, "focus_mode", "Odak Modu (pozisyon acilinca tarama durur)",
-                       self.controller.config.get("scanner.focus_mode", True))
+                       self.controller.config.get("strategy.focus_mode", False))
         lev = self.controller.config.get("leverage", {})
 
         self._checkbox(scroll, "lev_enabled", "Kaldirac Etkin",
@@ -166,7 +166,7 @@ class SettingsPanel(ctk.CTkFrame):
         auto_start = self.controller.config.get("scanner.auto_start", True)
         self._checkbox(scroll, "auto_start", "Otomatik Baslat (program acilinca scanner baslar)",
                        auto_start)
-        close_only = self.controller.config.get("scanner.close_only", False)
+        close_only = self.controller.config.get("strategy.close_only", False)
         self._checkbox(scroll, "close_only",
                        "Sadece Kapat Modu (yeni pozisyon acma, mevcutlari kapat)",
                        close_only)
@@ -277,10 +277,10 @@ class SettingsPanel(ctk.CTkFrame):
         c.set("hotkeys.sell_short", self._entries["hk_sell"].get().strip())
         c.set("hotkeys.kill_switch", self._entries["hk_kill"].get().strip())
 
-        # Scanner
-        c.set("scanner.max_positions",
-              int(self._entries["max_positions"].get() or 1))
-        c.set("scanner.focus_mode", self._entries["focus_mode"].get())
+        # Scanner (strategy.* is single source of truth)
+        c.set("strategy.max_positions",
+              int(self._entries["max_positions"].get() or 6))
+        c.set("strategy.focus_mode", self._entries["focus_mode"].get())
 
         # Leverage settings
         c.set("leverage.enabled", self._entries["lev_enabled"].get())
@@ -305,7 +305,7 @@ class SettingsPanel(ctk.CTkFrame):
         # Trading mode
         c.set("trading.use_api", self._entries["use_api"].get())
         c.set("scanner.auto_start", self._entries["auto_start"].get())
-        c.set("scanner.close_only", self._entries["close_only"].get())
+        c.set("strategy.close_only", self._entries["close_only"].get())
 
         # Risk
         c.set("risk.initial_balance",

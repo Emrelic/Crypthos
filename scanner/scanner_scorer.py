@@ -33,6 +33,12 @@ class ScanResult:
     reject_reason: str = ""
     leverage: int = 0               # max leverage for this coin
     timeframe: str = "1m"           # optimal timeframe
+    funding_rate: float = 0.0      # current funding rate (e.g. 0.0001 = 0.01%)
+    oi_change_pct: float = 0.0     # open interest change % (last 30min)
+    ob_imbalance: float = 0.0      # order book weighted imbalance (-1 to +1)
+    ob_wall_signal: str = "NONE"   # UP_BLOCKED / DOWN_BLOCKED / NONE
+    ob_liquidity: float = 0.0      # order book liquidity score (0-100)
+    ob_thin_book: bool = False     # True if dangerously low liquidity
 
 
 class ScannerScorer:
@@ -54,8 +60,10 @@ class ScannerScorer:
         self._w_risk = 0.15
 
     def score_symbol(self, symbol: str, klines: pd.DataFrame,
-                     volume_24h: float = 0, price_change_pct: float = 0) -> ScanResult:
-        """Compute full analysis and opportunity score for one symbol."""
+                     volume_24h: float = 0, price_change_pct: float = 0,
+                     market_context: dict = None) -> ScanResult:
+        """Compute full analysis and opportunity score for one symbol.
+        market_context: optional {funding_rate: float, oi_change_pct: float}"""
         result = ScanResult(
             symbol=symbol,
             score=0.0,
@@ -63,6 +71,15 @@ class ScannerScorer:
             volume_24h=volume_24h,
             price_change_pct=price_change_pct,
         )
+
+        # Inject market context (funding rate, open interest, order book)
+        if market_context:
+            result.funding_rate = market_context.get("funding_rate", 0.0)
+            result.oi_change_pct = market_context.get("oi_change_pct", 0.0)
+            result.ob_imbalance = market_context.get("ob_imbalance", 0.0)
+            result.ob_wall_signal = market_context.get("ob_wall_signal", "NONE")
+            result.ob_liquidity = market_context.get("ob_liquidity", 0.0)
+            result.ob_thin_book = market_context.get("ob_thin_book", False)
 
         if klines is None or klines.empty or len(klines) < 50:
             result.reject_reason = "insufficient_data"
@@ -123,14 +140,18 @@ class ScannerScorer:
         return result
 
     def score_batch(self, klines_map: dict[str, pd.DataFrame],
-                    ticker_data: dict[str, dict]) -> list[ScanResult]:
-        """Score multiple symbols and return sorted results."""
+                    ticker_data: dict[str, dict],
+                    market_context_map: dict[str, dict] = None) -> list[ScanResult]:
+        """Score multiple symbols and return sorted results.
+        market_context_map: {symbol: {funding_rate, oi_change_pct}}"""
         results = []
+        ctx_map = market_context_map or {}
         for symbol, klines in klines_map.items():
             ticker = ticker_data.get(symbol, {})
             vol = ticker.get("volume_24h", 0)
             change = ticker.get("price_change_pct", 0)
-            result = self.score_symbol(symbol, klines, vol, change)
+            ctx = ctx_map.get(symbol)
+            result = self.score_symbol(symbol, klines, vol, change, ctx)
             results.append(result)
 
         # Sort by absolute score descending (best opportunities first)
@@ -146,27 +167,46 @@ class ScannerScorer:
 
         # === READ STRATEGY CONFIG ===
         strat = self._config.get("strategy", {})
-        max_lev = self._config.get("leverage.max_leverage", 100)
-        high_leverage = max_lev >= 50
+        max_lev = strat.get("max_leverage", 20)
 
-        # ATR vs LEVERAGE: 1-candle ATR should be <50% of liq distance
-        if max_lev > 1 and r.atr_percent > 0:
-            target_atr_pct = (1.0 / max_lev) * 100.0 * 0.25
-            max_safe_atr_pct = target_atr_pct * 2.0
-            if r.atr_percent > max_safe_atr_pct:
+        # ATR vs LEVERAGE: ATR must be <= target (SL = 2×ATR rule)
+        # target_ATR = (1/L) × liq_factor × sl_liq_pct / 2
+        if max_lev >= 1 and r.atr_percent > 0:
+            liq_factor = strat.get("liq_factor", 70) / 100.0
+            sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
+            target_atr_pct = (1.0 / max_lev) * 100.0 * liq_factor * sl_liq_pct / 2.0
+            if r.atr_percent > target_atr_pct:
                 return False, (f"atr_too_volatile_{max_lev}x "
-                               f"(1m ATR={r.atr_percent:.3f}% > "
-                               f"safe={max_safe_atr_pct:.3f}%)")
+                               f"(ATR={r.atr_percent:.3f}% > "
+                               f"target={target_atr_pct:.3f}%)")
 
-        # VOLATILE regime filter
-        if strat.get("volatile_filter", True) and regime_name == "VOLATILE" and high_leverage:
-            return False, "volatile_regime_high_leverage"
+        # VOLATILE regime filter (config flag kontrolü)
+        if strat.get("volatile_filter", False) and regime_name == "VOLATILE":
+            return False, "volatile_regime"
 
-        # === CONFIGURABLE THRESHOLDS ===
-        min_conf = strat.get("min_confluence", 4.0)
-        min_adx = strat.get("min_adx", 18 if high_leverage else 15)
-        max_rsi_long = strat.get("max_rsi_long", 62 if high_leverage else 65)
-        min_rsi_short = strat.get("min_rsi_short", 38 if high_leverage else 35)
+        # EXTREME FUNDING RATE filter: block trades that go with overcrowded side
+        if r.funding_rate != 0:
+            fr_pct = r.funding_rate * 100
+            if r.direction == "LONG" and fr_pct > 0.1:
+                return False, f"extreme_funding_long ({fr_pct:.3f}%, crowd=LONG)"
+            if r.direction == "SHORT" and fr_pct < -0.1:
+                return False, f"extreme_funding_short ({fr_pct:.3f}%, crowd=SHORT)"
+
+        # THIN ORDER BOOK filter: dangerously low liquidity = easy manipulation
+        if r.ob_thin_book:
+            return False, "thin_order_book (low liquidity)"
+
+        # WALL BLOCK filter: large wall directly opposing our direction
+        if r.ob_wall_signal == "UP_BLOCKED" and r.direction == "LONG":
+            return False, "ask_wall_blocking_long"
+        if r.ob_wall_signal == "DOWN_BLOCKED" and r.direction == "SHORT":
+            return False, "bid_wall_blocking_short"
+
+        # === CONFIGURABLE THRESHOLDS (all from strategy config) ===
+        min_conf = strat.get("min_confluence", 5.0)
+        min_adx = strat.get("min_adx", 22)
+        max_rsi_long = strat.get("max_rsi_long", 62)
+        min_rsi_short = strat.get("min_rsi_short", 38)
         use_macd = strat.get("macd_filter", True)
         use_volume = strat.get("volume_filter", True)
 
@@ -177,6 +217,9 @@ class ScannerScorer:
                 return False, f"rsi_overbought ({r.rsi:.0f})"
             if r.adx < min_adx:
                 return False, f"adx_too_low ({r.adx:.0f}, need {min_adx}+)"
+            # Trend yönü kontrolü: güçlü düşüş trendine karşı LONG alma
+            if trend_dir == "DOWN" and r.adx > 25:
+                return False, f"trend_against_long (trend=DOWN, ADX={r.adx:.0f})"
 
             # Volume confirmation
             if use_volume:
@@ -185,8 +228,8 @@ class ScannerScorer:
                 if obv_slope <= 0 and cmf <= 0:
                     return False, "no_volume_confirmation"
 
-            # MACD filter
-            if use_macd and high_leverage:
+            # MACD filter (config flag ile kontrol, kaldıraç bağımsız)
+            if use_macd:
                 macd_h = r.indicator_values.get("MACD_histogram", 0)
                 if macd_h <= 0:
                     return False, f"macd_not_bullish ({macd_h:.4f})"
@@ -198,6 +241,9 @@ class ScannerScorer:
                 return False, f"rsi_oversold ({r.rsi:.0f})"
             if r.adx < min_adx:
                 return False, f"adx_too_low ({r.adx:.0f}, need {min_adx}+)"
+            # Trend yönü kontrolü: güçlü yükseliş trendine karşı SHORT alma
+            if trend_dir == "UP" and r.adx > 25:
+                return False, f"trend_against_short (trend=UP, ADX={r.adx:.0f})"
 
             if use_volume:
                 obv_slope = r.indicator_values.get("OBV_slope", 0)
@@ -205,7 +251,7 @@ class ScannerScorer:
                 if obv_slope >= 0 and cmf >= 0:
                     return False, "no_volume_confirmation"
 
-            if use_macd and high_leverage:
+            if use_macd:
                 macd_h = r.indicator_values.get("MACD_histogram", 0)
                 if macd_h >= 0:
                     return False, f"macd_not_bearish ({macd_h:.4f})"
@@ -227,6 +273,10 @@ class ScannerScorer:
             self._w_trend * trend_score +
             self._w_risk * risk_score
         )
+
+        # Funding rate, Open Interest & Order Book bonus/penalty (max ±12 points)
+        sentiment = self._score_sentiment(r)
+        raw += sentiment
 
         # Cap at 100
         raw = min(raw, 100.0)
@@ -362,16 +412,17 @@ class ScannerScorer:
         """Score 0-100 based on risk quality (ATR, divergences)."""
         score = 60.0
 
-        # ATR% in sweet spot (adjusted for leverage)
-        max_lev = self._config.get("leverage.max_leverage", 20)
+        # ATR% in sweet spot: target_ATR = (1/L) × liq_factor × sl_liq_pct / 2
+        strat = self._config.get("strategy", {})
+        max_lev = strat.get("max_leverage", 20)
+        liq_factor = strat.get("liq_factor", 70) / 100.0
+        sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
         atr_pct = r.atr_percent
-        # 20x: liq=%5, SL~%1.75 -> sweet spot 0.2%-1.5%
-        # 75x: liq=%1.3, SL~%0.3 -> sweet spot 0.05%-0.3%
-        safe_atr = (1.0 / max(max_lev, 1)) * 100 * 0.25
-        if atr_pct <= safe_atr:
-            score += 20
-        elif atr_pct <= safe_atr * 2:
-            score += 10  # borderline
+        safe_atr = (1.0 / max(max_lev, 1)) * 100 * liq_factor * sl_liq_pct / 2.0
+        if atr_pct <= safe_atr * 0.8:
+            score += 20  # ATR hedefin altında — ideal
+        elif atr_pct <= safe_atr:
+            score += 10  # ATR hedefe yakın — kabul edilebilir
         elif atr_pct > safe_atr * 4:
             score -= 30  # too volatile
         if atr_pct < 0.05:
@@ -389,3 +440,86 @@ class ScannerScorer:
                 score -= 20
 
         return max(0, min(score, 100))
+
+    def _score_sentiment(self, r: ScanResult) -> float:
+        """Score bonus/penalty from funding rate + open interest + order book (max +/-12 pts).
+
+        Funding Rate Logic:
+          - High positive funding → longs are crowded → favors SHORT
+          - High negative funding → shorts are crowded → favors LONG
+          - Extreme funding (>0.1%) → strong contrarian signal
+
+        Open Interest Logic:
+          - OI rising + our direction aligned with price trend → confirmation bonus
+          - OI falling against our direction → caution penalty
+        """
+        bonus = 0.0
+        fr = r.funding_rate  # e.g. 0.0001 = 0.01%, 0.001 = 0.1%
+
+        # --- Funding Rate ---
+        if fr != 0:
+            fr_pct = fr * 100  # convert to percentage (0.0001 -> 0.01%)
+
+            if r.direction == "LONG":
+                if fr_pct > 0.05:
+                    # Positive funding = longs pay shorts = crowd is long
+                    # Penalize going with the crowd
+                    bonus -= min(fr_pct * 20, 5.0)  # max -5 pts
+                elif fr_pct < -0.05:
+                    # Negative funding = shorts pay longs = crowd is short
+                    # Bonus for contrarian long
+                    bonus += min(abs(fr_pct) * 20, 5.0)  # max +5 pts
+            else:  # SHORT
+                if fr_pct < -0.05:
+                    # Negative funding = crowd is short, penalize
+                    bonus -= min(abs(fr_pct) * 20, 5.0)
+                elif fr_pct > 0.05:
+                    # Positive funding = crowd is long, bonus for short
+                    bonus += min(fr_pct * 20, 5.0)
+
+        # --- Open Interest Change ---
+        oi_chg = r.oi_change_pct  # e.g. 5.0 = 5% increase
+
+        if oi_chg != 0:
+            price_chg = r.price_change_pct  # 24h price change %
+
+            if r.direction == "LONG":
+                if oi_chg > 2 and price_chg > 0:
+                    # OI rising + price rising = new money flowing in bullish
+                    bonus += min(oi_chg * 0.5, 3.0)
+                elif oi_chg > 2 and price_chg < -1:
+                    # OI rising + price falling = bearish pressure building
+                    bonus -= min(oi_chg * 0.5, 3.0)
+                elif oi_chg < -2 and price_chg > 0:
+                    # OI falling + price rising = short squeeze, weak rally
+                    bonus -= 1.0
+            else:  # SHORT
+                if oi_chg > 2 and price_chg < 0:
+                    # OI rising + price falling = new short money confirmed
+                    bonus += min(oi_chg * 0.5, 3.0)
+                elif oi_chg > 2 and price_chg > 1:
+                    # OI rising + price rising = bullish, bad for short
+                    bonus -= min(oi_chg * 0.5, 3.0)
+                elif oi_chg < -2 and price_chg < 0:
+                    # OI falling + price falling = long liquidation, weak
+                    bonus -= 1.0
+
+        # --- Order Book Imbalance ---
+        ob_imb = r.ob_imbalance  # -1 to +1
+
+        if ob_imb != 0:
+            if r.direction == "LONG":
+                # Positive imbalance = more bids = buying pressure = good for long
+                bonus += ob_imb * 5.0  # max ±5 pts
+            else:  # SHORT
+                # Negative imbalance = more asks = selling pressure = good for short
+                bonus += -ob_imb * 5.0
+
+        # Liquidity quality bonus: high liquidity = safer trade
+        if r.ob_liquidity >= 70:
+            bonus += 2.0
+        elif r.ob_liquidity < 30 and r.ob_liquidity > 0:
+            bonus -= 2.0
+
+        # Clamp total sentiment to +-12
+        return max(-12.0, min(12.0, bonus))

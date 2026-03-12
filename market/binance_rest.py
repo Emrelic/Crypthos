@@ -9,6 +9,11 @@ from loguru import logger
 from core.constants import BINANCE_FUTURES_REST
 
 
+def _fmt(value: float) -> str:
+    """Format float without scientific notation (e.g. 0.00001 not 1e-05)."""
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
 class BinanceRestClient:
     BASE_URL = BINANCE_FUTURES_REST
 
@@ -80,11 +85,39 @@ class BinanceRestClient:
         """Get 24h ticker data for ALL symbols in one request."""
         return self._get("/fapi/v1/ticker/24hr")
 
+    def get_all_premium_index(self) -> list:
+        """GET /fapi/v1/premiumIndex (no symbol) — returns funding rate for ALL symbols.
+        Each item: {symbol, markPrice, indexPrice, lastFundingRate, nextFundingTime, ...}"""
+        return self._get("/fapi/v1/premiumIndex")
+
+    def get_depth(self, symbol: str, limit: int = 20) -> dict:
+        """GET /fapi/v1/depth — order book depth.
+        limit: 5, 10, 20, 50, 100, 500, 1000
+        Returns: {lastUpdateId, bids: [[price, qty], ...], asks: [[price, qty], ...]}"""
+        return self._get("/fapi/v1/depth", {"symbol": symbol, "limit": limit})
+
+    def get_open_interest(self, symbol: str) -> dict:
+        """GET /fapi/v1/openInterest — current open interest for a symbol.
+        Returns: {symbol, openInterest, time}"""
+        return self._get("/fapi/v1/openInterest", {"symbol": symbol})
+
+    def get_open_interest_hist(self, symbol: str, period: str = "5m",
+                               limit: int = 10) -> list:
+        """GET /futures/data/openInterestHist — historical OI with period.
+        period: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d
+        Returns: [{symbol, sumOpenInterest, sumOpenInterestValue, timestamp}, ...]"""
+        return self._get("/futures/data/openInterestHist", {
+            "symbol": symbol,
+            "period": period,
+            "limit": limit,
+        })
+
     # ─── authenticated (signed) ───────────────────────────────
 
     def _sign(self, params: dict) -> dict:
-        """Add timestamp and HMAC-SHA256 signature to params."""
+        """Add timestamp, recvWindow and HMAC-SHA256 signature to params."""
         params["timestamp"] = int(time.time() * 1000)
+        params.setdefault("recvWindow", 5000)
         query = urlencode(params)
         sig = hmac.new(
             self._api_secret.encode(), query.encode(), hashlib.sha256
@@ -95,9 +128,19 @@ class BinanceRestClient:
     def _signed_get(self, endpoint: str, params: dict = None) -> dict | list:
         params = self._sign(params or {})
         url = f"{self.BASE_URL}{endpoint}"
-        resp = self._session.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = self._session.get(url, params=params, timeout=10)
+            if resp.status_code >= 400:
+                try:
+                    err_body = resp.json()
+                    logger.error(f"API error {resp.status_code} [{endpoint}]: {err_body}")
+                except Exception:
+                    logger.error(f"API error {resp.status_code} [{endpoint}]: {resp.text}")
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logger.error(f"Signed GET error [{endpoint}]: {e}")
+            raise
 
     def _signed_post(self, endpoint: str, params: dict = None) -> dict | list:
         params = self._sign(params or {})
@@ -115,9 +158,19 @@ class BinanceRestClient:
     def _signed_delete(self, endpoint: str, params: dict = None) -> dict | list:
         params = self._sign(params or {})
         url = f"{self.BASE_URL}{endpoint}"
-        resp = self._session.delete(url, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = self._session.delete(url, params=params, timeout=10)
+            if resp.status_code >= 400:
+                try:
+                    err_body = resp.json()
+                    logger.error(f"API error {resp.status_code} [{endpoint}]: {err_body}")
+                except Exception:
+                    logger.error(f"API error {resp.status_code} [{endpoint}]: {resp.text}")
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logger.error(f"Signed DELETE error [{endpoint}]: {e}")
+            raise
 
     # ─── account & positions ──────────────────────────────────
 
@@ -240,9 +293,9 @@ class BinanceRestClient:
             "newOrderRespType": "RESULT",
         }
         if quantity is not None:
-            params["quantity"] = str(quantity)
+            params["quantity"] = _fmt(quantity)
         if price is not None:
-            params["price"] = str(price)
+            params["price"] = _fmt(price)
         if reduce_only:
             params["reduceOnly"] = "true"
         if time_in_force:
@@ -267,37 +320,47 @@ class BinanceRestClient:
             "type": order_type,
         }
         if trigger_price is not None:
-            params["triggerPrice"] = str(trigger_price)
+            params["triggerPrice"] = _fmt(trigger_price)
         if quantity is not None:
-            params["quantity"] = str(quantity)
+            params["quantity"] = _fmt(quantity)
         if price is not None:
-            params["price"] = str(price)
+            params["price"] = _fmt(price)
         # TRAILING_STOP_MARKET does not support closePosition in algo API
         if close_position and order_type != "TRAILING_STOP_MARKET":
             params["closePosition"] = "true"
         if callback_rate is not None:
-            params["callbackRate"] = str(callback_rate)
+            params["callbackRate"] = _fmt(callback_rate)
 
         return self._signed_post("/fapi/v1/algoOrder", params)
 
     def cancel_all_orders(self, symbol: str) -> dict:
-        """Cancel all open orders (regular + algo) for a symbol."""
+        """Cancel all open orders (regular + algo) for a symbol.
+        Returns {msg: 'ok', errors: [...]} — errors list empty on full success."""
+        errors = []
         # Cancel regular orders
         try:
             self._signed_delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to cancel regular orders for {symbol}: {e}")
+            errors.append(f"regular: {e}")
         # Cancel algo/conditional orders (SL/TP)
         try:
             algo_orders = self.get_algo_open_orders(symbol)
             for o in algo_orders:
                 algo_id = o.get("algoId")
                 if algo_id:
-                    self.cancel_algo_order(algo_id)
-                    logger.debug(f"Cancelled algo order {algo_id} for {symbol}")
-        except Exception:
-            pass
-        return {"msg": "ok"}
+                    try:
+                        self.cancel_algo_order(algo_id)
+                        logger.debug(f"Cancelled algo order {algo_id} for {symbol}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel algo order {algo_id}: {e}")
+                        errors.append(f"algo_{algo_id}: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch algo orders for {symbol}: {e}")
+            errors.append(f"algo_fetch: {e}")
+        if errors:
+            logger.error(f"cancel_all_orders({symbol}) partial failure: {errors}")
+        return {"msg": "ok" if not errors else "partial_failure", "errors": errors}
 
     def get_open_orders(self, symbol: str = None) -> list:
         """GET /fapi/v1/openOrders — regular orders."""

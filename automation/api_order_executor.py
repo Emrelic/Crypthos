@@ -182,8 +182,9 @@ class ApiOrderExecutor:
         return True
 
     def close_position(self, symbol: str, side: OrderSide,
-                       qty: float) -> bool:
-        """Close a position with a market order (reduce-only).
+                       qty: float, limit_exit: bool = False,
+                       limit_offset_pct: float = 0.0) -> bool:
+        """Close a position. If limit_exit=True, uses limit order for maker fee.
         Returns True if closed successfully OR if position no longer exists."""
         # Cancel existing TP/SL orders first
         try:
@@ -194,6 +195,38 @@ class ApiOrderExecutor:
 
         close_side = (OrderSide.SELL_SHORT if side == OrderSide.BUY_LONG
                       else OrderSide.BUY_LONG)
+
+        if limit_exit and limit_offset_pct > 0:
+            # Limit exit: place at slightly favorable price for maker fee
+            try:
+                ticker = self._rest.get_ticker_price(symbol)
+                current_price = float(ticker.get("price", 0))
+                if current_price > 0:
+                    pp = self._get_price_precision(symbol)
+                    if side == OrderSide.BUY_LONG:
+                        # Closing long = SELL → place slightly above market
+                        limit_price = round(current_price * (1 + limit_offset_pct / 100), pp)
+                    else:
+                        # Closing short = BUY → place slightly below market
+                        limit_price = round(current_price * (1 - limit_offset_pct / 100), pp)
+
+                    logger.info(f"Limit exit: {close_side.value} {qty} {symbol} "
+                                f"limit={limit_price} (market={current_price}, "
+                                f"offset={limit_offset_pct:.3f}%)")
+
+                    success = self.execute_order(
+                        symbol=symbol, side=close_side,
+                        order_type=OrderType.LIMIT,
+                        price=limit_price,
+                        size=qty, reduce_only=True,
+                    )
+                    if success:
+                        return True
+                    logger.warning(f"Limit exit failed for {symbol}, falling back to market")
+            except Exception as e:
+                logger.warning(f"Limit exit error for {symbol}: {e}, falling back to market")
+
+        # Market order (default or fallback)
         success = self.execute_order(
             symbol=symbol, side=close_side,
             order_type=OrderType.MARKET,

@@ -118,7 +118,9 @@ class ATR(Indicator):
         tr2 = (df["high"] - prev_close).abs()
         tr3 = (df["low"] - prev_close).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(self.period).mean()
+        # Wilder smoothing (EMA with alpha=1/period) — industry standard
+        # More reactive to sudden volatility spikes than SMA
+        atr = tr.ewm(alpha=1.0 / self.period, min_periods=self.period).mean()
         self._value = atr.iloc[-1] if not atr.empty else 0.0
 
     def get_values(self) -> dict:
