@@ -42,12 +42,12 @@ class MarketRegimeDetector:
         regime = self.RANGING
         confidence = 0.5
 
-        if adx > 30:
-            # Strong trend
+        if adx > 25:
+            # Strong trend (matches trending_mode.min_adx)
             regime = self.TRENDING
             confidence = min(adx / 50, 1.0)
-        elif adx > 20:
-            # Moderate trend
+        elif adx > 18:
+            # Gray zone (18-25): moderate trend but higher confluence required
             if bb_width < 2.0:
                 # Low volatility + moderate ADX = possible breakout forming
                 regime = self.BREAKOUT
@@ -55,7 +55,8 @@ class MarketRegimeDetector:
             else:
                 regime = self.TRENDING
                 confidence = adx / 40
-        elif adx < 15:
+        elif adx <= 18:
+            # Ranging zone (0-18): matches ranging_mode.max_adx
             if bb_width > 5.0:
                 regime = self.VOLATILE
                 confidence = min(bb_width / 8, 1.0)

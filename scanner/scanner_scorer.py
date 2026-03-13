@@ -202,21 +202,59 @@ class ScannerScorer:
         if r.ob_wall_signal == "DOWN_BLOCKED" and r.direction == "SHORT":
             return False, "bid_wall_blocking_short"
 
-        # === CONFIGURABLE THRESHOLDS (all from strategy config) ===
-        min_conf = strat.get("min_confluence", 5.0)
-        min_adx = strat.get("min_adx", 22)
-        max_rsi_long = strat.get("max_rsi_long", 62)
-        min_rsi_short = strat.get("min_rsi_short", 38)
+        # === ADX ZONE DETECTION ===
+        ranging_cfg = strat.get("ranging_mode", {})
+        gray_cfg = strat.get("gray_zone", {})
+        trending_cfg = strat.get("trending_mode", {})
+        
+        # Determine which zone we're in
+        if r.adx <= ranging_cfg.get("max_adx", 18):
+            zone = "RANGING"
+            min_conf = ranging_cfg.get("min_confluence", 4.0)
+            min_adx = 0  # No ADX minimum for ranging
+            # Ranging mode uses different RSI thresholds
+            if ranging_cfg.get("enabled", True):
+                max_rsi_long = ranging_cfg.get("max_rsi_buy", 35)
+                min_rsi_short = ranging_cfg.get("min_rsi_sell", 65)
+            else:
+                return False, "ranging_mode_disabled"
+        elif r.adx < trending_cfg.get("min_adx", 25):
+            zone = "GRAY"
+            min_conf = gray_cfg.get("min_confluence", 6.0)
+            min_adx = strat.get("min_adx", 18)
+            max_rsi_long = strat.get("max_rsi_long", 62)
+            min_rsi_short = strat.get("min_rsi_short", 38)
+            
+            # Gray zone confirmation system
+            confirmation_cfg = gray_cfg.get("confirmation_system", {})
+            if confirmation_cfg.get("enabled", True):
+                confirmation_score = self._calculate_gray_zone_confirmation(r, confirmation_cfg)
+                required_score = confirmation_cfg.get("required_score", 0.6)
+                if confirmation_score < required_score:
+                    return False, f"gray_zone_confirmation_low ({confirmation_score:.2f}, need {required_score}+)"
+        else:
+            zone = "TRENDING"
+            min_conf = trending_cfg.get("min_confluence", 5.0)
+            min_adx = trending_cfg.get("min_adx", 25)
+            max_rsi_long = strat.get("max_rsi_long", 62)
+            min_rsi_short = strat.get("min_rsi_short", 38)
+
+        # Apply zone-specific filters
         use_macd = strat.get("macd_filter", True)
         use_volume = strat.get("volume_filter", True)
+        
+        # Ranging mode disables MACD and volume filters
+        if zone == "RANGING":
+            use_macd = False
+            use_volume = False
 
         if r.direction == "LONG":
             if conf_score < min_conf:
-                return False, f"confluence_low ({conf_score:.1f}, need {min_conf}+)"
+                return False, f"confluence_low_{zone.lower()} ({conf_score:.1f}, need {min_conf}+)"
             if r.rsi > max_rsi_long:
-                return False, f"rsi_overbought ({r.rsi:.0f})"
+                return False, f"rsi_overbought_{zone.lower()} ({r.rsi:.0f})"
             if r.adx < min_adx:
-                return False, f"adx_too_low ({r.adx:.0f}, need {min_adx}+)"
+                return False, f"adx_too_low_{zone.lower()} ({r.adx:.0f}, need {min_adx}+)"
             # Trend yönü kontrolü: güçlü düşüş trendine karşı LONG alma
             if trend_dir == "DOWN" and r.adx > 25:
                 return False, f"trend_against_long (trend=DOWN, ADX={r.adx:.0f})"
@@ -236,11 +274,11 @@ class ScannerScorer:
 
         else:
             if conf_score > -min_conf:
-                return False, f"confluence_high ({conf_score:.1f}, need -{min_conf})"
+                return False, f"confluence_high_{zone.lower()} ({conf_score:.1f}, need -{min_conf})"
             if r.rsi < min_rsi_short:
-                return False, f"rsi_oversold ({r.rsi:.0f})"
+                return False, f"rsi_oversold_{zone.lower()} ({r.rsi:.0f})"
             if r.adx < min_adx:
-                return False, f"adx_too_low ({r.adx:.0f}, need {min_adx}+)"
+                return False, f"adx_too_low_{zone.lower()} ({r.adx:.0f}, need {min_adx}+)"
             # Trend yönü kontrolü: güçlü yükseliş trendine karşı SHORT alma
             if trend_dir == "UP" and r.adx > 25:
                 return False, f"trend_against_short (trend=UP, ADX={r.adx:.0f})"
@@ -363,6 +401,116 @@ class ScannerScorer:
                 score += 15
 
         return min(score, 100)
+
+    def _calculate_gray_zone_confirmation(self, r: ScanResult, cfg: dict) -> float:
+        """Calculate gray zone confirmation score (0.0-1.0)."""
+        total_score = 0.0
+        
+        # 1. Trend Direction Analysis
+        trend_cfg = cfg.get("trend_direction", {})
+        trend_weight = trend_cfg.get("weight", 0.3)
+        trend_score = 0.0
+        
+        # DI Difference: +DI vs -DI strength
+        plus_di = r.indicator_values.get("ADX_plus_DI", 0)
+        minus_di = r.indicator_values.get("ADX_minus_DI", 0)
+        di_diff = abs(plus_di - minus_di)
+        di_threshold = trend_cfg.get("di_diff_threshold", 2.0)
+        if di_diff > di_threshold:
+            trend_score += trend_cfg.get("di_diff_points", 0.4)
+        
+        # EMA Cross: fast vs slow EMA
+        ema_fast = r.indicator_values.get("EMA_fast", 0)
+        ema_slow = r.indicator_values.get("EMA_slow", 0)
+        if ema_fast > 0 and ema_slow > 0:
+            if (r.direction == "LONG" and ema_fast > ema_slow) or (r.direction == "SHORT" and ema_fast < ema_slow):
+                trend_score += trend_cfg.get("ema_cross_points", 0.3)
+        
+        # Supertrend alignment
+        st_trend = r.indicator_values.get("Supertrend_trend", "")
+        if (r.direction == "LONG" and st_trend == "UP") or (r.direction == "SHORT" and st_trend == "DOWN"):
+            trend_score += trend_cfg.get("supertrend_points", 0.3)
+        
+        total_score += min(trend_score, 1.0) * trend_weight
+        
+        # 2. Volatility Context
+        vol_cfg = cfg.get("volatility_context", {})
+        vol_weight = vol_cfg.get("weight", 0.25)
+        vol_score = 0.0
+        
+        # Bollinger Band Width
+        bb_width = r.indicator_values.get("BB_Width", 0)
+        bb_low = vol_cfg.get("bb_width_low", 2.0)
+        bb_high = vol_cfg.get("bb_width_high", 4.0)
+        
+        if bb_width < bb_low:
+            # Low volatility = potential breakout
+            vol_score += 0.4
+        elif bb_width > bb_high:
+            # High volatility = ranging likely
+            vol_score += 0.2
+        else:
+            # Moderate volatility = neutral
+            vol_score += 0.3
+        
+        # ATR efficiency (price movement efficiency)
+        atr = r.indicator_values.get("ATR", 0)
+        price = r.indicator_values.get("Price", 0)
+        if atr > 0 and price > 0:
+            efficiency = min(abs(r.price_change_pct) / (atr / price * 100), 1.0)
+            if efficiency > vol_cfg.get("efficiency_threshold", 0.7):
+                vol_score += 0.3
+        
+        total_score += min(vol_score, 1.0) * vol_weight
+        
+        # 3. Volume/Momentum
+        mom_cfg = cfg.get("volume_momentum", {})
+        mom_weight = mom_cfg.get("weight", 0.25)
+        mom_score = 0.0
+        
+        # OBV Slope
+        obv_slope = r.indicator_values.get("OBV_slope", 0)
+        obv_threshold = mom_cfg.get("obv_slope_threshold", 0.1)
+        if (r.direction == "LONG" and obv_slope > obv_threshold) or (r.direction == "SHORT" and obv_slope < -obv_threshold):
+            mom_score += 0.4
+        
+        # CMF (Chaikin Money Flow)
+        cmf = r.indicator_values.get("CMF", 0)
+        cmf_threshold = mom_cfg.get("cmf_threshold", 0.1)
+        if (r.direction == "LONG" and cmf > cmf_threshold) or (r.direction == "SHORT" and cmf < -cmf_threshold):
+            mom_score += 0.4
+        
+        # MACD Histogram trend
+        macd_h = r.indicator_values.get("MACD_histogram", 0)
+        if mom_cfg.get("macd_histogram_trend", True):
+            if (r.direction == "LONG" and macd_h > 0) or (r.direction == "SHORT" and macd_h < 0):
+                mom_score += 0.2
+        
+        total_score += min(mom_score, 1.0) * mom_weight
+        
+        # 4. Market Structure (simplified)
+        struct_cfg = cfg.get("market_structure", {})
+        struct_weight = struct_cfg.get("weight", 0.2)
+        struct_score = 0.0
+        
+        # Price position relative to recent range
+        # This is a simplified version - could be enhanced with actual HH/LL detection
+        rsi = r.indicator_values.get("RSI", 50)
+        if r.direction == "LONG":
+            if rsi > 45 and rsi < 65:  # Not oversold, not overbought = good structure
+                struct_score += 0.5
+        else:
+            if rsi > 35 and rsi < 55:  # Similar logic for shorts
+                struct_score += 0.5
+        
+        # Additional structure points based on price momentum
+        price_change = abs(r.price_change_pct)
+        if price_change > 0.5 and price_change < 3.0:  # Moderate movement
+            struct_score += 0.3
+        
+        total_score += min(struct_score, 1.0) * struct_weight
+        
+        return min(total_score, 1.0)
 
     def _score_trend(self, r: ScanResult) -> float:
         """Score 0-100 based on trend strength indicators."""
