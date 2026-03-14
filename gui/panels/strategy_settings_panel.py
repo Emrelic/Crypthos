@@ -50,6 +50,10 @@ PRESETS = {
             "direction_balance_enabled": False, "direction_balance_ratio": "2-1",
             "coin_daily_loss_limit": 0, "coin_daily_ban_hours": 24,
             "limit_exit_enabled": False, "limit_exit_atr_offset": 0.2,
+            # Market fallback / partial TP / BTC korelasyon
+            "market_fallback_on_limit_timeout": False,
+            "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
+            "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
         },
     },
     "dengeli": {
@@ -86,6 +90,10 @@ PRESETS = {
             "direction_balance_enabled": False, "direction_balance_ratio": "2-1",
             "coin_daily_loss_limit": 0, "coin_daily_ban_hours": 24,
             "limit_exit_enabled": False, "limit_exit_atr_offset": 0.2,
+            # Market fallback / partial TP / BTC korelasyon
+            "market_fallback_on_limit_timeout": False,
+            "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
+            "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
         },
     },
     "agresif": {
@@ -124,6 +132,10 @@ PRESETS = {
             "direction_balance_enabled": False, "direction_balance_ratio": "3-1",
             "coin_daily_loss_limit": 0, "coin_daily_ban_hours": 24,
             "limit_exit_enabled": False, "limit_exit_atr_offset": 0.2,
+            # Market fallback / partial TP / BTC korelasyon
+            "market_fallback_on_limit_timeout": False,
+            "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
+            "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
         },
     },
     "emre_ortalama": {
@@ -174,6 +186,10 @@ PRESETS = {
             "coin_daily_loss_limit": 3, "coin_daily_ban_hours": 24,
             # Limit cikis: maker fee ile kapama
             "limit_exit_enabled": True, "limit_exit_atr_offset": 0.2,
+            # Market fallback / partial TP / BTC korelasyon
+            "market_fallback_on_limit_timeout": True,
+            "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
+            "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
         },
     },
 }
@@ -508,6 +524,19 @@ class StrategySettingsPanel(ctk.CTkFrame):
         cb_rchk.pack(side="left")
         self._all_widgets.append((cb_rchk, "checkbox"))
 
+        self._checkbox(s, "market_fallback_on_limit_timeout",
+                       "Limit Timeout → Market Fallback",
+                       default=False,
+                       help_text=(
+                           "LIMIT TIMEOUT MARKET FALLBACK\n"
+                           "─────────────────────────────\n"
+                           "Limit emir suresi dolunca otomatik\n"
+                           "olarak market emre doner.\n\n"
+                           "Aktif: Timeout sonrasi market ile girilir\n"
+                           "  (firsat kacirilmaz ama taker fee odenır)\n\n"
+                           "Kapali: Timeout sonrasi emir iptal edilir\n"
+                           "  (firsat kacirilabilir ama fee tasarrufu)"))
+
         # ──────────────── KALDIRAC & POZISYON ────────────────
         self._section(s, "Kaldirac & Pozisyon Boyutu")
 
@@ -698,6 +727,28 @@ class StrategySettingsPanel(ctk.CTkFrame):
         ctk.CTkLabel(row_tp_mode, text="(immediate=hedefe ulasinca sat, signal=sinyal bekle)",
                      text_color="gray60", font=ctk.CTkFont(size=10)).pack(side="left", padx=5)
 
+        # ──────────────── KISMI KAR AL (PARTIAL TP) ────────────────
+        self._section(s, "Kismi Kar Al (Partial TP)")
+        self._checkbox(s, "partial_tp_enabled", "Kismi Kar Al (Partial TP)",
+                       default=False,
+                       help_text=(
+                           "KISMI KAR AL (PARTIAL TP)\n"
+                           "─────────────────────────\n"
+                           "Belirli bir kar seviyesine ulasinca\n"
+                           "pozisyonun bir kismini kapatir.\n\n"
+                           "AVANTAJLARI:\n"
+                           "  - Kari kismen realize eder\n"
+                           "  - Kalan pozisyon trailing ile devam\n"
+                           "  - Risk azaltilmis olur\n\n"
+                           "ORNEK:\n"
+                           "  ATR mult=3, kapanis=%50\n"
+                           "  3 ATR karda pozisyonun %50'si kapanir\n"
+                           "  Kalan %50 trailing ile devam eder"))
+        self._field(s, "partial_tp_atr_mult", "Partial TP ATR Mult", "3.0",
+                    tip="Kac ATR karda kismi kar al tetiklensin (3.0=standart)")
+        self._field(s, "partial_tp_close_pct", "Kapanacak Oran (%)", "50",
+                    tip="Pozisyonun yuzde kaci kapansin (50=%50)")
+
         # ──────────────── SINYAL CIKIS ────────────────
         self._section(s, "Sinyal Bazli Cikis")
         self._checkbox(s, "signal_exit_enabled", "Sinyal Donusu Cikis (confluence ters donunce)",
@@ -849,6 +900,28 @@ class StrategySettingsPanel(ctk.CTkFrame):
         self._all_widgets.append((ratio_combo, "combo"))
         ctk.CTkLabel(row_ratio, text="(1-1=esit, 2-1=2 ayni yon + 1 ters, ...)",
                      text_color="gray50", font=ctk.CTkFont(size=10)).pack(side="left", padx=5)
+
+        # ──────────────── BTC KORELASYON FILTRESI ────────────────
+        self._section(s, "BTC Korelasyon Filtresi")
+
+        self._checkbox(s, "btc_correlation_enabled", "BTC Korelasyon Filtresi",
+                       default=False,
+                       help_text=(
+                           "BTC KORELASYON FILTRESI\n"
+                           "───────────────────────\n"
+                           "Portfoyun toplam BTC beta'sini kontrol\n"
+                           "eder. Beta cok yuksekse yeni pozisyon\n"
+                           "acilmasini engeller.\n\n"
+                           "Beta nedir:\n"
+                           "  Beta = 1.0: BTC ile ayni hareket\n"
+                           "  Beta > 1.0: BTC'den fazla hareket\n"
+                           "  Beta < 1.0: BTC'den az hareket\n"
+                           "  Beta < 0:   BTC'nin tersi hareket\n\n"
+                           "Yuksek beta = yuksek korelasyon riski.\n"
+                           "BTC duserse tum portfoy birlikte duser.\n\n"
+                           "Max portfoy beta limiti bu riski sinirlar."))
+        self._field(s, "btc_max_portfolio_beta", "Max Portfoy Beta", "2.5",
+                    tip="Portfoy toplam beta'si bu degeri asarsa yeni pozisyon acilmaz (2.5=standart)")
 
         # ──────────────── COIN GUNLUK YASAK ────────────────
         self._section(s, "Coin Gunluk Yasak (Kayip Limiti)")

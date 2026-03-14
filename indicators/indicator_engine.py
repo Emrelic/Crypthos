@@ -17,6 +17,7 @@ from indicators.trend import ADX, ParabolicSAR, Supertrend, IchimokuCloud, Aroon
 
 # Volatility
 from indicators.volatility import BollingerBands, KeltnerChannels, DonchianChannels, ATR
+from indicators.support_resistance import SupportResistance
 
 # Volume
 from indicators.volume import OBV, CVD, VWAP, CMF, ADLine, ElderForceIndex
@@ -46,6 +47,7 @@ class IndicatorEngine:
         self._indicators["SMA_fast"] = SMA(cfg.get("ma_fast", 20))
         self._indicators["SMA_slow"] = SMA(cfg.get("ma_slow", 200))
         self._indicators["EMA_fast"] = EMA(cfg.get("ma_fast", 20))
+        self._indicators["EMA50"] = EMA(50)
         self._indicators["MACD"] = MACD(
             cfg.get("macd_fast", 12),
             cfg.get("macd_slow", 26),
@@ -63,6 +65,7 @@ class IndicatorEngine:
 
         # === TREND ===
         self._indicators["ADX"] = ADX(14)
+        self._indicators["SR"] = SupportResistance(50, 5)
         # self._indicators["PSAR"] = ParabolicSAR()  # DEVRE DISI: whipsaw, MACD+ADX yeterli (orthogonality audit)
         # self._indicators["Supertrend"] = Supertrend(10, 3.0)  # DEVRE DISI: ATR+MA turevi, redundant (orthogonality audit)
         # self._indicators["Ichimoku"] = IchimokuCloud(9, 26, 52)  # DEVRE DISI: trend overlap (orthogonality audit)

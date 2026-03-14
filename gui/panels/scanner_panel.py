@@ -1,22 +1,21 @@
 """Scanner Panel - shows scanner state, scan results, active position.
-All 12 confluence indicators shown with AL/SAT/TUT signals."""
+All 11 confluence indicators shown with AL/SAT/TUT signals."""
 import math
 import customtkinter as ctk
 from tkinter import messagebox
 
 
 # Confluence indicators grouped by philosophy (must match confluence.py)
-# TREND group (left) → VOLUME (middle) → MEAN-REV group (right)
-CONF_TREND = ["MACD", "ADX", "Supertrend", "PSAR", "Ichimoku", "Price_vs_SMA"]
-CONF_VOLUME = ["OBV", "CMF"]
-CONF_REVERSION = ["RSI", "StochRSI", "MFI", "BB"]
-CONF_INDICATORS = CONF_TREND + CONF_VOLUME + CONF_REVERSION
+# TREND group → MEAN-REV group → VOLUME group (decision flow order)
+CONF_TREND = ["MACD", "ADX", "EMA50", "Price_vs_SMA", "SR"]
+CONF_REVERSION = ["RSI", "BB"]
+CONF_VOLUME = ["OBV", "CMF", "CVD", "VWAP"]
+CONF_INDICATORS = CONF_TREND + CONF_REVERSION + CONF_VOLUME
 
 CONF_SHORT_MAP = {
-    "MACD": "MACD", "ADX": "ADX", "Supertrend": "ST", "PSAR": "PSAR",
-    "Ichimoku": "Ichi", "Price_vs_SMA": "SMA",
-    "OBV": "OBV", "CMF": "CMF",
-    "RSI": "RSI", "StochRSI": "StR", "MFI": "MFI", "BB": "BB",
+    "MACD": "MACD", "ADX": "ADX", "EMA50": "EMA50", "Price_vs_SMA": "SMA", "SR": "S/R",
+    "RSI": "RSI", "BB": "BB",
+    "OBV": "OBV", "CMF": "CMF", "CVD": "CVD", "VWAP": "VWAP",
 }
 CONF_SHORT = [CONF_SHORT_MAP[k] for k in CONF_INDICATORS]
 
@@ -24,25 +23,24 @@ CONF_SHORT = [CONF_SHORT_MAP[k] for k in CONF_INDICATORS]
 CONF_HDR_COLORS = {}
 for k in CONF_TREND:
     CONF_HDR_COLORS[CONF_SHORT_MAP[k]] = "#4FC3F7"   # blue = trend
-for k in CONF_VOLUME:
-    CONF_HDR_COLORS[CONF_SHORT_MAP[k]] = "#FFD54F"   # yellow = volume
 for k in CONF_REVERSION:
     CONF_HDR_COLORS[CONF_SHORT_MAP[k]] = "#CE93D8"   # purple = mean-rev
+for k in CONF_VOLUME:
+    CONF_HDR_COLORS[CONF_SHORT_MAP[k]] = "#FFD54F"   # yellow = volume
 
 # Map confluence key -> indicator_values key for showing numerical values
 CONF_VALUE_KEYS = {
     "MACD": "MACD_histogram",
     "ADX": "ADX",
-    "Supertrend": None,        # trend string, no number
-    "PSAR": None,              # trend string, no number
-    "Ichimoku": None,          # position string, no number
-    "Price_vs_SMA": None,      # derived
+    "EMA50": None,              # cross signal
+    "Price_vs_SMA": None,       # derived
+    "SR": None,                 # position string
+    "RSI": "RSI",
+    "BB": "BB_PercentB",
     "OBV": "OBV_slope",
     "CMF": "CMF",
-    "RSI": "RSI",
-    "StochRSI": "StochRSI_K",
-    "MFI": "MFI",
-    "BB": "BB_PercentB",
+    "CVD": "CVD_normalized",
+    "VWAP": "VWAP",
 }
 
 
@@ -226,10 +224,10 @@ class ScannerPanel(ctk.CTkFrame):
             ["Conf", "AL", "SAT", "Red"]
         )
         # Pre-indicator: 30+58+110+48+48+42+38+36+36+36 = 482
-        # Indicators (new order): MACD,ADX,ST,PSAR,Ichi,SMA | OBV,CMF | RSI,StR,MFI,BB
+        # Indicators (decision flow): MACD,ADX,EMA50,SMA,S/R | RSI,BB | OBV,CMF,CVD,VWAP
         self._scan_widths = (
             [30, 58, 110, 48, 48, 42, 38, 36, 36, 36] +
-            [58, 56, 56, 58, 56, 56, 58, 56, 56, 56, 56, 56] +
+            [58, 56, 58, 56, 56, 58, 56, 58, 56, 56, 56] +
             [52, 30, 30, 48]
         )
         for h, w in zip(self._scan_headers, self._scan_widths):
@@ -260,10 +258,10 @@ class ScannerPanel(ctk.CTkFrame):
              "7xATR%", "AktROI%", "Kar/7", "Geri%", "Trail", "Kalan", "$"]
         )
         # Pre-indicator total: 88+110+48+48+42+38+36+36+36 = 482 (matches scan table)
-        # Indicators (new order): MACD,ADX,ST,PSAR,Ichi,SMA | OBV,CMF | RSI,StR,MFI,BB
+        # Indicators (decision flow): MACD,ADX,EMA50,SMA,S/R | RSI,BB | OBV,CMF,CVD,VWAP
         self._pos_widths = (
             [88, 110, 48, 48, 42, 38, 36, 36, 36] +
-            [58, 56, 56, 58, 56, 56, 58, 56, 56, 56, 56, 56] +
+            [58, 56, 58, 56, 56, 58, 56, 58, 56, 56, 56] +
             [48, 28, 28,
              44, 44,
              50, 50, 46, 46, 46, 46, 40]

@@ -86,6 +86,33 @@ class ConfluenceScorer:
             trend_details["Price_vs_SMA"] = round(s, 2)
             trend_score += s
 
+        # EMA50 Golden/Death Cross (trend confirmation)
+        ema_fast = indicator_values.get("EMA_fast", 0)  # EMA20
+        ema50 = indicator_values.get("EMA50", 0)
+        if ema_fast > 0 and ema50 > 0:
+            if ema_fast > ema50:
+                s = 1.0   # golden cross territory (bullish)
+            elif ema_fast < ema50:
+                s = -1.0  # death cross territory (bearish)
+            else:
+                s = 0.0
+            trend_details["EMA50"] = round(s, 2)
+            trend_score += s
+
+        # Support/Resistance Position
+        sr_pos = indicator_values.get("SR_position", "")
+        sr_dist_sup = indicator_values.get("SR_distance_support_pct", 50)
+        sr_dist_res = indicator_values.get("SR_distance_resistance_pct", 50)
+        s = 0.0
+        if sr_pos == "NEAR_SUPPORT":
+            s = 1.0   # near support = good for long
+        elif sr_pos == "NEAR_RESISTANCE":
+            s = -1.0  # near resistance = good for short
+        elif sr_pos == "BREAKOUT":
+            s = 0.5   # above all resistance = bullish
+        trend_details["SR"] = round(s, 2)
+        trend_score += s
+
         trend_score = round(trend_score, 2)
 
         # ══════════════════════════════════════════════
