@@ -454,7 +454,12 @@ class ScannerStateMachine:
                     confluence = self._hold_confluence.score(indicators)
                     regime = self._hold_regime.detect(indicators)
                     if self._config.get("strategy.divergence_exit_enabled", False):
-                        divergences = self._hold_divergence.scan(indicators)
+                        ind_series = {}
+                        for name in ["RSI", "CCI", "OBV"]:
+                            ind = self._hold_engine.get_indicator(name)
+                            if ind and ind._series is not None:
+                                ind_series[name] = ind._series
+                        divergences = self._hold_divergence.detect_all(klines, ind_series)
             except Exception as e:
                 logger.debug(f"Focus analysis error for {symbol}: {e}")
 
@@ -832,7 +837,12 @@ class ScannerStateMachine:
                     indicators = self._hold_engine.compute_all(klines)
                     confluence = self._hold_confluence.score(indicators)
                     if self._config.get("strategy.divergence_exit_enabled", False):
-                        divergences = self._hold_divergence.scan(indicators)
+                        ind_series = {}
+                        for name in ["RSI", "CCI", "OBV"]:
+                            ind = self._hold_engine.get_indicator(name)
+                            if ind and ind._series is not None:
+                                ind_series[name] = ind._series
+                        divergences = self._hold_divergence.detect_all(klines, ind_series)
             except Exception as e:
                 logger.warning(f"Indicator analysis failed for held {symbol}: {e}")
 

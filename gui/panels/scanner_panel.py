@@ -19,6 +19,10 @@ CONF_SHORT_MAP = {
 }
 CONF_SHORT = [CONF_SHORT_MAP[k] for k in CONF_INDICATORS]
 
+# Filter check columns (shown on far right of table)
+FILTER_COLS = ["ATR", "FR", "OB", "Conf", "RSI", "ADX", "Trend", "Vol", "MACD"]
+FILTER_COL_WIDTH = 48  # narrow columns
+
 # Header colors per group
 CONF_HDR_COLORS = {}
 for k in CONF_TREND:
@@ -221,17 +225,24 @@ class ScannerPanel(ctk.CTkFrame):
         self._scan_headers = (
             ["#", "Sinyal", "Sembol", "Skor", "ATR%", "Lev", "TF", "Fnd", "OI%", "OB"] +
             CONF_SHORT +
-            ["Conf", "AL", "SAT", "Red"]
+            ["Conf", "AL", "SAT", "Red"] +
+            FILTER_COLS
         )
         # Pre-indicator: 30+58+110+48+48+42+38+36+36+36 = 482
         # Indicators (decision flow): MACD,ADX,EMA50,SMA,S/R | RSI,BB | OBV,CMF,CVD,VWAP
+        # Filter checks: 9 columns x 48px each
         self._scan_widths = (
             [30, 58, 110, 48, 48, 42, 38, 36, 36, 36] +
             [58, 56, 58, 56, 56, 58, 56, 58, 56, 56, 56] +
-            [52, 30, 30, 48]
+            [52, 30, 30, 48] +
+            [FILTER_COL_WIDTH] * len(FILTER_COLS)
         )
-        for h, w in zip(self._scan_headers, self._scan_widths):
-            hdr_color = CONF_HDR_COLORS.get(h, "#7799BB")
+        filter_start_idx = len(self._scan_headers) - len(FILTER_COLS)
+        for col_idx, (h, w) in enumerate(zip(self._scan_headers, self._scan_widths)):
+            if col_idx >= filter_start_idx:
+                hdr_color = "#FF8A65"  # orange/salmon for filter columns
+            else:
+                hdr_color = CONF_HDR_COLORS.get(h, "#7799BB")
             ctk.CTkLabel(hdr, text=h, width=w, font=ctk.CTkFont(size=13, weight="bold"),
                          text_color=hdr_color).pack(side="left", padx=1)
 
@@ -255,19 +266,26 @@ class ScannerPanel(ctk.CTkFrame):
             CONF_SHORT +
             ["Conf", "AL", "SAT",
              "SL%", "Acil",
-             "7xATR%", "AktROI%", "Kar/7", "Geri%", "Trail", "Kalan", "$"]
+             "7xATR%", "AktROI%", "Kar/7", "Geri%", "Trail", "Kalan", "$"] +
+            FILTER_COLS
         )
         # Pre-indicator total: 88+110+48+48+42+38+36+36+36 = 482 (matches scan table)
         # Indicators (decision flow): MACD,ADX,EMA50,SMA,S/R | RSI,BB | OBV,CMF,CVD,VWAP
+        # Filter checks: 9 columns x 48px each
         self._pos_widths = (
             [88, 110, 48, 48, 42, 38, 36, 36, 36] +
             [58, 56, 58, 56, 56, 58, 56, 58, 56, 56, 56] +
             [48, 28, 28,
              44, 44,
-             50, 50, 46, 46, 46, 46, 40]
+             50, 50, 46, 46, 46, 46, 40] +
+            [FILTER_COL_WIDTH] * len(FILTER_COLS)
         )
-        for h, w in zip(self._pos_headers, self._pos_widths):
-            hdr_color = CONF_HDR_COLORS.get(h, "#7799BB")
+        pos_filter_start_idx = len(self._pos_headers) - len(FILTER_COLS)
+        for col_idx, (h, w) in enumerate(zip(self._pos_headers, self._pos_widths)):
+            if col_idx >= pos_filter_start_idx:
+                hdr_color = "#FF8A65"  # orange/salmon for filter columns
+            else:
+                hdr_color = CONF_HDR_COLORS.get(h, "#7799BB")
             ctk.CTkLabel(pos_hdr, text=h, width=w,
                          font=ctk.CTkFont(size=13, weight="bold"),
                          text_color=hdr_color).pack(side="left", padx=1)
@@ -429,6 +447,23 @@ class ScannerPanel(ctk.CTkFrame):
             else:
                 conf_color = "white"
 
+            # Build filter check cells
+            filter_checks = getattr(r, 'filter_checks', {}) or {}
+            filter_cells = []
+            for fc_name in FILTER_COLS:
+                check = filter_checks.get(fc_name)
+                if check is None:
+                    fc_text, fc_color = "--", "#555555"
+                else:
+                    passed, actual, required = check
+                    if passed:
+                        fc_text = f"\u2713\n{actual}"
+                        fc_color = "#00C853"  # green
+                    else:
+                        fc_text = f"\u2717\n{actual}"
+                        fc_color = "#FF1744"  # red
+                filter_cells.append((fc_text, fc_color))
+
             vals = [
                 (f"{i+1}", "gray"),
                 sys_signal,
@@ -445,7 +480,7 @@ class ScannerPanel(ctk.CTkFrame):
                 (f"{bullish}", "#00C853" if bullish > 0 else "gray"),
                 (f"{bearish}", "#FF1744" if bearish > 0 else "gray"),
                 (reject_short, "#FF5252" if reject_short else "gray"),
-            ]
+            ] + filter_cells
 
             # Only update labels whose text or color actually changed
             if self._result_cache[i] == vals:
@@ -639,6 +674,9 @@ class ScannerPanel(ctk.CTkFrame):
             else:
                 pos_ob_str, pos_ob_color = "--", "gray"
 
+            # Filter check cells for positions (already passed all filters)
+            pos_filter_cells = [("\u2713", "#00C853")] * len(FILTER_COLS)
+
             vals = [
                 signal_merged,
                 (symbol, "white"),
@@ -662,7 +700,7 @@ class ScannerPanel(ctk.CTkFrame):
                 (trail_str, trail_color),
                 (time_str, time_color),
                 (f"${margin:.1f}", "white"),
-            ]
+            ] + pos_filter_cells
 
             # Only update labels that changed
             if self._pos_cache[idx] == vals:

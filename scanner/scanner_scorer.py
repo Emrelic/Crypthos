@@ -31,6 +31,7 @@ class ScanResult:
     adx: float = 0.0
     eligible: bool = False          # passes all hard filters
     reject_reason: str = ""
+    filter_checks: dict = field(default_factory=dict)  # {filter_name: (passed, actual, required)}
     leverage: int = 0               # max leverage for this coin
     timeframe: str = "1m"           # optimal timeframe
     funding_rate: float = 0.0      # current funding rate (e.g. 0.0001 = 0.01%)
@@ -159,9 +160,11 @@ class ScannerScorer:
         return results
 
     def _check_eligibility(self, r: ScanResult) -> tuple[bool, str]:
-        """Check hard filters. Returns (eligible, reason)."""
+        """Check hard filters. Records ALL filter results in r.filter_checks.
+        Returns (eligible, first_reject_reason)."""
+        checks = {}
+        first_fail = ""
         conf_score = r.confluence.get("score", 0)
-        conf_signal = r.confluence.get("signal", "NEUTRAL")
         regime_name = r.regime.get("regime", "UNKNOWN")
         trend_dir = r.regime.get("trend_direction", "NONE")
 
@@ -169,69 +172,84 @@ class ScannerScorer:
         strat = self._config.get("strategy", {})
         max_lev = strat.get("max_leverage", 20)
 
-        # ATR vs LEVERAGE: ATR must be <= target (SL = 2×ATR rule)
-        # target_ATR = (1/L) × liq_factor × sl_liq_pct / 2
+        # 1. ATR SAFETY
+        target_atr_pct = 0
         if max_lev >= 1 and r.atr_percent > 0:
             liq_factor = strat.get("liq_factor", 70) / 100.0
             sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
             target_atr_pct = (1.0 / max_lev) * 100.0 * liq_factor * sl_liq_pct / 2.0
-            if r.atr_percent > target_atr_pct:
-                return False, (f"atr_too_volatile_{max_lev}x "
-                               f"(ATR={r.atr_percent:.3f}% > "
-                               f"target={target_atr_pct:.3f}%)")
+            passed = r.atr_percent <= target_atr_pct
+            checks["ATR"] = (passed, f"{r.atr_percent:.3f}%", f"<{target_atr_pct:.3f}%")
+            if not passed and not first_fail:
+                first_fail = (f"atr_too_volatile_{max_lev}x "
+                              f"(ATR={r.atr_percent:.3f}% > "
+                              f"target={target_atr_pct:.3f}%)")
+        else:
+            checks["ATR"] = (True, "-", "-")
 
-        # VOLATILE regime filter (config flag kontrolü)
-        if strat.get("volatile_filter", False) and regime_name == "VOLATILE":
-            return False, "volatile_regime"
+        # 2. VOLATILE regime filter
+        if strat.get("volatile_filter", False):
+            vol_passed = regime_name != "VOLATILE"
+            checks["Regime"] = (vol_passed, regime_name[:4], "!VOL")
+            if not vol_passed and not first_fail:
+                first_fail = "volatile_regime"
+        else:
+            checks["Regime"] = (True, regime_name[:4], "any")
 
-        # EXTREME FUNDING RATE filter: block trades that go with overcrowded side
-        if r.funding_rate != 0:
-            fr_pct = r.funding_rate * 100
-            if r.direction == "LONG" and fr_pct > 0.1:
-                return False, f"extreme_funding_long ({fr_pct:.3f}%, crowd=LONG)"
-            if r.direction == "SHORT" and fr_pct < -0.1:
-                return False, f"extreme_funding_short ({fr_pct:.3f}%, crowd=SHORT)"
+        # 3. FUNDING RATE
+        fr_pct = r.funding_rate * 100 if r.funding_rate != 0 else 0
+        if r.direction == "LONG":
+            fr_passed = fr_pct <= 0.1
+            checks["FR"] = (fr_passed, f"{fr_pct:+.3f}%", "<0.1%")
+        else:
+            fr_passed = fr_pct >= -0.1
+            checks["FR"] = (fr_passed, f"{fr_pct:+.3f}%", ">-0.1%")
+        if not fr_passed and not first_fail:
+            first_fail = f"extreme_funding ({fr_pct:.3f}%)"
 
-        # THIN ORDER BOOK filter: dangerously low liquidity = easy manipulation
-        if r.ob_thin_book:
-            return False, "thin_order_book (low liquidity)"
-
-        # WALL BLOCK filter: large wall directly opposing our direction
+        # 4. ORDERBOOK (thin + wall)
+        ob_passed = not r.ob_thin_book
+        wall_ok = True
         if r.ob_wall_signal == "UP_BLOCKED" and r.direction == "LONG":
-            return False, "ask_wall_blocking_long"
+            wall_ok = False
         if r.ob_wall_signal == "DOWN_BLOCKED" and r.direction == "SHORT":
-            return False, "bid_wall_blocking_short"
+            wall_ok = False
+        ob_final = ob_passed and wall_ok
+        ob_actual = "thin" if not ob_passed else ("wall" if not wall_ok else "ok")
+        checks["OB"] = (ob_final, ob_actual, "ok")
+        if not ob_final and not first_fail:
+            if not ob_passed:
+                first_fail = "thin_order_book (low liquidity)"
+            else:
+                first_fail = f"{r.ob_wall_signal.lower()}"
 
         # === ADX ZONE DETECTION ===
         ranging_cfg = strat.get("ranging_mode", {})
         gray_cfg = strat.get("gray_zone", {})
         trending_cfg = strat.get("trending_mode", {})
-        
+
         # Determine which zone we're in
         if r.adx <= ranging_cfg.get("max_adx", 18):
             zone = "RANGING"
             min_conf = ranging_cfg.get("min_confluence", 4.0)
             min_adx = 0  # No ADX minimum for ranging
-            # Ranging mode uses different RSI thresholds
             if ranging_cfg.get("enabled", True):
                 max_rsi_long = ranging_cfg.get("max_rsi_buy", 35)
                 min_rsi_short = ranging_cfg.get("min_rsi_sell", 65)
             else:
-                return False, "ranging_mode_disabled"
+                # Ranging mode disabled — record and fail
+                checks["Zone"] = (False, "RANG", "enabled")
+                if not first_fail:
+                    first_fail = "ranging_mode_disabled"
+                # Still need defaults for remaining checks
+                max_rsi_long = 35
+                min_rsi_short = 65
         elif r.adx < trending_cfg.get("min_adx", 25):
             zone = "GRAY"
             min_conf = gray_cfg.get("min_confluence", 6.0)
             min_adx = strat.get("min_adx", 18)
             max_rsi_long = strat.get("max_rsi_long", 62)
             min_rsi_short = strat.get("min_rsi_short", 38)
-            
-            # Gray zone confirmation system
-            confirmation_cfg = gray_cfg.get("confirmation_system", {})
-            if confirmation_cfg.get("enabled", True):
-                confirmation_score = self._calculate_gray_zone_confirmation(r, confirmation_cfg)
-                required_score = confirmation_cfg.get("required_score", 0.6)
-                if confirmation_score < required_score:
-                    return False, f"gray_zone_confirmation_low ({confirmation_score:.2f}, need {required_score}+)"
         else:
             zone = "TRENDING"
             min_conf = trending_cfg.get("min_confluence", 5.0)
@@ -239,62 +257,97 @@ class ScannerScorer:
             max_rsi_long = strat.get("max_rsi_long", 62)
             min_rsi_short = strat.get("min_rsi_short", 38)
 
-        # Apply zone-specific filters
+        # Zone check (informational, always passes unless ranging disabled above)
+        if "Zone" not in checks:
+            checks["Zone"] = (True, zone[:4], zone[:4])
+
+        # 5. Confluence check
+        if r.direction == "LONG":
+            conf_passed = conf_score >= min_conf
+            checks["Conf"] = (conf_passed, f"{conf_score:.1f}", f">={min_conf:.0f}")
+        else:
+            conf_passed = conf_score <= -min_conf
+            checks["Conf"] = (conf_passed, f"{conf_score:.1f}", f"<=-{min_conf:.0f}")
+        if not conf_passed and not first_fail:
+            first_fail = f"confluence_{zone.lower()} ({conf_score:.1f}, need {'+'if r.direction=='LONG' else '-'}{min_conf})"
+
+        # 6. RSI check
+        if r.direction == "LONG":
+            rsi_passed = r.rsi <= max_rsi_long
+            checks["RSI"] = (rsi_passed, f"{r.rsi:.0f}", f"<={max_rsi_long}")
+        else:
+            rsi_passed = r.rsi >= min_rsi_short
+            checks["RSI"] = (rsi_passed, f"{r.rsi:.0f}", f">={min_rsi_short}")
+        if not rsi_passed and not first_fail:
+            first_fail = f"rsi_{zone.lower()} ({r.rsi:.0f})"
+
+        # 7. ADX minimum check
+        adx_passed = r.adx >= min_adx
+        checks["ADX"] = (adx_passed, f"{r.adx:.0f}", f">={min_adx}")
+        if not adx_passed and not first_fail:
+            first_fail = f"adx_too_low_{zone.lower()} ({r.adx:.0f})"
+
+        # 8. Trend direction check
+        trend_passed = True
+        if r.direction == "LONG" and trend_dir == "DOWN" and r.adx > 25:
+            trend_passed = False
+        elif r.direction == "SHORT" and trend_dir == "UP" and r.adx > 25:
+            trend_passed = False
+        checks["Trend"] = (trend_passed, trend_dir[:2], f"={'UP' if r.direction=='LONG' else 'DN'}?")
+        if not trend_passed and not first_fail:
+            first_fail = f"trend_against_{r.direction.lower()}"
+
+        # Apply zone-specific filter flags
         use_macd = strat.get("macd_filter", True)
         use_volume = strat.get("volume_filter", True)
-        
         # Ranging mode disables MACD and volume filters
         if zone == "RANGING":
             use_macd = False
             use_volume = False
 
-        if r.direction == "LONG":
-            if conf_score < min_conf:
-                return False, f"confluence_low_{zone.lower()} ({conf_score:.1f}, need {min_conf}+)"
-            if r.rsi > max_rsi_long:
-                return False, f"rsi_overbought_{zone.lower()} ({r.rsi:.0f})"
-            if r.adx < min_adx:
-                return False, f"adx_too_low_{zone.lower()} ({r.adx:.0f}, need {min_adx}+)"
-            # Trend yönü kontrolü: güçlü düşüş trendine karşı LONG alma
-            if trend_dir == "DOWN" and r.adx > 25:
-                return False, f"trend_against_long (trend=DOWN, ADX={r.adx:.0f})"
-
-            # Volume confirmation
-            if use_volume:
-                obv_slope = r.indicator_values.get("OBV_slope", 0)
-                cmf = r.indicator_values.get("CMF", 0)
-                if obv_slope <= 0 and cmf <= 0:
-                    return False, "no_volume_confirmation"
-
-            # MACD filter (config flag ile kontrol, kaldıraç bağımsız)
-            if use_macd:
-                macd_h = r.indicator_values.get("MACD_histogram", 0)
-                if macd_h <= 0:
-                    return False, f"macd_not_bullish ({macd_h:.4f})"
-
+        # 9. Volume confirmation
+        if use_volume:
+            obv_slope = r.indicator_values.get("OBV_slope", 0)
+            cmf = r.indicator_values.get("CMF", 0)
+            if r.direction == "LONG":
+                vol_passed = obv_slope > 0 or cmf > 0
+            else:
+                vol_passed = obv_slope < 0 or cmf < 0
+            checks["Vol"] = (vol_passed, f"{'+'if obv_slope>0 else '-'}", "confirm")
         else:
-            if conf_score > -min_conf:
-                return False, f"confluence_high_{zone.lower()} ({conf_score:.1f}, need -{min_conf})"
-            if r.rsi < min_rsi_short:
-                return False, f"rsi_oversold_{zone.lower()} ({r.rsi:.0f})"
-            if r.adx < min_adx:
-                return False, f"adx_too_low_{zone.lower()} ({r.adx:.0f}, need {min_adx}+)"
-            # Trend yönü kontrolü: güçlü yükseliş trendine karşı SHORT alma
-            if trend_dir == "UP" and r.adx > 25:
-                return False, f"trend_against_short (trend=UP, ADX={r.adx:.0f})"
+            vol_passed = True
+            checks["Vol"] = (True, "skip", "skip")
+        if not vol_passed and not first_fail:
+            first_fail = "no_volume_confirmation"
 
-            if use_volume:
-                obv_slope = r.indicator_values.get("OBV_slope", 0)
-                cmf = r.indicator_values.get("CMF", 0)
-                if obv_slope >= 0 and cmf >= 0:
-                    return False, "no_volume_confirmation"
+        # 10. MACD filter
+        if use_macd:
+            macd_h = r.indicator_values.get("MACD_histogram", 0)
+            if r.direction == "LONG":
+                macd_passed = macd_h > 0
+            else:
+                macd_passed = macd_h < 0
+            checks["MACD"] = (macd_passed, f"{macd_h:.4f}", f"{'>'if r.direction=='LONG' else '<'}0")
+        else:
+            macd_passed = True
+            checks["MACD"] = (True, "skip", "skip")
+        if not macd_passed and not first_fail:
+            first_fail = f"macd_not_{'bullish' if r.direction=='LONG' else 'bearish'}"
 
-            if use_macd:
-                macd_h = r.indicator_values.get("MACD_histogram", 0)
-                if macd_h >= 0:
-                    return False, f"macd_not_bearish ({macd_h:.4f})"
+        # 11. Gray zone confirmation (only in gray zone)
+        if zone == "GRAY":
+            confirmation_cfg = gray_cfg.get("confirmation_system", {})
+            if confirmation_cfg.get("enabled", True):
+                confirmation_score = self._calculate_gray_zone_confirmation(r, confirmation_cfg)
+                required_score = confirmation_cfg.get("required_score", 0.6)
+                gz_passed = confirmation_score >= required_score
+                checks["GZ"] = (gz_passed, f"{confirmation_score:.2f}", f">={required_score}")
+                if not gz_passed and not first_fail:
+                    first_fail = f"gray_zone_confirmation_low ({confirmation_score:.2f}, need {required_score}+)"
 
-        return True, ""
+        r.filter_checks = checks
+        all_passed = not first_fail
+        return all_passed, first_fail
 
     def _compute_score(self, r: ScanResult) -> float:
         """Compute composite score (0-100, negative for SHORT)."""
