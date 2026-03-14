@@ -27,8 +27,6 @@ class MarketRegimeDetector:
         minus_di = indicator_values.get("ADX_minus_DI", 0)
         bb_width = indicator_values.get("BB_Width", 0)
         atr = indicator_values.get("ATR", 0)
-        supertrend_trend = indicator_values.get("Supertrend_trend", "")
-        psar_trend = indicator_values.get("PSAR_trend", "")
 
         # Determine trend direction
         if plus_di > minus_di:
@@ -78,12 +76,12 @@ class MarketRegimeDetector:
         # Indicator weight adjustments per regime
         weight_map = {
             self.TRENDING: {
-                "MACD": 1.5, "ADX": 1.5, "Supertrend": 1.5,
+                "MACD": 1.5, "ADX": 1.5,
                 "EMA_fast": 1.3, "RSI": 0.7, "BB": 0.5,
             },
             self.RANGING: {
                 "RSI": 1.5, "BB": 1.5, "Stoch": 1.3,
-                "MACD": 0.5, "ADX": 0.5, "Supertrend": 0.5,
+                "MACD": 0.5, "ADX": 0.5,
             },
             self.VOLATILE: {
                 "ATR": 1.5, "BB": 1.3, "Volume": 1.3,

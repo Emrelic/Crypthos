@@ -64,6 +64,8 @@ class ConfigManager:
     def __init__(self, path: str = "config.json"):
         self._path = path
         self._config: dict = copy.deepcopy(DEFAULT_CONFIG)
+        self._previous_config: dict = {}  # for change tracking
+        self._order_logger = None  # set externally after init
         self.load()
 
     def load(self) -> None:
@@ -79,10 +81,28 @@ class ConfigManager:
             self.save()
             logger.info(f"Default config created at {self._path}")
 
-    def save(self) -> None:
+    def set_order_logger(self, order_logger) -> None:
+        """Set order logger for config change tracking."""
+        self._order_logger = order_logger
+        # Take initial snapshot
+        if order_logger:
+            self._previous_config = copy.deepcopy(self._config)
+            order_logger.log_config_change({}, self._config, change_source="startup")
+
+    def save(self, change_source: str = "manual") -> None:
+        """Save config and log changes to DB."""
+        # Log config changes if tracker is set
+        if self._order_logger and self._previous_config:
+            try:
+                self._order_logger.log_config_change(
+                    self._previous_config, self._config, change_source)
+            except Exception as e:
+                logger.debug(f"Config change logging failed: {e}")
+
         try:
             with open(self._path, "w", encoding="utf-8") as f:
                 json.dump(self._config, f, indent=2, ensure_ascii=False)
+            self._previous_config = copy.deepcopy(self._config)
         except Exception as e:
             logger.error(f"Config save error: {e}")
 

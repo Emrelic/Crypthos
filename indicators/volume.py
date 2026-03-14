@@ -1,4 +1,4 @@
-"""Volume indicators: OBV, VWAP, CMF, A/D Line, Elder Force Index."""
+"""Volume indicators: OBV, CVD, VWAP, CMF, A/D Line, Elder Force Index."""
 import numpy as np
 import pandas as pd
 from indicators.base import Indicator
@@ -30,6 +30,49 @@ class OBV(Indicator):
         return {
             "OBV": round(self._value, 0),
             "OBV_slope": round(self._obv_slope, 0) if hasattr(self, '_obv_slope') else 0,
+        }
+
+
+class CVD(Indicator):
+    """Cumulative Volume Delta - measures aggressive buying vs selling pressure.
+    CVD = cumsum(taker_buy_volume - taker_sell_volume).
+    Rising CVD = buyers dominating, falling = sellers dominating. Divergence = reversal."""
+
+    def __init__(self):
+        super().__init__("CVD")
+        self._cvd_slope = 0.0
+        self._cvd_normalized = 0.0
+
+    def compute(self, df: pd.DataFrame) -> None:
+        self._prev_value = self._value
+        volume = df["volume"]
+        taker_buy = df["taker_buy_volume"]
+        # delta = buy_vol - sell_vol = taker_buy - (volume - taker_buy) = 2*taker_buy - volume
+        delta = 2 * taker_buy - volume
+        cvd = delta.cumsum()
+        self._value = cvd.iloc[-1] if not cvd.empty else 0.0
+        self._series = cvd
+
+        # Slope over last 5 candles
+        if len(cvd) >= 5:
+            self._cvd_slope = cvd.iloc[-1] - cvd.iloc[-5]
+        else:
+            self._cvd_slope = 0.0
+
+        # Normalized signal: -1 to +1 based on recent CVD range
+        window = min(len(cvd), 50)
+        recent = cvd.iloc[-window:]
+        rng = recent.max() - recent.min()
+        if rng > 0:
+            self._cvd_normalized = 2 * (self._value - recent.min()) / rng - 1
+        else:
+            self._cvd_normalized = 0.0
+
+    def get_values(self) -> dict:
+        return {
+            "CVD": round(self._value, 0),
+            "CVD_slope": round(self._cvd_slope, 0),
+            "CVD_normalized": round(self._cvd_normalized, 4),
         }
 
 

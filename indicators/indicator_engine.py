@@ -19,7 +19,7 @@ from indicators.trend import ADX, ParabolicSAR, Supertrend, IchimokuCloud, Aroon
 from indicators.volatility import BollingerBands, KeltnerChannels, DonchianChannels, ATR
 
 # Volume
-from indicators.volume import OBV, VWAP, CMF, ADLine, ElderForceIndex
+from indicators.volume import OBV, CVD, VWAP, CMF, ADLine, ElderForceIndex
 
 # Advanced MAs
 from indicators.advanced_ma import HullMA, DEMA, TEMA, VWMA
@@ -54,18 +54,18 @@ class IndicatorEngine:
 
         # === MOMENTUM ===
         # self._indicators["Stochastic"] = StochasticOscillator(14, 3, 3)  # DEVRE DISI: skorlanmiyor
-        self._indicators["StochRSI"] = StochasticRSI(14, 14, 3, 3)
+        # self._indicators["StochRSI"] = StochasticRSI(14, 14, 3, 3)  # DEVRE DISI: RSI turevi, redundant (orthogonality audit)
         self._indicators["CCI"] = CCI(20)
         # self._indicators["WilliamsR"] = WilliamsR(14)  # DEVRE DISI: skorlanmiyor
-        self._indicators["MFI"] = MFI(14)
+        # self._indicators["MFI"] = MFI(14)  # DEVRE DISI: RSI+volume, OBV/CMF yeterli (orthogonality audit)
         # self._indicators["ROC"] = ROC(12)  # DEVRE DISI: skorlanmiyor
         # self._indicators["UltOsc"] = UltimateOscillator(7, 14, 28)  # DEVRE DISI: skorlanmiyor
 
         # === TREND ===
         self._indicators["ADX"] = ADX(14)
-        self._indicators["PSAR"] = ParabolicSAR()
-        self._indicators["Supertrend"] = Supertrend(10, 3.0)
-        self._indicators["Ichimoku"] = IchimokuCloud(9, 26, 52)
+        # self._indicators["PSAR"] = ParabolicSAR()  # DEVRE DISI: whipsaw, MACD+ADX yeterli (orthogonality audit)
+        # self._indicators["Supertrend"] = Supertrend(10, 3.0)  # DEVRE DISI: ATR+MA turevi, redundant (orthogonality audit)
+        # self._indicators["Ichimoku"] = IchimokuCloud(9, 26, 52)  # DEVRE DISI: trend overlap (orthogonality audit)
         # self._indicators["Aroon"] = Aroon(25)  # DEVRE DISI: skorlanmiyor
 
         # === VOLATILITY ===
@@ -76,7 +76,8 @@ class IndicatorEngine:
 
         # === VOLUME ===
         self._indicators["OBV"] = OBV()
-        # self._indicators["VWAP"] = VWAP()  # DEVRE DISI: skorlanmiyor
+        self._indicators["CVD"] = CVD()
+        self._indicators["VWAP"] = VWAP()
         self._indicators["CMF"] = CMF(20)
         # self._indicators["ADLine"] = ADLine()  # DEVRE DISI: skorlanmiyor
         # self._indicators["ElderForce"] = ElderForceIndex(13)  # DEVRE DISI: skorlanmiyor

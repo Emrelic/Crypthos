@@ -38,6 +38,13 @@ class ActivePosition:
     # Hybrid trailing: virtual entry for renewed trailing
     virtual_entry_price: float = 0.0   # reset point for ATR trailing (0 = use real entry)
     trailing_renewal_count: int = 0    # how many times trailing was renewed
+    # Market regime at entry
+    entry_regime: str = ""             # TRENDING, RANGING, GRAY, VOLATILE, BREAKOUT
+    entry_regime_confidence: float = 0.0
+    entry_bb_width: float = 0.0
+    # Partial take profit tracking
+    partial_tp_taken: bool = False     # whether partial TP has been executed
+    original_size: float = 0.0         # size before partial close
 
 
 class PositionManager:
@@ -56,6 +63,7 @@ class PositionManager:
     EXIT_DIVERGENCE = "DIVERGENCE_WARNING"
     EXIT_REGIME = "REGIME_DETERIORATION"
     EXIT_TIME = "TIME_LIMIT"
+    EXIT_PARTIAL_TP = "PARTIAL_TP"
 
     def __init__(self, config: ConfigManager, event_bus: EventBus):
         self._config = config
@@ -108,6 +116,12 @@ class PositionManager:
         with self._lock:
             return dict(self._positions)
 
+    def update_position_size(self, symbol: str, new_size: float) -> None:
+        """Update position size after partial close."""
+        with self._lock:
+            if symbol in self._positions:
+                self._positions[symbol].size = new_size
+
     def get_direction_counts(self) -> tuple[int, int]:
         """Return (long_count, short_count) of currently open positions."""
         with self._lock:
@@ -125,12 +139,16 @@ class PositionManager:
                       entry_score: float = 0.0,
                       entry_confluence: float = 0.0,
                       entry_adx: float = 0.0,
-                      entry_rsi: float = 50.0) -> ActivePosition:
+                      entry_rsi: float = 50.0,
+                      entry_regime: str = "",
+                      entry_regime_confidence: float = 0.0,
+                      entry_bb_width: float = 0.0) -> ActivePosition:
         """Create and track a new position."""
         with self._lock:
             return self._open_position_locked(
                 symbol, side, price, size, atr, leverage, margin_usdt,
-                timeframe, entry_score, entry_confluence, entry_adx, entry_rsi)
+                timeframe, entry_score, entry_confluence, entry_adx, entry_rsi,
+                entry_regime, entry_regime_confidence, entry_bb_width)
 
     def _open_position_locked(self, symbol: str, side: OrderSide, price: float,
                               size: float, atr: float,
@@ -140,7 +158,10 @@ class PositionManager:
                               entry_score: float = 0.0,
                               entry_confluence: float = 0.0,
                               entry_adx: float = 0.0,
-                              entry_rsi: float = 50.0) -> ActivePosition:
+                              entry_rsi: float = 50.0,
+                              entry_regime: str = "",
+                              entry_regime_confidence: float = 0.0,
+                              entry_bb_width: float = 0.0) -> ActivePosition:
         """Internal: create position (caller must hold lock)."""
         if symbol in self._positions:
             logger.warning(f"Already holding {symbol}, skipping duplicate")
@@ -219,6 +240,9 @@ class PositionManager:
         pos.entry_confluence = entry_confluence
         pos.entry_adx = entry_adx
         pos.entry_rsi = entry_rsi
+        pos.entry_regime = entry_regime
+        pos.entry_regime_confidence = entry_regime_confidence
+        pos.entry_bb_width = entry_bb_width
 
         self._positions[symbol] = pos
 
@@ -326,6 +350,14 @@ class PositionManager:
         if strat.get("tp_enabled", False):
             if self._check_take_profit(pos, current_price):
                 return self.EXIT_TP
+
+        # === 3.5 PARTIAL TAKE PROFIT (2×ATR profit, close 50%) ===
+        if strat.get("partial_tp_enabled", False) and not pos.partial_tp_taken:
+            partial_mult = strat.get("partial_tp_atr_mult", 2.0)
+            if profit_atr >= partial_mult:
+                pos.partial_tp_taken = True
+                pos.original_size = pos.size
+                return self.EXIT_PARTIAL_TP
 
         # === 4. TRAILING STOP (Hybrid) ===
         # N×ATR'de aktive olur, 1×ATR geri cekilmede tetiklenir.
@@ -554,6 +586,19 @@ class PositionManager:
                 "lowest_price": pos.lowest_price,
                 "leverage": pos.leverage,
                 "margin_usdt": pos.margin_usdt,
+                "notional_usdt": pos.notional_usdt,
+                "entry_time": pos.entry_time,
+                "initial_sl": pos.initial_sl,
+                "initial_tp": pos.initial_tp,
+                "atr_at_entry": pos.atr_at_entry,
+                "timeframe": pos.timeframe,
+                "entry_score": pos.entry_score,
+                "entry_confluence": pos.entry_confluence,
+                "entry_adx": pos.entry_adx,
+                "entry_rsi": pos.entry_rsi,
+                "entry_regime": pos.entry_regime,
+                "entry_regime_confidence": pos.entry_regime_confidence,
+                "entry_bb_width": pos.entry_bb_width,
             }
 
             del self._positions[symbol]

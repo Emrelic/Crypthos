@@ -64,6 +64,7 @@ def main():
 
     order_logger = OrderLogger("data/crypthos.db")
     controller.set_order_logger(order_logger)
+    config.set_order_logger(order_logger)  # Config change tracking
 
     # Trading mode: API or UI automation
     use_api = config.get("trading.use_api", False)

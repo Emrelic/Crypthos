@@ -1,8 +1,8 @@
 """Confluence Scoring System - Option C: Dual-Philosophy with Conflict Detection.
 
 Two indicator groups scored separately:
-  TREND group:     MACD, ADX, Supertrend, PSAR, Ichimoku, Price_vs_SMA
-  MEAN-REV group:  RSI, StochRSI, MFI, BB
+  TREND group:     MACD, ADX, Price_vs_SMA (orthogonality audit: 3 independent signals)
+  MEAN-REV group:  RSI, BB (orthogonality audit: 2 independent signals)
 
 Volume (OBV, CMF) is a confirmation layer added to the active group.
 
@@ -48,65 +48,41 @@ class ConfluenceScorer:
         trend_details = {}
         trend_score = 0.0
 
-        # MACD
+        # MACD (boosted: ±2.5 max, was ±2.0)
         macd_hist = indicator_values.get("MACD_histogram", 0)
         w = weights.get("MACD", 1.0)
         if indicator_values.get("MACD_bullish_cross"):
-            s = 2.0
+            s = 2.5
         elif indicator_values.get("MACD_bearish_cross"):
-            s = -2.0
+            s = -2.5
         elif macd_hist > 0:
-            s = 0.5
+            s = 0.7
         elif macd_hist < 0:
-            s = -0.5
+            s = -0.7
         else:
             s = 0.0
         trend_details["MACD"] = round(s * w, 2)
         trend_score += s * w
 
-        # ADX + DI
+        # ADX + DI (boosted: ±2.0 max, was ±1.5)
         adx = indicator_values.get("ADX", 0)
         plus_di = indicator_values.get("ADX_plus_DI", 0)
         minus_di = indicator_values.get("ADX_minus_DI", 0)
         w = weights.get("ADX", 1.0)
         if adx > 30:
-            s = 1.5 if plus_di > minus_di else -1.5
+            s = 2.0 if plus_di > minus_di else -2.0
         elif adx > 22:
-            s = 0.75 if plus_di > minus_di else -0.75
+            s = 1.0 if plus_di > minus_di else -1.0
         else:
             s = 0.0
         trend_details["ADX"] = round(s * w, 2)
         trend_score += s * w
 
-        # Supertrend
-        st_trend = indicator_values.get("Supertrend_trend", "")
-        w = weights.get("Supertrend", 1.0)
-        if st_trend == "UP":
-            s = 1.5
-        elif st_trend == "DOWN":
-            s = -1.5
-        else:
-            s = 0.0
-        trend_details["Supertrend"] = round(s * w, 2)
-        trend_score += s * w
-
-        # Parabolic SAR
-        psar_trend = indicator_values.get("PSAR_trend", "")
-        s = 1.0 if psar_trend == "UP" else (-1.0 if psar_trend == "DOWN" else 0.0)
-        trend_details["PSAR"] = round(s, 2)
-        trend_score += s
-
-        # Ichimoku
-        ichi_pos = indicator_values.get("Ichimoku_Position", "")
-        s = 1.5 if ichi_pos == "ABOVE" else (-1.5 if ichi_pos == "BELOW" else 0.0)
-        trend_details["Ichimoku"] = round(s, 2)
-        trend_score += s
-
-        # Price vs SMA
+        # Price vs SMA (boosted: ±1.5 max, was ±1.0)
         price = indicator_values.get("Price", 0)
         sma_slow = indicator_values.get("SMA_slow", 0)
         if price > 0 and sma_slow > 0:
-            s = 1.0 if price > sma_slow else -1.0
+            s = 1.5 if price > sma_slow else -1.5
             trend_details["Price_vs_SMA"] = round(s, 2)
             trend_score += s
 
@@ -118,56 +94,33 @@ class ConfluenceScorer:
         rev_details = {}
         rev_score = 0.0
 
-        # RSI
+        # RSI (boosted: ±2.5 max, was ±2.0)
         rsi = indicator_values.get("RSI", 50)
         w = weights.get("RSI", 1.0)
         if rsi < 25:
-            s = 2.0
+            s = 2.5
         elif rsi < 35:
-            s = 1.0
+            s = 1.2
         elif rsi > 75:
-            s = -2.0
+            s = -2.5
         elif rsi > 65:
-            s = -1.0
+            s = -1.2
         else:
             s = 0.0
         rev_details["RSI"] = round(s * w, 2)
         rev_score += s * w
 
-        # StochRSI
-        stoch_k = indicator_values.get("StochRSI_K", 50)
-        stoch_d = indicator_values.get("StochRSI_D", 50)
-        if stoch_k < 20 and stoch_k > stoch_d:
-            s = 1.5
-        elif stoch_k > 80 and stoch_k < stoch_d:
-            s = -1.5
-        else:
-            s = 0.0
-        rev_details["StochRSI"] = round(s, 2)
-        rev_score += s
-
-        # MFI
-        mfi = indicator_values.get("MFI", 50)
-        if mfi < 20:
-            s = 1.5
-        elif mfi > 80:
-            s = -1.5
-        else:
-            s = 0.0
-        rev_details["MFI"] = round(s, 2)
-        rev_score += s
-
-        # Bollinger Bands %B
+        # Bollinger Bands %B (boosted: ±2.0 max, was ±1.5)
         bb_pctb = indicator_values.get("BB_PercentB", 0.5)
         w = weights.get("BB", 1.0)
         if bb_pctb < 0.0:
-            s = 1.5
+            s = 2.0
         elif bb_pctb > 1.0:
-            s = -1.5
+            s = -2.0
         elif bb_pctb < 0.2:
-            s = 1.0
+            s = 1.2
         elif bb_pctb > 0.8:
-            s = -1.0
+            s = -1.2
         else:
             s = 0.0
         rev_details["BB"] = round(s * w, 2)
@@ -198,6 +151,35 @@ class ConfluenceScorer:
             s = 0.0
         vol_details["CMF"] = round(s, 2)
         vol_score += s
+
+        # CVD (Cumulative Volume Delta) — orderflow signal
+        cvd_norm = indicator_values.get("CVD_normalized", 0)
+        if cvd_norm > 0.3:
+            s = 1.5
+        elif cvd_norm > 0.1:
+            s = 0.7
+        elif cvd_norm < -0.3:
+            s = -1.5
+        elif cvd_norm < -0.1:
+            s = -0.7
+        else:
+            s = 0.0
+        vol_details["CVD"] = round(s, 2)
+        vol_score += s
+
+        # VWAP — institutional reference price
+        price = indicator_values.get("Price", 0)
+        vwap = indicator_values.get("VWAP", 0)
+        if price > 0 and vwap > 0:
+            vwap_dist = (price - vwap) / vwap * 100  # % distance from VWAP
+            if vwap_dist > 0.5:
+                s = 0.5   # price above VWAP = bullish
+            elif vwap_dist < -0.5:
+                s = -0.5  # price below VWAP = bearish
+            else:
+                s = 0.0
+            vol_details["VWAP"] = round(s, 2)
+            vol_score += s
 
         vol_score = round(vol_score, 2)
 

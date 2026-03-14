@@ -110,7 +110,7 @@ class ScannerScorer:
 
             # Divergence
             ind_series = {}
-            for name in ["RSI", "CCI", "MFI", "OBV"]:
+            for name in ["RSI", "CCI", "OBV"]:
                 ind = self._engine.get_indicator(name)
                 if ind and ind._series is not None:
                     ind_series[name] = ind._series
@@ -375,30 +375,35 @@ class ScannerScorer:
         return base * confidence
 
     def _score_volume(self, r: ScanResult) -> float:
-        """Score 0-100 based on volume confirmation."""
+        """Score 0-100 based on volume confirmation.
+        Orthogonality audit: OBV + CMF + CVD (orderflow)."""
         score = 50.0  # base
         obv_slope = r.indicator_values.get("OBV_slope", 0)
         cmf = r.indicator_values.get("CMF", 0)
-        mfi = r.indicator_values.get("MFI", 50)
+        cvd_norm = r.indicator_values.get("CVD_normalized", 0)
 
         if r.direction == "LONG":
             if obv_slope > 0:
-                score += 20
+                score += 15
             if cmf > 0.1:
                 score += 15
             elif cmf > 0:
                 score += 5
-            if mfi < 30:
-                score += 15  # oversold MFI = buying opportunity
+            if cvd_norm > 0.3:
+                score += 15  # strong buy flow
+            elif cvd_norm > 0.1:
+                score += 8
         else:
             if obv_slope < 0:
-                score += 20
+                score += 15
             if cmf < -0.1:
                 score += 15
             elif cmf < 0:
                 score += 5
-            if mfi > 70:
-                score += 15
+            if cvd_norm < -0.3:
+                score += 15  # strong sell flow
+            elif cvd_norm < -0.1:
+                score += 8
 
         return min(score, 100)
 
@@ -426,11 +431,11 @@ class ScannerScorer:
             if (r.direction == "LONG" and ema_fast > ema_slow) or (r.direction == "SHORT" and ema_fast < ema_slow):
                 trend_score += trend_cfg.get("ema_cross_points", 0.3)
         
-        # Supertrend alignment
-        st_trend = r.indicator_values.get("Supertrend_trend", "")
-        if (r.direction == "LONG" and st_trend == "UP") or (r.direction == "SHORT" and st_trend == "DOWN"):
+        # MACD alignment (replaced Supertrend — orthogonality audit)
+        macd_h = r.indicator_values.get("MACD_histogram", 0)
+        if (r.direction == "LONG" and macd_h > 0) or (r.direction == "SHORT" and macd_h < 0):
             trend_score += trend_cfg.get("supertrend_points", 0.3)
-        
+
         total_score += min(trend_score, 1.0) * trend_weight
         
         # 2. Volatility Context
@@ -513,46 +518,40 @@ class ScannerScorer:
         return min(total_score, 1.0)
 
     def _score_trend(self, r: ScanResult) -> float:
-        """Score 0-100 based on trend strength indicators."""
+        """Score 0-100 based on trend strength indicators.
+        Orthogonality audit: 3 independent signals (ADX, MACD, SMA200)."""
         score = 0.0
         adx = r.indicator_values.get("ADX", 0)
         plus_di = r.indicator_values.get("ADX_plus_DI", 0)
         minus_di = r.indicator_values.get("ADX_minus_DI", 0)
-        st = r.indicator_values.get("Supertrend_trend", "")
         macd_h = r.indicator_values.get("MACD_histogram", 0)
         price = r.indicator_values.get("Price", 0)
         sma200 = r.indicator_values.get("SMA_slow", 0)
 
-        # ADX strength
+        # ADX strength (boosted: was 30, now 35)
         if adx > 30:
-            score += 30
+            score += 35
         elif adx > 20:
-            score += 15
+            score += 18
 
-        # DI alignment
+        # DI alignment (boosted: was 20, now 25)
         if r.direction == "LONG" and plus_di > minus_di:
-            score += 20
+            score += 25
         elif r.direction == "SHORT" and minus_di > plus_di:
-            score += 20
+            score += 25
 
-        # Supertrend
-        if r.direction == "LONG" and st == "UP":
-            score += 20
-        elif r.direction == "SHORT" and st == "DOWN":
-            score += 20
-
-        # MACD histogram
+        # MACD histogram (boosted: was 15, now 20)
         if r.direction == "LONG" and macd_h > 0:
-            score += 15
+            score += 20
         elif r.direction == "SHORT" and macd_h < 0:
-            score += 15
+            score += 20
 
-        # Price vs SMA200
+        # Price vs SMA200 (boosted: was 15, now 20)
         if price > 0 and sma200 > 0:
             if r.direction == "LONG" and price > sma200:
-                score += 15
+                score += 20
             elif r.direction == "SHORT" and price < sma200:
-                score += 15
+                score += 20
 
         return min(score, 100)
 

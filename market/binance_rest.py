@@ -55,7 +55,7 @@ class BinanceRestClient:
             "close_time", "quote_volume", "trades", "taker_buy_volume",
             "taker_buy_quote_volume", "ignore",
         ])
-        for col in ["open", "high", "low", "close", "volume"]:
+        for col in ["open", "high", "low", "close", "volume", "taker_buy_volume"]:
             df[col] = df[col].astype(float)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
@@ -171,6 +171,43 @@ class BinanceRestClient:
         except requests.RequestException as e:
             logger.error(f"Signed DELETE error [{endpoint}]: {e}")
             raise
+
+    # ─── income history ──────────────────────────────────────
+
+    def get_income_history(self, income_type: str = "", symbol: str = "",
+                           start_time: int = 0, end_time: int = 0,
+                           limit: int = 1000) -> list:
+        """GET /fapi/v1/income — trade income history (PnL, fees, funding, liquidations)."""
+        params = {"limit": limit}
+        if income_type:
+            params["incomeType"] = income_type
+        if symbol:
+            params["symbol"] = symbol
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+        try:
+            return self._signed_get("/fapi/v1/income", params)
+        except Exception as e:
+            logger.error(f"Income history error: {e}")
+            return []
+
+    def get_account_trades(self, symbol: str = "", start_time: int = 0,
+                           end_time: int = 0, limit: int = 500) -> list:
+        """GET /fapi/v1/userTrades — actual trade fills with qty, price, fee."""
+        params = {"limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+        try:
+            return self._signed_get("/fapi/v1/userTrades", params)
+        except Exception as e:
+            logger.error(f"Account trades error: {e}")
+            return []
 
     # ─── account & positions ──────────────────────────────────
 
