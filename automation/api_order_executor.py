@@ -108,14 +108,21 @@ class ApiOrderExecutor:
                 return False
 
     def _get_price_precision(self, symbol: str) -> int:
-        """Get price precision for a symbol from exchange info."""
+        """Get price precision from tickSize (more accurate than pricePrecision).
+        tickSize=0.0000100 → 5 decimals, tickSize=0.01 → 2 decimals."""
         try:
             info = self._rest.get_exchange_info(symbol)
             if info:
+                filters = {f["filterType"]: f for f in info.get("filters", [])}
+                tick_size = filters.get("PRICE_FILTER", {}).get("tickSize", "")
+                if tick_size:
+                    # Count decimals from tickSize: "0.0000100" → strip trailing 0s → "0.00001" → 5
+                    tick_str = str(tick_size).rstrip("0")
+                    if "." in tick_str:
+                        return len(tick_str.split(".")[1])
                 return info.get("pricePrecision", 4)
         except Exception:
             pass
-        # Fallback: guess from entry price
         return 4
 
     def _place_tp_sl(self, symbol: str, entry_side: str,
