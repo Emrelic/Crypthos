@@ -103,7 +103,13 @@
     "coin_daily_loss_limit": 2,
     "coin_daily_ban_hours": 24,
     "limit_exit_atr_offset": 0.1,
-    "max_symbols_to_scan": 50,
+    "max_symbols_to_scan": 100,
+    "market_fallback_on_limit_timeout": true,
+    "partial_tp_enabled": true,
+    "partial_tp_atr_mult": 2.0,
+    "partial_tp_close_pct": 0.5,
+    "btc_correlation_enabled": true,
+    "btc_max_portfolio_beta": 2.0,
     "macd_filter": true,
     "volume_filter": true,
     "volatile_filter": false,
@@ -124,7 +130,32 @@
     "battle_mode": false,
     "close_only": false,
     "focus_mode": false,
-    "direction_balance_ratio": "2-1"
+    "direction_balance_ratio": "2-1",
+    "ranging_mode": {
+      "enabled": true,
+      "max_adx": 18,
+      "min_confluence": 4.0,
+      "max_rsi_buy": 35,
+      "min_rsi_sell": 65
+    },
+    "gray_zone": {
+      "min_adx": 18,
+      "max_adx": 25,
+      "min_confluence": 6.0,
+      "position_size_multiplier": 0.6,
+      "confirmation_system": {
+        "enabled": true,
+        "required_score": 0.6,
+        "trend_direction": { "weight": 0.3, "di_diff_threshold": 2.0, "ema_cross_points": 1.0, "supertrend_points": 0.3 },
+        "volatility_context": { "weight": 0.25, "bb_width_low": 2.0, "bb_width_high": 4.0, "efficiency_threshold": 0.7 },
+        "volume_momentum": { "weight": 0.25, "obv_slope_threshold": 0.1, "cmf_threshold": 0.1, "macd_histogram_trend": true },
+        "market_structure": { "weight": 0.2, "hh_ll_lookback": 10 }
+      }
+    },
+    "trending_mode": {
+      "min_adx": 25,
+      "min_confluence": 5.0
+    }
   },
   "adaptive_regime": {
     "enabled": true,
