@@ -21,6 +21,8 @@ from analysis.divergence import DivergenceDetector
 from analysis.orderbook_analyzer import OrderBookAnalyzer
 from analysis.btc_correlation import BTCCorrelationEngine
 
+TF_LADDER = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h"]
+
 
 class ScannerStateMachine:
     """Main scanner loop: IDLE -> SCANNING -> BUYING -> loop.
@@ -278,6 +280,12 @@ class ScannerStateMachine:
                     r.timeframe = coin_info.optimal_tf
                 else:
                     r.timeframe = symbol_intervals.get(r.symbol, default_interval)
+
+        # Multi-timeframe analysis for top 5 (enriches mtf_data field)
+        try:
+            self._fetch_mtf_data(results)
+        except Exception as e:
+            logger.debug(f"MTF analysis failed: {e}")
 
         self._last_scan_results = results
 
@@ -567,6 +575,53 @@ class ScannerStateMachine:
                 ctx[sym]["ob_thin_book"] = ob.get("thin_book", False)
             except Exception:
                 pass  # Order book is optional, don't block scan
+
+    # ──── Multi-Timeframe Analysis ────
+
+    @staticmethod
+    def _get_upper_tfs(base_tf: str) -> tuple:
+        """Get 2-up and 5-up timeframes from base on the TF ladder."""
+        try:
+            idx = TF_LADDER.index(base_tf)
+        except ValueError:
+            return "1h", "4h"
+        tf_2up = TF_LADDER[min(idx + 2, len(TF_LADDER) - 1)]
+        tf_5up = TF_LADDER[min(idx + 5, len(TF_LADDER) - 1)]
+        return tf_2up, tf_5up
+
+    def _fetch_mtf_data(self, results: list) -> None:
+        """Fetch upper-timeframe indicators for top 5 results.
+        Populates result.mtf_data = {tf: {indicators, confluence, signal}} for each."""
+        mtf_engine = IndicatorEngine(self._config)
+        mtf_confluence = ConfluenceScorer(threshold=4.0)
+
+        for r in results[:5]:
+            base_tf = getattr(r, 'timeframe', '1m')
+            tf_2up, tf_5up = self._get_upper_tfs(base_tf)
+            mtf = {}
+
+            for tf in (tf_2up, tf_5up):
+                if tf == base_tf:
+                    continue  # skip if clamped to same TF
+                try:
+                    klines = self._rest.get_klines(r.symbol, tf, limit=200)
+                    if klines is not None and len(klines) > 50:
+                        indicators = mtf_engine.compute_all(klines)
+                        confluence = mtf_confluence.score(indicators)
+                        conf_score = confluence.get("score", 0)
+                        if conf_score >= 0:
+                            signal = "LONG"
+                        else:
+                            signal = "SHORT"
+                        mtf[tf] = {
+                            "indicators": indicators,
+                            "confluence": confluence,
+                            "signal": signal,
+                        }
+                except Exception as e:
+                    logger.debug(f"MTF fetch error {r.symbol}@{tf}: {e}")
+
+            r.mtf_data = mtf
 
     # ──── Pending Limit Order Management ────
 

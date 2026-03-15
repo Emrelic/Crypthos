@@ -40,6 +40,7 @@ class ScanResult:
     ob_wall_signal: str = "NONE"   # UP_BLOCKED / DOWN_BLOCKED / NONE
     ob_liquidity: float = 0.0      # order book liquidity score (0-100)
     ob_thin_book: bool = False     # True if dangerously low liquidity
+    mtf_data: dict = field(default_factory=dict)  # {tf: {indicators, confluence}} for multi-TF
 
 
 class ScannerScorer:

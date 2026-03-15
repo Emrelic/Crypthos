@@ -1,12 +1,13 @@
 """Scanner Panel - shows scanner state, scan results, active position.
-All 11 confluence indicators shown with AL/SAT/TUT signals."""
+All 11 confluence indicators shown with AL/SAT/TUT signals.
+Multi-timeframe sub-rows for top scan results."""
 import math
 import customtkinter as ctk
 from tkinter import messagebox
 
 
 # Confluence indicators grouped by philosophy (must match confluence.py)
-# TREND group → MEAN-REV group → VOLUME group (decision flow order)
+# TREND group -> MEAN-REV group -> VOLUME group (decision flow order)
 CONF_TREND = ["MACD", "ADX", "EMA50", "Price_vs_SMA", "SR"]
 CONF_REVERSION = ["RSI", "BB"]
 CONF_VOLUME = ["OBV", "CMF", "CVD", "VWAP"]
@@ -22,6 +23,9 @@ CONF_SHORT = [CONF_SHORT_MAP[k] for k in CONF_INDICATORS]
 # Filter check columns (shown on far right of table)
 FILTER_COLS = ["ATR", "FR", "OB", "Conf", "RSI", "ADX", "Trend", "Vol", "MACD"]
 FILTER_COL_WIDTH = 48  # narrow columns
+
+# Timeframe ladder (must match state_machine.py TF_LADDER)
+TF_LADDER = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h"]
 
 # Header colors per group
 CONF_HDR_COLORS = {}
@@ -46,6 +50,9 @@ CONF_VALUE_KEYS = {
     "CVD": "CVD_normalized",
     "VWAP": "VWAP",
 }
+
+# Sub-row background colors (darker than main rows)
+_SUB_ROW_BG = "#141e33"
 
 
 def _conf_detail_cell(score: float, raw_val=None) -> tuple[str, str]:
@@ -138,6 +145,17 @@ def _system_signal_position(pos_side: str, confluence: dict) -> tuple[str, str]:
             return ("DIKKAT", "#FF9800")
 
 
+def _get_upper_tfs(base_tf: str) -> tuple:
+    """Get 2-up and 5-up timeframes from base on the TF ladder."""
+    try:
+        idx = TF_LADDER.index(base_tf)
+    except ValueError:
+        return "1h", "4h"
+    tf_2up = TF_LADDER[min(idx + 2, len(TF_LADDER) - 1)]
+    tf_5up = TF_LADDER[min(idx + 5, len(TF_LADDER) - 1)]
+    return tf_2up, tf_5up
+
+
 class ScannerPanel(ctk.CTkFrame):
     """GUI panel for the crypto scanner state machine."""
 
@@ -212,88 +230,99 @@ class ScannerPanel(ctk.CTkFrame):
                                         font=ctk.CTkFont(size=13))
         self._trade_lbl.pack(side="right", padx=10)
 
+        # === Shared column widths for alignment ===
+        # Both tables share: [Sinyal, Sembol, ATR%, Lev, TF, Fnd, OI%, OB] + 11 indicators + [Conf, AL, SAT]
+        # Scan-only prefix: # + Skor
+        # Pos-only prefix: ROI%
+        # After SAT: scan has [Red + filters], pos has [filters + exit cols]
+        _IND_W = [50, 48, 50, 48, 48, 50, 48, 50, 48, 48, 48]  # 11 indicators
+        _SHARED_MID = [48, 38, 32, 32, 32, 32]  # ATR% Lev TF Fnd OI% OB
+        _CONF_W = [44, 26, 26]  # Conf AL SAT
+        _FLT_W = [42] * len(FILTER_COLS)  # 9 filter cols
+
         # === MIDDLE: Scan Results Table ===
         table_frame = ctk.CTkFrame(self)
-        table_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        table_frame.pack(fill="both", expand=True, padx=5, pady=3)
 
-        ctk.CTkLabel(table_frame, text="Tarama Sonuclari (Top 100)",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=5, pady=3)
+        ctk.CTkLabel(table_frame, text="Tarama Sonuclari",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=5, pady=2)
 
         # Header
         hdr = ctk.CTkFrame(table_frame)
-        hdr.pack(fill="x", padx=5)
+        hdr.pack(fill="x", padx=2)
         self._scan_headers = (
-            ["#", "Sinyal", "Sembol", "Skor", "ATR%", "Lev", "TF", "Fnd", "OI%", "OB"] +
+            ["#", "Sinyal", "Sembol", "Skor"] +
+            ["ATR%", "Lev", "TF", "Fnd", "OI%", "OB"] +
             CONF_SHORT +
             ["Conf", "AL", "SAT", "Red"] +
             FILTER_COLS
         )
-        # Pre-indicator: 30+58+110+48+48+42+38+36+36+36 = 482
-        # Indicators (decision flow): MACD,ADX,EMA50,SMA,S/R | RSI,BB | OBV,CMF,CVD,VWAP
-        # Filter checks: 9 columns x 48px each
         self._scan_widths = (
-            [30, 58, 110, 48, 48, 42, 38, 36, 36, 36] +
-            [58, 56, 58, 56, 56, 58, 56, 58, 56, 56, 56] +
-            [52, 30, 30, 48] +
-            [FILTER_COL_WIDTH] * len(FILTER_COLS)
+            [20, 50, 78, 40] +
+            _SHARED_MID +
+            _IND_W +
+            _CONF_W + [60] +
+            _FLT_W
         )
         filter_start_idx = len(self._scan_headers) - len(FILTER_COLS)
         for col_idx, (h, w) in enumerate(zip(self._scan_headers, self._scan_widths)):
             if col_idx >= filter_start_idx:
-                hdr_color = "#FF8A65"  # orange/salmon for filter columns
+                hdr_color = "#FF8A65"
             else:
                 hdr_color = CONF_HDR_COLORS.get(h, "#7799BB")
-            ctk.CTkLabel(hdr, text=h, width=w, font=ctk.CTkFont(size=13, weight="bold"),
-                         text_color=hdr_color).pack(side="left", padx=1)
+            ctk.CTkLabel(hdr, text=h, width=w, font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=hdr_color).pack(side="left", padx=0)
 
         # Scrollable results
-        self._results_scroll = ctk.CTkScrollableFrame(table_frame, height=350)
-        self._results_scroll.pack(fill="both", expand=True, padx=5, pady=3)
-        self._result_rows = []   # list of (frame, [labels])
-        self._result_cache = []  # list of [(text, color), ...] per row — skip if same
+        self._results_scroll = ctk.CTkScrollableFrame(table_frame, height=320)
+        self._results_scroll.pack(fill="both", expand=True, padx=2)
+        self._result_rows = []
+        self._result_cache = []
 
         # === BOTTOM: Active Positions ===
-        pos_frame = ctk.CTkFrame(self)
-        pos_frame.pack(fill="x", padx=10, pady=5)
+        pos_frame_outer = ctk.CTkFrame(self)
+        pos_frame_outer.pack(fill="x", padx=5, pady=3)
 
-        ctk.CTkLabel(pos_frame, text="Aktif Pozisyonlar",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=5)
+        ctk.CTkLabel(pos_frame_outer, text="Aktif Pozisyonlar",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=5)
 
-        pos_hdr = ctk.CTkFrame(pos_frame)
-        pos_hdr.pack(fill="x", padx=5)
+        pos_hdr = ctk.CTkFrame(pos_frame_outer)
+        pos_hdr.pack(fill="x", padx=2)
+        # Pos prefix: Sinyal(50) + Sembol(78) + ROI%(40) = 168 = scan prefix 20+50+78+40 = 188
+        # Add 20px spacer to match scan's "#" column
+        # FILTER_COLS come BEFORE exit columns so they align with scan table
         self._pos_headers = (
-            ["Sinyal", "Sembol", "ROI%", "ATR%", "Lev", "TF", "Fnd", "OI%", "OB"] +
+            ["", "Sinyal", "Sembol", "ROI%"] +
+            ["ATR%", "Lev", "TF", "Fnd", "OI%", "OB"] +
             CONF_SHORT +
-            ["Conf", "AL", "SAT",
-             "SL%", "Acil",
-             "7xATR%", "AktROI%", "Kar/7", "Geri%", "Trail", "Kalan", "$"] +
-            FILTER_COLS
+            ["Conf", "AL", "SAT"] +
+            FILTER_COLS +
+            ["SL%", "Acil", "AktR%", "Kar/A", "Geri%", "Trail", "Kalan", "$"]
         )
-        # Pre-indicator total: 88+110+48+48+42+38+36+36+36 = 482 (matches scan table)
-        # Indicators (decision flow): MACD,ADX,EMA50,SMA,S/R | RSI,BB | OBV,CMF,CVD,VWAP
-        # Filter checks: 9 columns x 48px each
         self._pos_widths = (
-            [88, 110, 48, 48, 42, 38, 36, 36, 36] +
-            [58, 56, 58, 56, 56, 58, 56, 58, 56, 56, 56] +
-            [48, 28, 28,
-             44, 44,
-             50, 50, 46, 46, 46, 46, 40] +
-            [FILTER_COL_WIDTH] * len(FILTER_COLS)
+            [20, 50, 78, 40] +
+            _SHARED_MID +
+            _IND_W +
+            _CONF_W +
+            _FLT_W +
+            [38, 38, 40, 38, 38, 38, 40, 36]
         )
-        pos_filter_start_idx = len(self._pos_headers) - len(FILTER_COLS)
+        # Filter columns start right after Conf/AL/SAT
+        pos_filter_start_idx = 4 + len(_SHARED_MID) + len(_IND_W) + len(_CONF_W)
+        pos_filter_end_idx = pos_filter_start_idx + len(FILTER_COLS)
         for col_idx, (h, w) in enumerate(zip(self._pos_headers, self._pos_widths)):
-            if col_idx >= pos_filter_start_idx:
-                hdr_color = "#FF8A65"  # orange/salmon for filter columns
+            if pos_filter_start_idx <= col_idx < pos_filter_end_idx:
+                hdr_color = "#FF8A65"
             else:
                 hdr_color = CONF_HDR_COLORS.get(h, "#7799BB")
             ctk.CTkLabel(pos_hdr, text=h, width=w,
-                         font=ctk.CTkFont(size=13, weight="bold"),
-                         text_color=hdr_color).pack(side="left", padx=1)
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=hdr_color).pack(side="left", padx=0)
 
-        self._pos_scroll = ctk.CTkScrollableFrame(pos_frame, height=180)
-        self._pos_scroll.pack(fill="x", padx=5, pady=3)
-        self._pos_rows = []    # list of (frame, [labels])
-        self._pos_cache = []   # list of [(text, color), ...] per row
+        self._pos_scroll = ctk.CTkScrollableFrame(pos_frame_outer, height=160)
+        self._pos_scroll.pack(fill="x", padx=2)
+        self._pos_rows = []
+        self._pos_cache = []
 
     def _on_start(self) -> None:
         self.controller.start_scanner()
@@ -345,7 +374,7 @@ class ScannerPanel(ctk.CTkFrame):
     def _ensure_scan_rows(self, count: int) -> None:
         """Ensure exactly `count` rows exist in the scan results table."""
         widths = self._scan_widths
-        font = ctk.CTkFont(size=13, weight="bold")
+        font = ctk.CTkFont(size=11)
         # Remove excess rows
         while len(self._result_rows) > count:
             frame, labels = self._result_rows.pop()
@@ -367,126 +396,218 @@ class ScannerPanel(ctk.CTkFrame):
             self._result_rows.append((row_frame, labels))
             self._result_cache.append(None)
 
+    def _build_scan_row_vals(self, i: int, r) -> list:
+        """Build the vals list for a single main scan result row."""
+        score_color = "#00C853" if r.score > 0 else "#FF1744" if r.score < 0 else "gray"
+        eligible_marker = "*" if r.eligible else ""
+        lev_str = f"{r.leverage}x" if r.leverage > 0 else "--"
+        tf_str = getattr(r, 'timeframe', '1m')
+        reject_short = r.reject_reason[:12] if r.reject_reason else ""
+        row_color = score_color if r.eligible else "gray"
+
+        sys_signal = _system_signal_candidate(r)
+
+        details = r.confluence.get("details", {}) if r.confluence else {}
+        bullish = r.confluence.get("bullish_count", 0) if r.confluence else 0
+        bearish = r.confluence.get("bearish_count", 0) if r.confluence else 0
+        conf_total = r.confluence.get("score", 0) if r.confluence else 0
+        active_grp = r.confluence.get("active_group", "") if r.confluence else ""
+
+        raw_ind = getattr(r, 'indicator_values', {}) or {}
+        ind_cells = []
+        for key in CONF_INDICATORS:
+            vk = CONF_VALUE_KEYS.get(key)
+            raw = raw_ind.get(vk) if vk else None
+            ind_cells.append(_conf_detail_cell(details.get(key, 0), raw))
+
+        atr_pct = getattr(r, 'atr_percent', 0) or 0
+        atr_color = "#FF9800" if atr_pct > 0.5 else "#2196F3" if atr_pct > 0 else "gray"
+
+        # Funding rate display
+        fr = getattr(r, 'funding_rate', 0) or 0
+        fr_pct = fr * 100  # 0.0001 -> 0.01%
+        if abs(fr_pct) >= 0.05:
+            fr_color = "#FF1744" if fr_pct > 0 else "#00C853"
+        else:
+            fr_color = "gray"
+        fr_str = f"{fr_pct:+.2f}" if fr != 0 else "--"
+
+        # Open interest change display
+        oi_chg = getattr(r, 'oi_change_pct', 0) or 0
+        if oi_chg > 2:
+            oi_color = "#00C853"
+        elif oi_chg < -2:
+            oi_color = "#FF1744"
+        else:
+            oi_color = "gray"
+        oi_str = f"{oi_chg:+.1f}" if oi_chg != 0 else "--"
+
+        # Order book imbalance display
+        ob_imb = getattr(r, 'ob_imbalance', 0) or 0
+        ob_thin = getattr(r, 'ob_thin_book', False)
+        if ob_thin:
+            ob_str, ob_color = "X", "#FF1744"
+        elif ob_imb > 0.25:
+            ob_str, ob_color = f"+{ob_imb:.1f}", "#00C853"
+        elif ob_imb < -0.25:
+            ob_str, ob_color = f"{ob_imb:.1f}", "#FF1744"
+        elif ob_imb != 0:
+            ob_str, ob_color = f"{ob_imb:+.1f}", "gray"
+        else:
+            ob_str, ob_color = "--", "gray"
+
+        # Active group indicator for Conf column
+        grp_tag = {"TREND": "T", "REVERSION": "R", "BOTH": "B",
+                   "CONFLICT": "!", "NEUTRAL": "-"}.get(active_grp, "")
+        conf_str = f"{conf_total:+.1f}{grp_tag}"
+        if active_grp == "CONFLICT":
+            conf_color = "#FF9800"  # orange = conflict, skipped
+        elif conf_total >= 4:
+            conf_color = "#00C853"
+        elif conf_total <= -4:
+            conf_color = "#FF1744"
+        else:
+            conf_color = "white"
+
+        # Build filter check cells
+        filter_checks = getattr(r, 'filter_checks', {}) or {}
+        filter_cells = []
+        for fc_name in FILTER_COLS:
+            check = filter_checks.get(fc_name)
+            if check is None:
+                fc_text, fc_color = "--", "#555555"
+            else:
+                passed, actual, required = check
+                if passed:
+                    fc_text = f"\u2713\n{actual}"
+                    fc_color = "#00C853"  # green
+                else:
+                    fc_text = f"\u2717\n{actual}"
+                    fc_color = "#FF1744"  # red
+            filter_cells.append((fc_text, fc_color))
+
+        vals = [
+            (f"{i+1}", "gray"),
+            sys_signal,
+            (f"{r.symbol}{eligible_marker}", row_color),
+            (f"{r.score:+.0f}", score_color),
+            (f"{atr_pct:.2f}" if atr_pct > 0 else "--", atr_color),
+            (lev_str, "#FF9800" if r.leverage >= 75 else "white"),
+            (tf_str, "#2196F3"),
+            (fr_str, fr_color),
+            (oi_str, oi_color),
+            (ob_str, ob_color),
+        ] + ind_cells + [
+            (conf_str, conf_color),
+            (f"{bullish}", "#00C853" if bullish > 0 else "gray"),
+            (f"{bearish}", "#FF1744" if bearish > 0 else "gray"),
+            (reject_short, "#FF5252" if reject_short else "gray"),
+        ] + filter_cells
+
+        return vals
+
+    def _build_mtf_sub_row_vals(self, tf: str, mtf_entry: dict, symbol: str) -> list:
+        """Build vals list for a multi-TF sub-row (2-up or 5-up)."""
+        indicators = mtf_entry.get("indicators", {})
+        confluence = mtf_entry.get("confluence", {})
+
+        details = confluence.get("details", {})
+        bullish = confluence.get("bullish_count", 0)
+        bearish = confluence.get("bearish_count", 0)
+        conf_total = confluence.get("score", 0)
+        active_grp = confluence.get("active_group", "")
+
+        # Build indicator cells from MTF data
+        ind_cells = []
+        for key in CONF_INDICATORS:
+            vk = CONF_VALUE_KEYS.get(key)
+            raw = indicators.get(vk) if vk else None
+            ind_cells.append(_conf_detail_cell(details.get(key, 0), raw))
+
+        # Conf column
+        grp_tag = {"TREND": "T", "REVERSION": "R", "BOTH": "B",
+                   "CONFLICT": "!", "NEUTRAL": "-"}.get(active_grp, "")
+        conf_str = f"{conf_total:+.1f}{grp_tag}"
+        if active_grp == "CONFLICT":
+            conf_color = "#FF9800"
+        elif conf_total >= 4:
+            conf_color = "#00C853"
+        elif conf_total <= -4:
+            conf_color = "#FF1744"
+        else:
+            conf_color = "white"
+
+        # Empty cells for non-indicator columns
+        empty = ("", "#555555")
+        n_filters = len(FILTER_COLS)
+
+        vals = [
+            empty,                                      # #
+            empty,                                      # Sinyal
+            (f"  \u2514 {tf}", "#7799BB"),             # Sembol (indented with corner)
+            empty,                                      # Skor
+            empty,                                      # ATR%
+            empty,                                      # Lev
+            (tf, "#64B5F6"),                            # TF
+            empty,                                      # Fnd
+            empty,                                      # OI%
+            empty,                                      # OB
+        ] + ind_cells + [
+            (conf_str, conf_color),                     # Conf
+            (f"{bullish}", "#00C853" if bullish > 0 else "#555555"),  # AL
+            (f"{bearish}", "#FF1744" if bearish > 0 else "#555555"),  # SAT
+            empty,                                      # Red
+        ] + [empty] * n_filters                         # Filters empty
+
+        return vals
+
     def _update_results(self) -> None:
         results = self.controller.get_scan_results()
         if not results:
             return
 
         n = min(len(results), 100)
-        self._ensure_scan_rows(n)
 
+        # Calculate total rows needed: main rows + sub-rows for coins with mtf_data
+        total_rows = 0
+        row_plan = []  # list of (result_index, row_type, tf_key)
         for i, r in enumerate(results[:n]):
-            score_color = "#00C853" if r.score > 0 else "#FF1744" if r.score < 0 else "gray"
-            eligible_marker = "*" if r.eligible else ""
-            lev_str = f"{r.leverage}x" if r.leverage > 0 else "--"
-            tf_str = getattr(r, 'timeframe', '1m')
-            reject_short = r.reject_reason[:12] if r.reject_reason else ""
-            row_color = score_color if r.eligible else "gray"
+            row_plan.append((i, "main", None))
+            total_rows += 1
+            mtf_data = getattr(r, 'mtf_data', {}) or {}
+            if mtf_data:
+                base_tf = getattr(r, 'timeframe', '1m')
+                tf_2up, tf_5up = _get_upper_tfs(base_tf)
+                # Show sub-rows in order: 2-up then 5-up
+                for sub_tf in (tf_2up, tf_5up):
+                    if sub_tf in mtf_data and sub_tf != base_tf:
+                        row_plan.append((i, "sub", sub_tf))
+                        total_rows += 1
 
-            sys_signal = _system_signal_candidate(r)
+        self._ensure_scan_rows(total_rows)
 
-            details = r.confluence.get("details", {}) if r.confluence else {}
-            bullish = r.confluence.get("bullish_count", 0) if r.confluence else 0
-            bearish = r.confluence.get("bearish_count", 0) if r.confluence else 0
-            conf_total = r.confluence.get("score", 0) if r.confluence else 0
-            active_grp = r.confluence.get("active_group", "") if r.confluence else ""
+        for row_idx, (res_i, row_type, sub_tf) in enumerate(row_plan):
+            r = results[res_i]
 
-            raw_ind = getattr(r, 'indicator_values', {}) or {}
-            ind_cells = []
-            for key in CONF_INDICATORS:
-                vk = CONF_VALUE_KEYS.get(key)
-                raw = raw_ind.get(vk) if vk else None
-                ind_cells.append(_conf_detail_cell(details.get(key, 0), raw))
-
-            atr_pct = getattr(r, 'atr_percent', 0) or 0
-            atr_color = "#FF9800" if atr_pct > 0.5 else "#2196F3" if atr_pct > 0 else "gray"
-
-            # Funding rate display
-            fr = getattr(r, 'funding_rate', 0) or 0
-            fr_pct = fr * 100  # 0.0001 -> 0.01%
-            if abs(fr_pct) >= 0.05:
-                fr_color = "#FF1744" if fr_pct > 0 else "#00C853"
+            if row_type == "main":
+                vals = self._build_scan_row_vals(res_i, r)
+                # Set normal alternating background
+                bg = "#1c2d4d" if res_i % 2 == 0 else "transparent"
             else:
-                fr_color = "gray"
-            fr_str = f"{fr_pct:+.2f}" if fr != 0 else "--"
+                # Sub-row for multi-TF
+                mtf_entry = r.mtf_data[sub_tf]
+                vals = self._build_mtf_sub_row_vals(sub_tf, mtf_entry, r.symbol)
+                bg = _SUB_ROW_BG
 
-            # Open interest change display
-            oi_chg = getattr(r, 'oi_change_pct', 0) or 0
-            if oi_chg > 2:
-                oi_color = "#00C853"
-            elif oi_chg < -2:
-                oi_color = "#FF1744"
-            else:
-                oi_color = "gray"
-            oi_str = f"{oi_chg:+.1f}" if oi_chg != 0 else "--"
-
-            # Order book imbalance display
-            ob_imb = getattr(r, 'ob_imbalance', 0) or 0
-            ob_thin = getattr(r, 'ob_thin_book', False)
-            if ob_thin:
-                ob_str, ob_color = "X", "#FF1744"
-            elif ob_imb > 0.25:
-                ob_str, ob_color = f"+{ob_imb:.1f}", "#00C853"
-            elif ob_imb < -0.25:
-                ob_str, ob_color = f"{ob_imb:.1f}", "#FF1744"
-            elif ob_imb != 0:
-                ob_str, ob_color = f"{ob_imb:+.1f}", "gray"
-            else:
-                ob_str, ob_color = "--", "gray"
-
-            # Active group indicator for Conf column
-            grp_tag = {"TREND": "T", "REVERSION": "R", "BOTH": "B",
-                       "CONFLICT": "!", "NEUTRAL": "-"}.get(active_grp, "")
-            conf_str = f"{conf_total:+.1f}{grp_tag}"
-            if active_grp == "CONFLICT":
-                conf_color = "#FF9800"  # orange = conflict, skipped
-            elif conf_total >= 4:
-                conf_color = "#00C853"
-            elif conf_total <= -4:
-                conf_color = "#FF1744"
-            else:
-                conf_color = "white"
-
-            # Build filter check cells
-            filter_checks = getattr(r, 'filter_checks', {}) or {}
-            filter_cells = []
-            for fc_name in FILTER_COLS:
-                check = filter_checks.get(fc_name)
-                if check is None:
-                    fc_text, fc_color = "--", "#555555"
-                else:
-                    passed, actual, required = check
-                    if passed:
-                        fc_text = f"\u2713\n{actual}"
-                        fc_color = "#00C853"  # green
-                    else:
-                        fc_text = f"\u2717\n{actual}"
-                        fc_color = "#FF1744"  # red
-                filter_cells.append((fc_text, fc_color))
-
-            vals = [
-                (f"{i+1}", "gray"),
-                sys_signal,
-                (f"{r.symbol}{eligible_marker}", row_color),
-                (f"{r.score:+.0f}", score_color),
-                (f"{atr_pct:.2f}" if atr_pct > 0 else "--", atr_color),
-                (lev_str, "#FF9800" if r.leverage >= 75 else "white"),
-                (tf_str, "#2196F3"),
-                (fr_str, fr_color),
-                (oi_str, oi_color),
-                (ob_str, ob_color),
-            ] + ind_cells + [
-                (conf_str, conf_color),
-                (f"{bullish}", "#00C853" if bullish > 0 else "gray"),
-                (f"{bearish}", "#FF1744" if bearish > 0 else "gray"),
-                (reject_short, "#FF5252" if reject_short else "gray"),
-            ] + filter_cells
+            # Update row background if needed
+            frame, labels = self._result_rows[row_idx]
+            if frame.cget("fg_color") != bg:
+                frame.configure(fg_color=bg)
 
             # Only update labels whose text or color actually changed
-            if self._result_cache[i] == vals:
+            if self._result_cache[row_idx] == vals:
                 continue
-            self._result_cache[i] = vals
-            _, labels = self._result_rows[i]
+            self._result_cache[row_idx] = vals
             for lbl, (val, color) in zip(labels, vals):
                 lbl.configure(text=val, text_color=color)
 
@@ -503,7 +624,7 @@ class ScannerPanel(ctk.CTkFrame):
     def _ensure_pos_rows(self, count: int) -> None:
         """Ensure exactly `count` rows exist in positions table."""
         widths = self._pos_widths
-        font = ctk.CTkFont(size=13, weight="bold")
+        font = ctk.CTkFont(size=11)
         while len(self._pos_rows) > count:
             frame, labels = self._pos_rows.pop()
             frame.destroy()
@@ -643,11 +764,11 @@ class ScannerPanel(ctk.CTkFrame):
                 time_color = "gray"
 
             side_short = "L" if is_long else "S"
-            side_arrow = "\u25B2" if is_long else "\u25BC"  # ▲ or ▼
+            side_arrow = "\u25B2" if is_long else "\u25BC"  # triangle up or down
             roi_color = "#00C853" if roi > 0 else "#FF1744" if roi < 0 else "white"
             conf_color = "#00C853" if conf_total >= 4 else "#FF1744" if conf_total <= -4 else "white"
 
-            # Merge Sinyal + Yon into one column: "TUT ▲L" or "CIK! ▼S"
+            # Merge Sinyal + Yon into one column: "TUT triangle-L" or "CIK! triangle-S"
             sig_text, sig_color = sys_signal
             signal_merged = (f"{sig_text} {side_arrow}{side_short}", sig_color)
 
@@ -677,7 +798,9 @@ class ScannerPanel(ctk.CTkFrame):
             # Filter check cells for positions (already passed all filters)
             pos_filter_cells = [("\u2713", "#00C853")] * len(FILTER_COLS)
 
+            # Build vals: filters BEFORE exit columns (aligned with scan table)
             vals = [
+                ("", "transparent"),  # spacer to align with scan table "#" column
                 signal_merged,
                 (symbol, "white"),
                 (f"{roi:+.1f}%", roi_color),
@@ -691,16 +814,16 @@ class ScannerPanel(ctk.CTkFrame):
                 (f"{conf_total:+.1f}", conf_color),
                 (f"{bullish}", "#00C853" if bullish > 0 else "gray"),
                 (f"{bearish}", "#FF1744" if bearish > 0 else "gray"),
+            ] + pos_filter_cells + [
                 (f"{sl_dist:.1f}%", sl_color),
                 (f"{em_dist:.1f}%", em_color),
-                (f"{trailing_activate_pct:.1f}%", act_pct_color),
                 (f"{trailing_activate_roi:.0f}%", act_roi_color),
                 (kar7_str, kar7_color),
                 (f"{trailing_distance_pct:.2f}%", geri_color),
                 (trail_str, trail_color),
                 (time_str, time_color),
                 (f"${margin:.1f}", "white"),
-            ] + pos_filter_cells
+            ]
 
             # Only update labels that changed
             if self._pos_cache[idx] == vals:
