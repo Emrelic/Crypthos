@@ -486,10 +486,7 @@ class ScannerStateMachine:
                 divergences=divergences,
             )
 
-            # Server-side trailing stop management
-            pos_now = self._position_mgr.get_position(symbol)
-            if pos_now:
-                self._sync_server_trailing(symbol, pos_now, current_price, confluence)
+            # Server SL + trailing bir kez konuldu, dokunma (sadece renew'da güncellenir)
 
             if exit_reason == self._position_mgr.EXIT_PARTIAL_TP:
                 self._execute_partial_tp(symbol, current_price)
@@ -925,10 +922,7 @@ class ScannerStateMachine:
                 divergences=divergences,
             )
 
-            # Server-side trailing stop management
-            pos_now = self._position_mgr.get_position(symbol)
-            if pos_now:
-                self._sync_server_trailing(symbol, pos_now, current_price, confluence)
+            # Server SL + trailing bir kez konuldu, dokunma (sadece renew'da güncellenir)
 
             if exit_reason == self._position_mgr.EXIT_PARTIAL_TP:
                 self._execute_partial_tp(symbol, current_price)
@@ -1980,14 +1974,10 @@ class ScannerStateMachine:
                     if updated_pos:
                         strat = self._config.get("strategy", {})
                         tp_price = updated_pos.initial_tp if strat.get("tp_enabled", False) else None
-                        self._order_executor.update_tp_sl(
-                            symbol=symbol,
-                            side="SELL" if pos.side == OrderSide.BUY_LONG else "BUY",
-                            quantity=pos.size,
-                            sl_price=updated_pos.initial_sl,
-                            tp_price=tp_price,
-                        )
-                        logger.info(f"[HYBRID] {symbol} Binance SL güncellendi: "
+                        # Renew: cancel all → SL + trailing yeniden koy
+                        callback = self._calc_trailing_callback(updated_pos, current_price)
+                        self._send_server_trailing(symbol, updated_pos, current_price, callback)
+                        logger.info(f"[HYBRID] {symbol} Binance SL + trailing yeniden kondu: "
                                     f"yeni SL={updated_pos.initial_sl:.6f}")
                 except Exception as e:
                     logger.error(f"[HYBRID] {symbol} SL güncelleme hatası: {e}")
@@ -2248,8 +2238,8 @@ class ScannerStateMachine:
 
     def _sync_server_trailing(self, symbol: str, pos, current_price: float,
                                confluence: dict = None) -> None:
-        """Sync server-side trailing stop with current software state.
-        Called every check cycle (30s). Decides when to update server trailing.
+        """SADECE trailing renew olduğunda server emirlerini günceller.
+        Artık her 30s çağrılmıyor — sadece renew_trailing sonrası kullanılır.
 
         Mantık:
         - Server'da HER ZAMAN trailing var (pozisyon açılışında konuyor)
@@ -2291,42 +2281,46 @@ class ScannerStateMachine:
 
     def _send_server_trailing(self, symbol: str, pos, current_price: float,
                                callback_pct: float) -> None:
-        """Place or replace TRAILING_STOP_MARKET on Binance.
-        Activation price:
-          - Trailing aktifse: current_price (hemen devreye gir)
-          - Trailing henüz aktif değilse: entry + 7×ATR (bekle)"""
+        """Place or replace TRAILING_STOP_MARKET + SL on Binance.
+        Sadece trailing renew olduğunda çağrılır.
+        cancel_all_orders → SL + trailing yeniden konur (SL silinmesin diye)."""
         try:
             rest = self._order_executor._rest
             pp = self._order_executor._get_price_precision(symbol)
             is_long = pos.side == OrderSide.BUY_LONG
             close_side = "SELL" if is_long else "BUY"
             strat = self._config.get("strategy", {})
+            atr = pos.atr_at_entry
+            activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
+            ref_price = pos.virtual_entry_price if pos.virtual_entry_price > 0 else pos.entry_price
 
-            if pos.trailing_active:
-                # Yazılımsal trailing zaten aktif — server da hemen aktif olsun
-                activation_price = round(current_price, pp)
+            # Trailing activation: her zaman 4×ATR ileride (current_price DEĞİL)
+            if is_long:
+                activation_price = round(ref_price + (atr * activate_mult), pp)
             else:
-                # Henüz aktif değil — 7×ATR'de aktif olsun
-                atr = pos.atr_at_entry
-                activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
-                ref_price = pos.virtual_entry_price if pos.virtual_entry_price > 0 else pos.entry_price
-                if is_long:
-                    activation_price = round(ref_price + (atr * activate_mult), pp)
-                else:
-                    activation_price = round(ref_price - (atr * activate_mult), pp)
+                activation_price = round(ref_price - (atr * activate_mult), pp)
 
-
-            # Cancel existing orders and re-place trailing only (no server SL)
+            # Cancel all → re-place both SL + trailing
             cancel_result = rest.cancel_all_orders(symbol)
             if cancel_result.get("errors"):
-                logger.warning(f"Server trailing cancel issues for {symbol}: {cancel_result['errors']}")
+                logger.warning(f"Server order cancel issues for {symbol}: {cancel_result['errors']}")
 
-            # Server SL kaldırıldı — emergency exit yazılım tarafında korur
+            # 1. Re-place SERVER SL (2×ATR) — cancel_all sildi, geri koy
+            sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
+            if atr > 0 and pos.entry_price > 0:
+                if is_long:
+                    sl_price = round(pos.entry_price - (atr * sl_atr_mult), pp)
+                else:
+                    sl_price = round(pos.entry_price + (atr * sl_atr_mult), pp)
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=pos.size, stop_price=sl_price,
+                )
 
-            # Place TRAILING_STOP_MARKET
+            # 2. Re-place TRAILING_STOP_MARKET
             rest.place_order(
-                symbol=symbol,
-                side=close_side,
+                symbol=symbol, side=close_side,
                 order_type="TRAILING_STOP_MARKET",
                 quantity=pos.size,
                 stop_price=activation_price,
@@ -2343,7 +2337,8 @@ class ScannerStateMachine:
             logger.info(f"[SERVER TRAILING] {symbol}: "
                         f"callback={callback_pct:.1f}% "
                         f"activation={activation_price} "
-                        f"(server koruma aktif)")
+                        f"SL={sl_price if atr > 0 else 'N/A'} "
+                        f"(renew — SL + trailing yeniden kondu)")
 
         except Exception as e:
             logger.warning(f"Server trailing failed for {symbol}: {e} "
