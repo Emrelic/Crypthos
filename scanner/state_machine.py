@@ -405,10 +405,18 @@ class ScannerStateMachine:
                     logger.info(f"Skipping {candidate.symbol} ({dir_reason})")
                     continue
 
+                # ADX regime: MTF confirmation check
+                if getattr(candidate, 'adx_regime', '') and candidate.adx_regime != "NO_TRADE":
+                    mtf_ok, mtf_reason = self._check_mtf_confirmation(candidate)
+                    if not mtf_ok:
+                        logger.info(f"Skipping {candidate.symbol}: {mtf_reason}")
+                        continue
+
                 cand_tf = symbol_intervals.get(candidate.symbol, default_interval) if dynamic_tf else default_interval
                 logger.info(f"Candidate found: {candidate.symbol} "
                             f"score={candidate.score:+.1f} dir={candidate.direction} "
                             f"regime={candidate.regime.get('regime')} "
+                            f"adx_regime={getattr(candidate, 'adx_regime', '')} "
                             f"confluence={candidate.confluence.get('score', 0):+.1f} "
                             f"tf={cand_tf}")
                 self._last_candidate = candidate
@@ -571,7 +579,9 @@ class ScannerStateMachine:
             try:
                 depth = self._rest.get_depth(sym, limit=20)
                 vol_24h = ticker_data.get(sym, {}).get("volume_24h", 0)
-                ob = self._ob_analyzer.analyze(depth, volume_24h=vol_24h)
+                thin_sec = self._config.get("strategy.thin_book_seconds", 5.0)
+                ob = self._ob_analyzer.analyze(depth, volume_24h=vol_24h,
+                                               thin_book_seconds=thin_sec)
                 ctx[sym]["ob_imbalance"] = ob.get("weighted_imbalance", 0.0)
                 ctx[sym]["ob_wall_signal"] = ob.get("wall_signal", "NONE")
                 ctx[sym]["ob_liquidity"] = ob.get("liquidity_score", 0.0)
@@ -636,6 +646,34 @@ class ScannerStateMachine:
                     logger.debug(f"MTF fetch error {r.symbol}@{tf}: {e}")
 
             r.mtf_data = mtf
+
+    def _check_mtf_confirmation(self, candidate) -> tuple:
+        """Check if 2-up and 5-up timeframes confirm the candidate direction.
+        Returns (ok, reason). If MTF data is missing, passes gracefully."""
+        strat = self._config.get("strategy", {})
+        if not strat.get("adx_regime_mtf_required", True):
+            return True, ""
+
+        mtf = getattr(candidate, 'mtf_data', {}) or {}
+        if not mtf:
+            # MTF data not available (coin not in top 5) — skip check
+            return True, ""
+
+        base_tf = getattr(candidate, 'timeframe', '1m')
+        tf_2up, tf_5up = self._get_upper_tfs(base_tf)
+        direction = candidate.direction  # "LONG" or "SHORT"
+
+        for label, tf in [("2up", tf_2up), ("5up", tf_5up)]:
+            if tf == base_tf:
+                continue  # clamped to same TF, skip
+            entry = mtf.get(tf)
+            if not entry:
+                continue  # data not available, skip
+            mtf_signal = entry.get("signal", "")
+            if mtf_signal and mtf_signal != direction:
+                return False, f"mtf_{label}_{tf}_conflict ({mtf_signal} vs {direction})"
+
+        return True, ""
 
     # ──── Pending Limit Order Management ────
 
@@ -1691,6 +1729,20 @@ class ScannerStateMachine:
         limit_atr_offset = strat.get("limit_atr_offset", 0.5) if strat else 0.5
         limit_timeout = strat.get("limit_timeout_seconds", 300) if strat else 300
 
+        # ADX regime override: entry type + ATR offset
+        adx_regime = getattr(candidate, 'adx_regime', '') if candidate else ''
+        if adx_regime and strat.get("adx_regime_enabled", False):
+            if adx_regime == "RANGING":
+                limit_enabled = True
+                limit_atr_offset = strat.get("adx_regime_ranging_entry_atr", 2.0)
+            elif adx_regime == "WEAK_TREND":
+                limit_enabled = True
+                limit_atr_offset = strat.get("adx_regime_weak_entry_atr", 1.0)
+            elif adx_regime == "STRONG_TREND":
+                limit_enabled = False  # market entry
+            logger.info(f"[ADX REGIME] {symbol}: {adx_regime} → "
+                        f"{'limit ' + str(limit_atr_offset) + 'xATR' if limit_enabled else 'market'}")
+
         if limit_enabled and atr > 0 and self._order_executor:
             # LIMIT ORDER: place at offset price
             offset = atr * limit_atr_offset
@@ -1782,6 +1834,9 @@ class ScannerStateMachine:
             self._config.get("strategy", {}).get("dynamic_timeframe", True) else \
             self._config.get("indicators.kline_interval", "1m")
         regime_info = candidate.regime or {}
+        # Use ADX regime as entry_regime when enabled, fallback to market regime
+        effective_regime = (adx_regime if adx_regime
+                           else regime_info.get("regime", ""))
         self._position_mgr.open_position(
             symbol, side, price, size_qty, atr,
             leverage=leverage if lev_enabled else 1,
@@ -1791,7 +1846,7 @@ class ScannerStateMachine:
             entry_confluence=candidate.confluence.get("score", 0),
             entry_adx=candidate.adx,
             entry_rsi=candidate.rsi,
-            entry_regime=regime_info.get("regime", ""),
+            entry_regime=effective_regime,
             entry_regime_confidence=regime_info.get("confidence", 0),
             entry_bb_width=regime_info.get("bb_width", 0),
         )
@@ -2176,8 +2231,29 @@ class ScannerStateMachine:
 
             atr_pct = atr / entry_price * 100 if entry_price > 0 and atr > 0 else 0
 
+            # === ADX REGIME OVERRIDE for SL/trailing ===
+            entry_regime = getattr(pos, 'entry_regime', '')
+            if strat.get("adx_regime_enabled", False) and entry_regime in (
+                    "RANGING", "WEAK_TREND", "STRONG_TREND"):
+                prefix = {
+                    "RANGING": "adx_regime_ranging",
+                    "WEAK_TREND": "adx_regime_weak",
+                    "STRONG_TREND": "adx_regime_strong",
+                }[entry_regime]
+                activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
+                distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
+                logger.info(f"[ADX REGIME] {symbol}: {entry_regime} → "
+                            f"SL={strat.get(f'{prefix}_sl_atr', 2.0)}xATR, "
+                            f"trail={activate_mult}/{distance_mult}xATR")
+
             # === SERVER SL: 2×ATR STOP_MARKET (crash koruması) ===
             sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
+            if strat.get("adx_regime_enabled", False) and entry_regime in (
+                    "RANGING", "WEAK_TREND", "STRONG_TREND"):
+                prefix = {"RANGING": "adx_regime_ranging",
+                          "WEAK_TREND": "adx_regime_weak",
+                          "STRONG_TREND": "adx_regime_strong"}[entry_regime]
+                sl_atr_mult = strat.get(f"{prefix}_sl_atr", sl_atr_mult)
             if atr > 0 and entry_price > 0:
                 if is_long:
                     sl_price = round(entry_price - (atr * sl_atr_mult), pp)

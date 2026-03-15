@@ -15,7 +15,7 @@ PRESETS = {
             "min_buy_score": 65, "min_confluence": 5.0, "min_adx": 22,
             "max_rsi_long": 58, "min_rsi_short": 42,
             "macd_filter": True, "volume_filter": True, "volatile_filter": True,
-            "wall_min_tf_ratio": 0.3, "depth_min_tf_ratio": 2.0,
+            "wall_min_tf_ratio": 0.3, "depth_min_tf_ratio": 2.0, "thin_book_seconds": 3.0,
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_timeframe": "5m",
             # Leverage
@@ -65,7 +65,7 @@ PRESETS = {
             "min_buy_score": 55, "min_confluence": 4.0, "min_adx": 20,
             "max_rsi_long": 60, "min_rsi_short": 40,
             "macd_filter": True, "volume_filter": True, "volatile_filter": True,
-            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0,
+            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0, "thin_book_seconds": 5.0,
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_timeframe": "5m",
             "min_leverage": 25, "max_leverage": 50,
@@ -106,7 +106,7 @@ PRESETS = {
             "min_buy_score": 55, "min_confluence": 4.0, "min_adx": 18,
             "max_rsi_long": 62, "min_rsi_short": 38,
             "macd_filter": True, "volume_filter": True, "volatile_filter": True,
-            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0,
+            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0, "thin_book_seconds": 5.0,
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_timeframe": "3m",
             "min_leverage": 50, "max_leverage": 100,
@@ -143,14 +143,14 @@ PRESETS = {
     },
     "emre_ortalama": {
         "name": "Emre Ortalama",
-        "desc": "Max kaldirac, 1/12 portfoy, ATR trailing (7x/1x), sinyal her zaman cikis",
+        "desc": "Max kaldirac, 1/12 portfoy, ATR trailing (4x/1x), karda sinyal cikis",
         "color": "#9C27B0",
         "values": {
-            # Entry: agresif giris, guclu sinyal gerektir
-            "min_buy_score": 55, "min_confluence": 4.0, "min_adx": 18,
+            # Entry: kaliteli sinyal, guclu confluence gerektir
+            "min_buy_score": 70, "min_confluence": 6.5, "min_adx": 18,
             "max_rsi_long": 62, "min_rsi_short": 38,
             "macd_filter": True, "volume_filter": True, "volatile_filter": False,
-            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0,
+            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0, "thin_book_seconds": 5.0,
             "scan_interval_seconds": 30, "kline_interval": "5m", "kline_limit": 200,
             "min_timeframe": "5m",
             # Kaldirac: max mumkun (20x bile olsa ac)
@@ -168,16 +168,15 @@ PRESETS = {
             "trailing_activate_fee_mult": 3.0, "trailing_distance_fee_mult": 2.0,
             # TP: kapali, trailing ve sinyal yonetir
             "tp_enabled": False, "tp_liq_multiplier": 3.0, "tp_exit_mode": "signal",
-            # Sinyal: HER ZAMAN cikis (zararda bile), override trailing
+            # Sinyal: sadece kârda + ters pozisyon açılacak güçte sinyal
             "signal_exit_enabled": True, "signal_exit_threshold": 4.0,
             "signal_min_hold_seconds": 60, "signal_only_in_profit": False,
-            "signal_deep_exit_threshold": 8.0,
             "divergence_exit_enabled": False,
             # Zaman: 8 saat, trailing aktifse uzat
             "time_limit_enabled": True, "time_limit_minutes": 480,
             "time_limit_extend_trailing": True, "time_limit_extend_breakeven": True,
             "cooldown_seconds": 60,
-            "loss_cooldown_seconds": 600,
+            "loss_cooldown_seconds": 3600,
             # Scanner
             "max_symbols_to_scan": 50,
             "battle_mode": False, "close_only": False, "focus_mode": False,
@@ -194,6 +193,23 @@ PRESETS = {
             "market_fallback_on_limit_timeout": True,
             "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
             "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
+            # ADX Rejim Sistemi
+            "adx_regime_enabled": True,
+            "adx_regime_no_trade": 18,
+            "adx_regime_strong_trend": 25,
+            "adx_regime_mtf_required": True,
+            "adx_regime_ranging_entry_atr": 2.0,
+            "adx_regime_ranging_sl_atr": 2.0,
+            "adx_regime_ranging_tp_atr": 3.0,
+            "adx_regime_ranging_trail_activate_atr": 4.0,
+            "adx_regime_ranging_trail_callback_atr": 1.0,
+            "adx_regime_weak_entry_atr": 1.0,
+            "adx_regime_weak_sl_atr": 2.0,
+            "adx_regime_weak_trail_activate_atr": 4.0,
+            "adx_regime_weak_trail_callback_atr": 1.0,
+            "adx_regime_strong_sl_atr": 2.0,
+            "adx_regime_strong_trail_activate_atr": 4.0,
+            "adx_regime_strong_trail_callback_atr": 1.0,
         },
     },
 }
@@ -293,8 +309,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
 
         # ──────────────── GIRIS AYARLARI ────────────────
         self._section(s, "Giris Ayarlari (Entry)")
-        self._field(s, "min_buy_score", "Min Alim Skoru", "55",
-                    tip="Kompozit skor esigi (0-100). 55=dengeli, 65+=cok secici",
+        self._field(s, "min_buy_score", "Min Alim Skoru", "70",
+                    tip="Kompozit skor esigi (0-100). 70=kaliteli, 80+=cok secici",
                     help_text=(
                         "KOMPOZIT SKOR (0-100)\n"
                         "─────────────────────\n"
@@ -304,11 +320,11 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  Hacim        %15  OBV, CMF, MFI\n"
                         "  Trend        %15  ADX, MACD, Supertrend\n"
                         "  Risk         %15  ATR uygunlugu, divergence\n\n"
-                        "55 = orta kaliteli firsatlar dahil\n"
-                        "65 = sadece guclu firsatlar\n"
-                        "75+ = cok secici, az islem"))
-        self._field(s, "min_confluence", "Min Confluence", "4.0",
-                    tip="Kac indikator uyumlu olmali. 3.5=gevsek, 4.0=standart, 5.0+=siki",
+                        "55 = orta kaliteli (cok fazla zarar)\n"
+                        "70 = kaliteli firsatlar (onerilen)\n"
+                        "80+ = cok secici, az islem"))
+        self._field(s, "min_confluence", "Min Confluence", "6.5",
+                    tip="Kac indikator uyumlu olmali. 4.0=gevsek, 6.5=standart, 8.0+=siki",
                     help_text=(
                         "CONFLUENCE SKORU (indikator uyumu)\n"
                         "──────────────────────────────────\n"
@@ -465,6 +481,23 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  3.0: Varsayilan\n"
                         "  5.0: Siki\n"
                         "  0: Toplam derinlik filtresi kapali"))
+        self._field(s, "thin_book_seconds", "Ince Book Esigi (saniye)", "5.0",
+                    help_text=(
+                        "INCE BOOK (THIN BOOK) FILTRESI\n"
+                        "──────────────────────────────\n"
+                        "Order book'taki tum emirlerin toplami\n"
+                        "kac saniyede tuketilebilir?\n\n"
+                        "Hesaplama:\n"
+                        "  book_saniye = toplam_book_usdt /\n"
+                        "                (gunluk_hacim / 86400)\n\n"
+                        "Ornek (esik=5 saniye):\n"
+                        "  BTCUSDT: 1.6M$ book / 68K$/s = 23s → OK\n"
+                        "  XANUSDT: 27K$ book / 5.2K$/s = 5s → SINIR\n"
+                        "  APRUSDT: 5.7K$ book / 1.7K$/s = 3s → INCE\n\n"
+                        "Ince book'ta fiyat kayar, SL bosa tetiklenir.\n\n"
+                        "  3: Gevsek (sadece cok siglari ele)\n"
+                        "  5: Varsayilan\n"
+                        "  10: Siki (daha derin book iste)"))
 
         self._field(s, "scan_interval_seconds", "Tarama Araligi (sn)", "30")
 
@@ -806,54 +839,43 @@ class StrategySettingsPanel(ctk.CTkFrame):
 
         # ──────────────── SINYAL CIKIS ────────────────
         self._section(s, "Sinyal Bazli Cikis")
-        self._checkbox(s, "signal_exit_enabled", "Sinyal Donusu Cikis (confluence ters donunce)",
+        self._checkbox(s, "signal_exit_enabled", "Sinyal Donusu Cikis (karda + ters sinyal guclu)",
                       help_text=(
-                          "SINYAL CIKIS (EN KRITIK KURAL)\n"
-                          "──────────────────────────────\n"
-                          "Indikatorler ters donunce pozisyonu\n"
-                          "kapat. SL ve Emergency disinda EN\n"
-                          "YUKSEK oncelikli cikis sinyali.\n\n"
-                          "CIKIS ONCELIK SIRASI:\n"
-                          "  0. Emergency    liq x %80\n"
-                          "  1. Stop Loss    liq x %50\n"
-                          "  2. SINYAL CIKIS (bu ayar)\n"
-                          "  3. Take Profit  (opsiyonel)\n"
-                          "  4. Trailing     N x ATR\n"
-                          "  5. Divergence   (profit zone)\n"
-                          "  6. Regime       (profit zone)\n"
-                          "  7. Zaman Limiti\n\n"
-                          "Neden onemli:\n"
-                          "  +1 ATR'de sinyal SAT derse:\n"
-                          "    Sat → kucuk kar (%7.5 ROI)\n"
-                          "    Tut → SL riski (-%35 ROI)\n\n"
-                          "  Erken cikis 3:1 R:R'i korur.\n"
-                          "  Tek iyi trade 3 kotu trade'i\n"
-                          "  karsilar.\n\n"
-                          "'Sadece Karda Cik' ile birlikte\n"
-                          "kullanilabilir (asagida)."))
+                          "SINYAL CIKIS (KARDA + TERS POZISYON)\n"
+                          "────────────────────────────────────\n"
+                          "3 KOSUL birden saglanmalı:\n\n"
+                          "  1. Pozisyon KARDA (fee dahil)\n"
+                          "  2. Ters sinyal >= min_buy_score\n"
+                          "     (ters pozisyon acilabilir guçte)\n"
+                          "  3. Confluence esigi asilmis\n\n"
+                          "Zararda sinyal cikisi YAPILMAZ.\n"
+                          "Zararda server SL korur.\n\n"
+                          "ORNEK:\n"
+                          "  LONG pozisyondayiz, karda.\n"
+                          "  Sinyal -75 (SHORT, score >= 70)\n"
+                          "  → Cik, cunku ters pozisyon acilacak\n"
+                          "    kadar guclu donus var.\n\n"
+                          "  Sinyal -40 (zayif SHORT)\n"
+                          "  → Cikma, sinyal yeterince guclu\n"
+                          "    degil (whipsaw olabilir)."))
         self._field(s, "signal_exit_threshold", "Sinyal Esik Degeri", "4.0",
                     tip="Confluence skoru bu degerin altina dusunce sat (ornek: 4.0)")
         self._field(s, "signal_min_hold_seconds", "Min Bekle (sn)", "30",
                     tip="Pozisyon acildiktan sonra min bekleme suresi")
-        self._checkbox(s, "signal_only_in_profit", "Sadece Karda Cik (zarardayken sinyal yoksay)",
+        self._checkbox(s, "signal_only_in_profit", "Eski: Sadece Karda Cik (artik varsayilan davranis)",
                       help_text=(
-                          "SADECE KARDA SINYAL CIKIS\n"
+                          "NOT: Bu ayar artik etkisiz.\n"
                           "─────────────────────────\n"
-                          "Acik: Zararda normal esik (-4) ile\n"
-                          "cikmaz, sadece DERIN reversal esigi\n"
-                          "(asagida) gecilirse cikar.\n\n"
-                          "Kapali: Zararda da normal esik (-4)\n"
-                          "ile cikar (whipsaw riski!).\n\n"
-                          "Onerilen: KAPALI + Derin esik 8.0\n"
-                          "  Karda: -4'te cik (normal)\n"
-                          "  Zararda: -8'de cik (derin reversal)\n"
-                          "  Yapisan indikatorler de donmusse\n"
-                          "  bu whipsaw degil, gercek donus."))
-        self._field(s, "signal_deep_exit_threshold", "Zararda Cikis Esigi", "8.0",
-                    tip=("Zarardayken sinyal cikis esigi (ornek: 8.0).\n"
-                         "Normal esikten yuksek olmali (whipsaw koruması).\n"
-                         "Karda: -4, Zararda: -8 = yapisan indikatorler\n"
-                         "de donmus olmali (gercek trend donusu)"))
+                          "Sinyal cikis sistemi guncellendi:\n"
+                          "Sadece karda (fee dahil) VE sinyal\n"
+                          "ters pozisyon acilacak kadar guclu\n"
+                          "ise (min_buy_score) cikis yapilir.\n\n"
+                          "Zararda sinyal cikisi tamamen\n"
+                          "kaldirildi — server SL korur."))
+        self._field(s, "signal_deep_exit_threshold", "Eski: Zararda Cikis Esigi", "8.0",
+                    tip=("Artik etkisiz — zararda sinyal cikisi kaldirildi.\n"
+                         "Sadece karda + ters sinyal >= min_buy_score\n"
+                         "kosulu ile cikis yapilir."))
         self._checkbox(s, "divergence_exit_enabled", "Divergence Cikis (bearish divergence'ta sat)",
                       help_text=(
                           "DIVERGENCE (Iraksama) CIKIS\n"
@@ -887,8 +909,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
         self._section(s, "Risk & Bekleme")
         self._field(s, "cooldown_seconds", "Satis Sonrasi Bekleme (sn)", "120",
                     tip="Pozisyon kapatildiktan sonra kac saniye bekle")
-        self._field(s, "loss_cooldown_seconds", "Zarar Cooldown (sn)", "600",
-                    tip="Ayni coinde zarar sonrasi tekrar giris bekleme suresi (600=10dk)",
+        self._field(s, "loss_cooldown_seconds", "Zarar Cooldown (sn)", "3600",
+                    tip="Ayni coinde zarar sonrasi tekrar giris bekleme suresi (3600=1saat)",
                     help_text=(
                         "ZARAR COOLDOWN\n"
                         "──────────────\n"
@@ -899,9 +921,9 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  Coin zararla kapandi → sinyal hala\n"
                         "  guclu gozukebilir → tekrar girer →\n"
                         "  ayni sonuc → ardisik zarar spirali\n\n"
-                        "  300 =  5 dakika\n"
-                        "  600 = 10 dakika (onerilen)\n"
-                        "  900 = 15 dakika\n\n"
+                        "  600  = 10 dakika\n"
+                        "  1800 = 30 dakika\n"
+                        "  3600 =  1 saat (onerilen)\n\n"
                         "Sadece ZARAR ile kapanan coinlere\n"
                         "uygulanir. Karla kapanan coinler\n"
                         "cooldown'a girmez."))
@@ -977,6 +999,89 @@ class StrategySettingsPanel(ctk.CTkFrame):
                            "Max portfoy beta limiti bu riski sinirlar."))
         self._field(s, "btc_max_portfolio_beta", "Max Portfoy Beta", "2.5",
                     tip="Portfoy toplam beta'si bu degeri asarsa yeni pozisyon acilmaz (2.5=standart)")
+
+        # ──────────────── ADX REJIM SISTEMI ────────────────
+        self._section(s, "ADX Rejim Sistemi")
+
+        self._checkbox(s, "adx_regime_enabled", "ADX Rejim Sistemi Aktif",
+                       default=False,
+                       help_text=(
+                           "ADX REJIM SISTEMI\n"
+                           "─────────────────\n"
+                           "ADX degerine gore farkli giris/cikis\n"
+                           "parametreleri uygular.\n\n"
+                           "4 REJIM:\n"
+                           "  ADX < 18: ISLEM ACMA (yatar piyasa)\n"
+                           "  ADX 18-25 (trend yok): RANGING\n"
+                           "    → 2 ATR limit giris, 2 ATR SL\n"
+                           "    → 3 ATR TP + 4/1 ATR trailing\n"
+                           "  ADX 18-25 (trend var): WEAK TREND\n"
+                           "    → 1 ATR limit giris, 2 ATR SL\n"
+                           "    → 4/1 ATR trailing\n"
+                           "  ADX > 25: STRONG TREND\n"
+                           "    → market giris, 2 ATR SL\n"
+                           "    → 4/1 ATR trailing\n\n"
+                           "MTF TEYIT:\n"
+                           "  2-ust ve 5-ust timeframe\n"
+                           "  ayni yonu desteklemeli."))
+
+        self._field(s, "adx_regime_no_trade", "No Trade Esigi (ADX <)", "18",
+                    tip="Bu ADX altinda islem acilmaz (yatar piyasa)")
+        self._field(s, "adx_regime_strong_trend", "Strong Trend Esigi (ADX >)", "25",
+                    tip="Bu ADX ustunde guclu trend: market giris")
+
+        self._checkbox(s, "adx_regime_mtf_required", "MTF Teyit Zorunlu (2-ust + 5-ust TF)",
+                       default=True,
+                       help_text=(
+                           "MTF (Multi-Timeframe) TEYIT\n"
+                           "───────────────────────────\n"
+                           "Pozisyon acilmadan once 2-ust ve 5-ust\n"
+                           "timeframe'lerdeki sinyal yonunu kontrol eder.\n\n"
+                           "ORNEK (1m bazda):\n"
+                           "  2-ust = 5m, 5-ust = 30m\n"
+                           "  1m: AL → 5m: AL → 30m: AL → OK\n"
+                           "  1m: AL → 5m: SAT → ENGEL\n\n"
+                           "ORNEK (5m bazda):\n"
+                           "  2-ust = 15m, 5-ust = 2h\n\n"
+                           "Tum rejimlerde uygulanir."))
+
+        # Ranging (ADX 18-25, trend yok) parametreleri
+        ctk.CTkLabel(s, text="  Ranging (ADX 18-25, trend yok):",
+                     font=ctk.CTkFont(size=12, slant="italic"),
+                     text_color="#CE93D8").pack(anchor="w", padx=15, pady=(8, 2))
+        self._field(s, "adx_regime_ranging_entry_atr", "  Limit Giris ATR Ofseti", "2.0",
+                    tip="Kac ATR asagiya/yukariya limit emir (2.0=genis pazarlik)")
+        self._field(s, "adx_regime_ranging_sl_atr", "  SL (ATR)", "2.0",
+                    tip="Stop Loss mesafesi ATR cinsinden")
+        self._field(s, "adx_regime_ranging_tp_atr", "  TP (ATR)", "3.0",
+                    tip="Take Profit mesafesi ATR cinsinden (ranging'de sabit TP)")
+        self._field(s, "adx_regime_ranging_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0",
+                    tip="Trailing stop aktif olma mesafesi")
+        self._field(s, "adx_regime_ranging_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0",
+                    tip="Trailing stop geri cekilme mesafesi")
+
+        # Weak Trend (ADX 18-25, trend var) parametreleri
+        ctk.CTkLabel(s, text="  Weak Trend (ADX 18-25, trend var):",
+                     font=ctk.CTkFont(size=12, slant="italic"),
+                     text_color="#4FC3F7").pack(anchor="w", padx=15, pady=(8, 2))
+        self._field(s, "adx_regime_weak_entry_atr", "  Limit Giris ATR Ofseti", "1.0",
+                    tip="Kac ATR asagiya/yukariya limit emir (1.0=orta pazarlik)")
+        self._field(s, "adx_regime_weak_sl_atr", "  SL (ATR)", "2.0",
+                    tip="Stop Loss mesafesi ATR cinsinden")
+        self._field(s, "adx_regime_weak_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0")
+        self._field(s, "adx_regime_weak_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0")
+
+        # Strong Trend (ADX > 25) parametreleri
+        ctk.CTkLabel(s, text="  Strong Trend (ADX > 25):",
+                     font=ctk.CTkFont(size=12, slant="italic"),
+                     text_color="#00C853").pack(anchor="w", padx=15, pady=(8, 2))
+        ctk.CTkLabel(s, text="    Giris: Market fiyat (pazarlik yok)",
+                     text_color="gray50", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=25, pady=1)
+        self._field(s, "adx_regime_strong_sl_atr", "  SL (ATR)", "2.0",
+                    tip="Stop Loss mesafesi ATR cinsinden")
+        self._field(s, "adx_regime_strong_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0")
+        self._field(s, "adx_regime_strong_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0")
 
         # ──────────────── COIN GUNLUK YASAK ────────────────
         self._section(s, "Coin Gunluk Yasak (Kayip Limiti)")

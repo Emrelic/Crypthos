@@ -263,6 +263,26 @@ class PositionManager:
         strat = self._config.get("strategy", {})
         activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
         distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+
+        # ADX regime override for trailing params
+        if strat.get("adx_regime_enabled", False) and entry_regime in (
+                "RANGING", "WEAK_TREND", "STRONG_TREND"):
+            prefix = {"RANGING": "adx_regime_ranging",
+                      "WEAK_TREND": "adx_regime_weak",
+                      "STRONG_TREND": "adx_regime_strong"}[entry_regime]
+            activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
+            distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
+
+            # RANGING regime: override TP with ATR-based TP
+            if entry_regime == "RANGING":
+                tp_atr_mult = strat.get("adx_regime_ranging_tp_atr", 3.0)
+                if atr > 0 and price > 0:
+                    if side == OrderSide.BUY_LONG:
+                        pos.tp = price * (1 + (atr * tp_atr_mult / price))
+                    else:
+                        pos.tp = price * (1 - (atr * tp_atr_mult / price))
+                    tp = pos.tp
+                    logger.info(f"  [ADX RANGING] TP={tp_atr_mult}xATR @ {tp:.6f}")
         trailing_activate_pct = atr_pct * activate_mult  # 7xATR yuzde hareket
         trailing_distance_pct = atr_pct * distance_mult  # 1xATR geri gelme yuzde
         trailing_activate_roi = trailing_activate_pct * leverage if lev_enabled else trailing_activate_pct
@@ -874,27 +894,28 @@ class PositionManager:
                 roi = (pos.entry_price - current_price) / pos.entry_price * lev * 100
             in_profit = roi >= fee_roi
 
-        threshold = strat.get("signal_exit_threshold", 4.0)
+        # Sadece kârda (fee dahil) ve sinyal ters pozisyon açacak kadar
+        # dönmüşse çık. Zararda sinyal çıkışı yapılmaz — server SL korur.
+        if not in_profit:
+            return False
 
-        if in_profit:
-            # Kârda: normal eşikte çık (-4.0)
-            if pos.side == OrderSide.BUY_LONG and signal == "SELL" and score <= -threshold:
-                return True
-            if pos.side == OrderSide.SELL_SHORT and signal == "BUY" and score >= threshold:
-                return True
-        else:
-            # Zararda: sadece derin reversal'da çık (-8.0)
-            # Yapışkan indikatörler (Supertrend, Ichimoku, ADX, PSAR) de dönmüş olmalı
-            # Bu whipsaw değil, gerçek trend dönüşü demek
-            deep_threshold = strat.get("signal_deep_exit_threshold", 8.0)
-            if pos.side == OrderSide.BUY_LONG and signal == "SELL" and score <= -deep_threshold:
-                logger.info(f"[DEEP REVERSAL] {pos.symbol} zararda derin sinyal çıkışı "
-                            f"(conf={score:.1f} <= -{deep_threshold}, ROI={roi:.1f}%)")
-                return True
-            if pos.side == OrderSide.SELL_SHORT and signal == "BUY" and score >= deep_threshold:
-                logger.info(f"[DEEP REVERSAL] {pos.symbol} zararda derin sinyal çıkışı "
-                            f"(conf={score:.1f} >= +{deep_threshold}, ROI={roi:.1f}%)")
-                return True
+        # Sinyal, ters pozisyon açılacak kadar güçlü mü?
+        # min_buy_score seviyesinde ters sinyal = gerçek dönüş
+        min_score = strat.get("min_buy_score", 70)
+        threshold = strat.get("signal_exit_threshold", 4.0)
+        # Ters sinyal gücü: hem confluence threshold hem de min_buy_score
+        # seviyesinde olmalı (yani bu sinyal ile ters pozisyon açılabilir)
+        abs_score = abs(score)
+        reverse_worthy = abs_score >= min_score
+
+        if pos.side == OrderSide.BUY_LONG and signal == "SELL" and score <= -threshold and reverse_worthy:
+            logger.info(f"[SIGNAL EXIT] {pos.symbol} kârda sinyal çıkışı "
+                        f"(conf={score:.1f}, abs={abs_score:.1f} >= min_score={min_score}, ROI={roi:.1f}%)")
+            return True
+        if pos.side == OrderSide.SELL_SHORT and signal == "BUY" and score >= threshold and reverse_worthy:
+            logger.info(f"[SIGNAL EXIT] {pos.symbol} kârda sinyal çıkışı "
+                        f"(conf={score:.1f}, abs={abs_score:.1f} >= min_score={min_score}, ROI={roi:.1f}%)")
+            return True
 
         return False
 

@@ -26,7 +26,7 @@ class OrderBookAnalyzer:
     WALL_MULTIPLIER = 5.0
 
     def analyze(self, order_book: dict, current_price: float = 0,
-                volume_24h: float = 0) -> dict:
+                volume_24h: float = 0, thin_book_seconds: float = 5.0) -> dict:
         """Analyze order book and return comprehensive signal data.
 
         Args:
@@ -74,9 +74,11 @@ class OrderBookAnalyzer:
             "thin_book": False,
             "ask_depth_seconds": 0.0,
             "bid_depth_seconds": 0.0,
+            "book_depth_seconds": 0.0,
         }
 
         if not bids or not asks:
+            result["thin_book"] = True
             return result
 
         best_bid = bids[0]["price"]
@@ -155,9 +157,20 @@ class OrderBookAnalyzer:
         result["liquidity_score"] = self._calc_liquidity_score(
             bid_total_usdt, ask_total_usdt, result["spread_pct"], len(bids), len(asks))
 
-        # --- Thin book detection ---
+        # --- Thin book detection (volume-relative) ---
         total_usdt = bid_total_usdt + ask_total_usdt
-        result["thin_book"] = total_usdt < 50_000 or result["spread_pct"] > 0.15
+        # Spread too wide: direct cost too high
+        spread_thin = result["spread_pct"] > 0.15
+        # Volume-relative: book depth < N seconds of trading volume
+        # Means the entire visible book can be consumed in under N seconds
+        if vol_per_sec > 0:
+            book_seconds = total_usdt / vol_per_sec if total_usdt > 0 else 0.0
+            result["book_depth_seconds"] = round(book_seconds, 1)
+            vol_thin = book_seconds < thin_book_seconds
+        else:
+            # No volume data: fallback to absolute threshold
+            vol_thin = total_usdt < 50_000
+        result["thin_book"] = spread_thin or vol_thin
 
         # --- Generate signal ---
         imb = result["weighted_imbalance"]

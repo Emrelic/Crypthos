@@ -49,6 +49,7 @@ class ScanResult:
     ob_liquidity: float = 0.0      # order book liquidity score (0-100)
     ob_thin_book: bool = False     # True if dangerously low liquidity
     mtf_data: dict = field(default_factory=dict)  # {tf: {indicators, confluence}} for multi-TF
+    adx_regime: str = ""  # NO_TRADE / RANGING / WEAK_TREND / STRONG_TREND
 
 
 class ScannerScorer:
@@ -136,6 +137,9 @@ class ScannerScorer:
                 result.direction = "LONG"
             else:
                 result.direction = "SHORT"
+
+            # ADX regime classification
+            result.adx_regime = self._classify_adx_regime(result)
 
             # Check eligibility (hard filters)
             eligible, reason = self._check_eligibility(result)
@@ -272,6 +276,12 @@ class ScannerScorer:
             else:
                 first_fail = f"total_depth_blocking ({wall_info})"
 
+        # === ADX REGIME GATE (new system) ===
+        if strat.get("adx_regime_enabled", False) and r.adx_regime == "NO_TRADE":
+            checks["ADX"] = (False, f"{r.adx:.0f}", f">={strat.get('adx_regime_no_trade', 18)}")
+            if not first_fail:
+                first_fail = f"adx_no_trade_zone ({r.adx:.0f} < {strat.get('adx_regime_no_trade', 18)})"
+
         # === ADX ZONE DETECTION ===
         ranging_cfg = strat.get("ranging_mode", {})
         gray_cfg = strat.get("gray_zone", {})
@@ -301,7 +311,7 @@ class ScannerScorer:
             min_rsi_short = strat.get("min_rsi_short", 38)
         else:
             zone = "TRENDING"
-            min_conf = trending_cfg.get("min_confluence", 5.0)
+            min_conf = trending_cfg.get("min_confluence", strat.get("min_confluence", 6.5))
             min_adx = trending_cfg.get("min_adx", 25)
             max_rsi_long = strat.get("max_rsi_long", 62)
             min_rsi_short = strat.get("min_rsi_short", 38)
@@ -397,6 +407,28 @@ class ScannerScorer:
         r.filter_checks = checks
         all_passed = not first_fail
         return all_passed, first_fail
+
+    def _classify_adx_regime(self, r: ScanResult) -> str:
+        """Classify ADX regime: NO_TRADE / RANGING / WEAK_TREND / STRONG_TREND.
+        Used by state_machine to determine entry type, SL, trailing params."""
+        strat = self._config.get("strategy", {})
+        if not strat.get("adx_regime_enabled", False):
+            return ""
+
+        no_trade_threshold = strat.get("adx_regime_no_trade", 18)
+        strong_trend_threshold = strat.get("adx_regime_strong_trend", 25)
+
+        if r.adx < no_trade_threshold:
+            return "NO_TRADE"
+        elif r.adx >= strong_trend_threshold:
+            return "STRONG_TREND"
+        else:
+            # ADX 18-25: check if trend is confirmed via confluence active_group
+            active_group = r.confluence.get("active_group", "NEUTRAL")
+            if active_group in ("TREND", "BOTH"):
+                return "WEAK_TREND"
+            else:
+                return "RANGING"
 
     def _compute_score(self, r: ScanResult) -> float:
         """Compute composite score (0-100, negative for SHORT)."""
