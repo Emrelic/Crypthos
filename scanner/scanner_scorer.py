@@ -11,6 +11,11 @@ from analysis.confluence import ConfluenceScorer
 from analysis.market_regime import MarketRegimeDetector
 from analysis.divergence import DivergenceDetector
 
+# Timeframe to seconds mapping for wall strength calculation
+_TF_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+               "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
+               "8h": 28800, "12h": 43200}
+
 
 @dataclass
 class ScanResult:
@@ -38,6 +43,9 @@ class ScanResult:
     oi_change_pct: float = 0.0     # open interest change % (last 30min)
     ob_imbalance: float = 0.0      # order book weighted imbalance (-1 to +1)
     ob_wall_signal: str = "NONE"   # UP_BLOCKED / DOWN_BLOCKED / NONE
+    ob_wall_seconds: float = 0.0   # wall strength in seconds of volume
+    ob_ask_depth_seconds: float = 0.0  # total ask depth in seconds
+    ob_bid_depth_seconds: float = 0.0  # total bid depth in seconds
     ob_liquidity: float = 0.0      # order book liquidity score (0-100)
     ob_thin_book: bool = False     # True if dangerously low liquidity
     mtf_data: dict = field(default_factory=dict)  # {tf: {indicators, confluence}} for multi-TF
@@ -80,6 +88,9 @@ class ScannerScorer:
             result.oi_change_pct = market_context.get("oi_change_pct", 0.0)
             result.ob_imbalance = market_context.get("ob_imbalance", 0.0)
             result.ob_wall_signal = market_context.get("ob_wall_signal", "NONE")
+            result.ob_wall_seconds = market_context.get("ob_wall_seconds", 0.0)
+            result.ob_ask_depth_seconds = market_context.get("ob_ask_depth_seconds", 0.0)
+            result.ob_bid_depth_seconds = market_context.get("ob_bid_depth_seconds", 0.0)
             result.ob_liquidity = market_context.get("ob_liquidity", 0.0)
             result.ob_thin_book = market_context.get("ob_thin_book", False)
 
@@ -112,7 +123,7 @@ class ScannerScorer:
 
             # Divergence
             ind_series = {}
-            for name in ["RSI", "CCI", "OBV"]:
+            for name in ["RSI", "OBV"]:
                 ind = self._engine.get_indicator(name)
                 if ind and ind._series is not None:
                     ind_series[name] = ind._series
@@ -208,21 +219,58 @@ class ScannerScorer:
         if not fr_passed and not first_fail:
             first_fail = f"extreme_funding ({fr_pct:.3f}%)"
 
-        # 4. ORDERBOOK (thin + wall)
+        # 4. ORDERBOOK (thin + volume-relative wall + total depth)
         ob_passed = not r.ob_thin_book
         wall_ok = True
-        if r.ob_wall_signal == "UP_BLOCKED" and r.direction == "LONG":
-            wall_ok = False
-        if r.ob_wall_signal == "DOWN_BLOCKED" and r.direction == "SHORT":
-            wall_ok = False
-        ob_final = ob_passed and wall_ok
-        ob_actual = "thin" if not ob_passed else ("wall" if not wall_ok else "ok")
+        depth_ok = True
+        wall_info = ""
+
+        # Wall blocking: compare wall strength to timeframe
+        tf_seconds = _TF_SECONDS.get(r.timeframe, 300)
+        wall_min_ratio = strat.get("wall_min_tf_ratio", 0.5)
+        depth_min_ratio = strat.get("depth_min_tf_ratio", 3.0)
+
+        if r.ob_wall_signal != "NONE" and r.ob_wall_seconds > 0:
+            wall_ratio = r.ob_wall_seconds / tf_seconds
+            blocks_direction = (
+                (r.ob_wall_signal == "UP_BLOCKED" and r.direction == "LONG") or
+                (r.ob_wall_signal == "DOWN_BLOCKED" and r.direction == "SHORT")
+            )
+            if blocks_direction and wall_ratio >= wall_min_ratio:
+                wall_ok = False
+                wall_info = f"wall {r.ob_wall_seconds:.0f}s ({wall_ratio:.2f}x tf)"
+            # Wall exists but too thin relative to volume — ignore it
+
+        # Total depth pressure: all levels combined on the blocking side
+        if depth_min_ratio > 0:
+            if r.direction == "LONG" and r.ob_ask_depth_seconds > 0:
+                depth_ratio = r.ob_ask_depth_seconds / tf_seconds
+                if depth_ratio >= depth_min_ratio:
+                    depth_ok = False
+                    wall_info = f"depth {r.ob_ask_depth_seconds:.0f}s ({depth_ratio:.1f}x tf)"
+            elif r.direction == "SHORT" and r.ob_bid_depth_seconds > 0:
+                depth_ratio = r.ob_bid_depth_seconds / tf_seconds
+                if depth_ratio >= depth_min_ratio:
+                    depth_ok = False
+                    wall_info = f"depth {r.ob_bid_depth_seconds:.0f}s ({depth_ratio:.1f}x tf)"
+
+        ob_final = ob_passed and wall_ok and depth_ok
+        if not ob_passed:
+            ob_actual = "thin"
+        elif not wall_ok:
+            ob_actual = "wall"
+        elif not depth_ok:
+            ob_actual = "deep"
+        else:
+            ob_actual = "ok"
         checks["OB"] = (ob_final, ob_actual, "ok")
         if not ob_final and not first_fail:
             if not ob_passed:
                 first_fail = "thin_order_book (low liquidity)"
+            elif not wall_ok:
+                first_fail = f"{r.ob_wall_signal.lower()} ({wall_info})"
             else:
-                first_fail = f"{r.ob_wall_signal.lower()}"
+                first_fail = f"total_depth_blocking ({wall_info})"
 
         # === ADX ZONE DETECTION ===
         ranging_cfg = strat.get("ranging_mode", {})

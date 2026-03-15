@@ -57,7 +57,7 @@ class IndicatorEngine:
         # === MOMENTUM ===
         # self._indicators["Stochastic"] = StochasticOscillator(14, 3, 3)  # DEVRE DISI: skorlanmiyor
         # self._indicators["StochRSI"] = StochasticRSI(14, 14, 3, 3)  # DEVRE DISI: RSI turevi, redundant (orthogonality audit)
-        self._indicators["CCI"] = CCI(20)
+        # self._indicators["CCI"] = CCI(20)  # DEVRE DISI: RSI turevi, redundant (orthogonality audit)
         # self._indicators["WilliamsR"] = WilliamsR(14)  # DEVRE DISI: skorlanmiyor
         # self._indicators["MFI"] = MFI(14)  # DEVRE DISI: RSI+volume, OBV/CMF yeterli (orthogonality audit)
         # self._indicators["ROC"] = ROC(12)  # DEVRE DISI: skorlanmiyor

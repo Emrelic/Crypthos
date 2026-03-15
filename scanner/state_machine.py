@@ -550,6 +550,7 @@ class ScannerStateMachine:
     def _fetch_oi_depth(self, symbols: list[str], ctx: dict[str, dict]) -> None:
         """Phase 2: Fetch OI history + OrderBook depth for given symbols (mutates ctx).
         Called after preliminary scoring so only top candidates get detailed data."""
+        ticker_data = self._universe.get_all_tickers()
         for sym in symbols:
             if sym not in ctx:
                 ctx[sym] = {"funding_rate": 0.0, "oi_change_pct": 0.0}
@@ -569,11 +570,23 @@ class ScannerStateMachine:
             # Order Book depth (20 levels each side)
             try:
                 depth = self._rest.get_depth(sym, limit=20)
-                ob = self._ob_analyzer.analyze(depth)
+                vol_24h = ticker_data.get(sym, {}).get("volume_24h", 0)
+                ob = self._ob_analyzer.analyze(depth, volume_24h=vol_24h)
                 ctx[sym]["ob_imbalance"] = ob.get("weighted_imbalance", 0.0)
                 ctx[sym]["ob_wall_signal"] = ob.get("wall_signal", "NONE")
                 ctx[sym]["ob_liquidity"] = ob.get("liquidity_score", 0.0)
                 ctx[sym]["ob_thin_book"] = ob.get("thin_book", False)
+                # Wall strength in seconds (for timeframe-relative filtering)
+                ask_wall = ob.get("ask_wall")
+                bid_wall = ob.get("bid_wall")
+                ctx[sym]["ob_wall_seconds"] = 0.0
+                if ask_wall and ob.get("wall_signal") == "UP_BLOCKED":
+                    ctx[sym]["ob_wall_seconds"] = ask_wall.get("wall_seconds", 9999.0)
+                elif bid_wall and ob.get("wall_signal") == "DOWN_BLOCKED":
+                    ctx[sym]["ob_wall_seconds"] = bid_wall.get("wall_seconds", 9999.0)
+                # Total depth pressure in seconds
+                ctx[sym]["ob_ask_depth_seconds"] = ob.get("ask_depth_seconds", 0.0)
+                ctx[sym]["ob_bid_depth_seconds"] = ob.get("bid_depth_seconds", 0.0)
             except Exception:
                 pass  # Order book is optional, don't block scan
 

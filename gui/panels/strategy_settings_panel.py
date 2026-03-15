@@ -15,6 +15,7 @@ PRESETS = {
             "min_buy_score": 65, "min_confluence": 5.0, "min_adx": 22,
             "max_rsi_long": 58, "min_rsi_short": 42,
             "macd_filter": True, "volume_filter": True, "volatile_filter": True,
+            "wall_min_tf_ratio": 0.3, "depth_min_tf_ratio": 2.0,
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_timeframe": "5m",
             # Leverage
@@ -64,6 +65,7 @@ PRESETS = {
             "min_buy_score": 55, "min_confluence": 4.0, "min_adx": 20,
             "max_rsi_long": 60, "min_rsi_short": 40,
             "macd_filter": True, "volume_filter": True, "volatile_filter": True,
+            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0,
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_timeframe": "5m",
             "min_leverage": 25, "max_leverage": 50,
@@ -104,6 +106,7 @@ PRESETS = {
             "min_buy_score": 55, "min_confluence": 4.0, "min_adx": 18,
             "max_rsi_long": 62, "min_rsi_short": 38,
             "macd_filter": True, "volume_filter": True, "volatile_filter": True,
+            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0,
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_timeframe": "3m",
             "min_leverage": 50, "max_leverage": 100,
@@ -147,6 +150,7 @@ PRESETS = {
             "min_buy_score": 55, "min_confluence": 4.0, "min_adx": 18,
             "max_rsi_long": 62, "min_rsi_short": 38,
             "macd_filter": True, "volume_filter": True, "volatile_filter": False,
+            "wall_min_tf_ratio": 0.5, "depth_min_tf_ratio": 3.0,
             "scan_interval_seconds": 30, "kline_interval": "5m", "kline_limit": 200,
             "min_timeframe": "5m",
             # Kaldirac: max mumkun (20x bile olsa ac)
@@ -425,6 +429,42 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "ek bir katman olarak calisir.\n\n"
                           "  Acik: Volatile rejimde giris yok\n"
                           "  Kapali: ATR kontrolune guven"))
+
+        self._field(s, "wall_min_tf_ratio", "Duvar Kalinligi (TF orani)", "0.5",
+                    help_text=(
+                        "DUVAR KALINLIGI FILTRESI\n"
+                        "────────────────────────\n"
+                        "Order book'taki en buyuk blok (duvar)\n"
+                        "ne kadar guclu? Hacme ve timeframe'e\n"
+                        "gore oransal olarak degerlendirilir.\n\n"
+                        "Hesaplama:\n"
+                        "  duvar_saniye = duvar_usdt / (hacim24h / 86400)\n"
+                        "  oran = duvar_saniye / timeframe_saniye\n\n"
+                        "Ornek (5m TF, oran=0.5):\n"
+                        "  Duvar < 150 sn → kagit, yoksay\n"
+                        "  Duvar >= 150 sn → gercek, engelle\n\n"
+                        "BTCUSDT'de 2 sn'lik duvar yoksayilir,\n"
+                        "DOTUSDT'de 394 sn'lik duvar engellenir.\n\n"
+                        "  0.3: Gevsek (az engelleme)\n"
+                        "  0.5: Varsayilan\n"
+                        "  1.0: Siki (1 mum dayanamayan engeller)\n"
+                        "  0: Duvar filtresi kapali"))
+        self._field(s, "depth_min_tf_ratio", "Toplam Derinlik (TF orani)", "3.0",
+                    help_text=(
+                        "TOPLAM DERINLIK FILTRESI\n"
+                        "────────────────────────\n"
+                        "Tek blok degil, tum order book\n"
+                        "kademelerinin toplam buyuklugu.\n\n"
+                        "Hesaplama:\n"
+                        "  toplam_sn = toplam_usdt / (hacim24h / 86400)\n"
+                        "  oran = toplam_sn / timeframe_saniye\n\n"
+                        "Ornek (5m TF, oran=3.0):\n"
+                        "  Toplam < 900 sn (15dk) → gecebilir\n"
+                        "  Toplam >= 900 sn → cok kalin, engelle\n\n"
+                        "  2.0: Gevsek\n"
+                        "  3.0: Varsayilan\n"
+                        "  5.0: Siki\n"
+                        "  0: Toplam derinlik filtresi kapali"))
 
         self._field(s, "scan_interval_seconds", "Tarama Araligi (sn)", "30")
 

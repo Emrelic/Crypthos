@@ -3,8 +3,9 @@
 Analyzes Binance Futures depth data to detect:
   - Bid/Ask imbalance (weighted by proximity to current price)
   - Large order walls (support/resistance from big players)
+  - Volume-relative wall strength (seconds to break through)
+  - Total depth pressure (all levels combined)
   - Spread-based liquidity filtering
-  - Spoofing indicators (walls appearing/disappearing)
 """
 from loguru import logger
 
@@ -24,19 +25,27 @@ class OrderBookAnalyzer:
     # Wall detection: a single level with this many times the average = wall
     WALL_MULTIPLIER = 5.0
 
-    def analyze(self, order_book: dict, current_price: float = 0) -> dict:
+    def analyze(self, order_book: dict, current_price: float = 0,
+                volume_24h: float = 0) -> dict:
         """Analyze order book and return comprehensive signal data.
+
+        Args:
+            order_book: Binance depth data
+            current_price: current market price
+            volume_24h: 24h quote volume in USDT (for wall strength calculation)
 
         Returns dict with:
           - imbalance, weighted_imbalance: bid/ask balance (-1 to +1)
           - depth_ratio: bid_total / ask_total
           - spread, spread_pct: absolute and percentage spread
-          - bid_wall, ask_wall: detected walls {price, size, distance_pct}
+          - bid_wall, ask_wall: detected walls {price, size, distance_pct, wall_seconds}
           - liquidity_score: 0-100 (how liquid this market is)
           - signal: BUY/SELL/NEUTRAL
           - signal_strength: 0.0-1.0
           - wall_signal: UP_BLOCKED/DOWN_BLOCKED/NONE
           - thin_book: True if dangerously low liquidity
+          - ask_depth_seconds: total ask side depth in seconds of volume
+          - bid_depth_seconds: total bid side depth in seconds of volume
         """
         bids_raw = order_book.get("bids", [])
         asks_raw = order_book.get("asks", [])
@@ -63,6 +72,8 @@ class OrderBookAnalyzer:
             "signal_strength": 0.0,
             "wall_signal": "NONE",
             "thin_book": False,
+            "ask_depth_seconds": 0.0,
+            "bid_depth_seconds": 0.0,
         }
 
         if not bids or not asks:
@@ -74,6 +85,9 @@ class OrderBookAnalyzer:
         if mid_price <= 0:
             return result
 
+        # Volume per second (for wall strength calculation)
+        vol_per_sec = volume_24h / 86400 if volume_24h > 0 else 0
+
         # --- Total volumes (in USDT) ---
         bid_total = sum(b["size"] for b in bids)
         ask_total = sum(a["size"] for a in asks)
@@ -83,6 +97,11 @@ class OrderBookAnalyzer:
         result["ask_total"] = ask_total
         result["bid_total_usdt"] = bid_total_usdt
         result["ask_total_usdt"] = ask_total_usdt
+
+        # --- Total depth in seconds (how long to eat through all levels) ---
+        if vol_per_sec > 0:
+            result["ask_depth_seconds"] = round(ask_total_usdt / vol_per_sec, 1)
+            result["bid_depth_seconds"] = round(bid_total_usdt / vol_per_sec, 1)
 
         # --- Simple imbalance ---
         total = bid_total + ask_total
@@ -120,9 +139,11 @@ class OrderBookAnalyzer:
                 best_bid * ask_vol + best_ask * bid_vol
             ) / (bid_vol + ask_vol)
 
-        # --- Wall Detection ---
-        result["bid_wall"] = self._detect_wall(bids, mid_price, side="bid")
-        result["ask_wall"] = self._detect_wall(asks, mid_price, side="ask")
+        # --- Wall Detection (with volume-relative strength) ---
+        result["bid_wall"] = self._detect_wall(bids, mid_price, side="bid",
+                                                vol_per_sec=vol_per_sec)
+        result["ask_wall"] = self._detect_wall(asks, mid_price, side="ask",
+                                                vol_per_sec=vol_per_sec)
 
         # Wall signal: if a wall is close and big, it blocks that direction
         if result["ask_wall"] and result["ask_wall"]["distance_pct"] < 1.0:
@@ -172,9 +193,9 @@ class OrderBookAnalyzer:
         return result
 
     def _detect_wall(self, levels: list[dict], mid_price: float,
-                     side: str) -> dict | None:
+                     side: str, vol_per_sec: float = 0) -> dict | None:
         """Detect if any single level has disproportionately large volume.
-        Returns {price, size, size_usdt, distance_pct, multiplier} or None."""
+        Returns {price, size, size_usdt, distance_pct, multiplier, wall_seconds} or None."""
         if len(levels) < 5:
             return None
 
@@ -190,6 +211,7 @@ class OrderBookAnalyzer:
         # Find the largest level
         best = None
         best_mult = 0
+        best_usdt = 0
         for lv in levels:
             lv_usdt = lv["size"] * lv["price"]
             mult = lv_usdt / avg_usdt
@@ -200,12 +222,15 @@ class OrderBookAnalyzer:
 
         if best and best_mult >= self.WALL_MULTIPLIER:
             dist = abs(best["price"] - mid_price) / mid_price * 100
+            # Wall strength: how many seconds of average volume to break this wall
+            wall_seconds = best_usdt / vol_per_sec if vol_per_sec > 0 else 9999.0
             return {
                 "price": best["price"],
                 "size": best["size"],
                 "size_usdt": best_usdt,
                 "distance_pct": round(dist, 3),
                 "multiplier": round(best_mult, 1),
+                "wall_seconds": round(wall_seconds, 1),
             }
 
         return None
