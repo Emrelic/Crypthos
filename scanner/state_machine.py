@@ -696,7 +696,9 @@ class ScannerStateMachine:
 
         logger.info(f"Limit order FILLED: {symbol} @ ~{fill_price:.6f}")
 
-        # Signal recheck: is the signal still valid?
+        # Signal recheck: only close if STRONG REVERSAL (opposite direction signal)
+        # LONG pozisyonda iken → sadece SHORT sinyali (conf < -threshold) gelirse kapat
+        # Nötr veya zayıf sinyal → devam et (fee kaybını önle)
         if recheck:
             try:
                 tf = info.get("timeframe", self._config.get("indicators.kline_interval", "5m"))
@@ -704,23 +706,25 @@ class ScannerStateMachine:
                 if klines is not None and not klines.empty:
                     result = self._scorer.score_symbol(symbol, klines)
                     conf_score = result.confluence.get("score", 0)
-                    min_conf = strat.get("min_confluence", 4.0)
+                    recheck_threshold = strat.get("min_confluence", 4.0)
 
-                    # Check if signal still supports our direction
-                    if info["direction"] == "LONG" and conf_score < min_conf * 0.5:
-                        logger.warning(f"Limit filled but signal REVERSED for {symbol} "
-                                       f"(conf={conf_score:.1f}, need {min_conf*0.5:.1f}+), "
-                                       f"closing immediately")
+                    # LONG iken sadece güçlü SHORT sinyali varsa kapat
+                    if info["direction"] == "LONG" and conf_score <= -recheck_threshold:
+                        logger.warning(f"Limit filled but STRONG REVERSAL for {symbol} "
+                                       f"(conf={conf_score:.1f} <= -{recheck_threshold:.0f}, "
+                                       f"SHORT sinyali), closing immediately")
                         self._cancel_limit_position(symbol, info)
                         return
-                    elif info["direction"] == "SHORT" and conf_score > -min_conf * 0.5:
-                        logger.warning(f"Limit filled but signal REVERSED for {symbol} "
-                                       f"(conf={conf_score:.1f}, need {-min_conf*0.5:.1f}-), "
-                                       f"closing immediately")
+                    # SHORT iken sadece güçlü LONG sinyali varsa kapat
+                    elif info["direction"] == "SHORT" and conf_score >= recheck_threshold:
+                        logger.warning(f"Limit filled but STRONG REVERSAL for {symbol} "
+                                       f"(conf={conf_score:.1f} >= +{recheck_threshold:.0f}, "
+                                       f"LONG sinyali), closing immediately")
                         self._cancel_limit_position(symbol, info)
                         return
 
-                    logger.info(f"Signal recheck OK: {symbol} conf={conf_score:.1f}")
+                    logger.info(f"Signal recheck OK: {symbol} conf={conf_score:.1f} "
+                                f"(no strong reversal, proceeding)")
             except Exception as e:
                 logger.warning(f"Signal recheck failed for {symbol}: {e}, proceeding anyway")
 
