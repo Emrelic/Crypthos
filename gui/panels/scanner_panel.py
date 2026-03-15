@@ -235,10 +235,12 @@ class ScannerPanel(ctk.CTkFrame):
         # Scan-only prefix: # + Skor
         # Pos-only prefix: ROI%
         # After SAT: scan has [Red + filters], pos has [filters + exit cols]
-        _IND_W = [50, 48, 50, 48, 48, 50, 48, 50, 48, 48, 48]  # 11 indicators
-        _SHARED_MID = [48, 38, 32, 32, 32, 32]  # ATR% Lev TF Fnd OI% OB
-        _CONF_W = [44, 26, 26]  # Conf AL SAT
-        _FLT_W = [42] * len(FILTER_COLS)  # 9 filter cols
+        # Column widths designed for ~1440px (Full HD minus scrollbar/padding)
+        # Scan: 34 cols, Pos: 41 cols — shared section must be identical
+        _IND_W = [52, 50, 52, 50, 50, 52, 50, 52, 50, 50, 50]  # 11 indicators
+        _SHARED_MID = [50, 40, 34, 34, 34, 34]  # ATR% Lev TF Fnd OI% OB
+        _CONF_W = [46, 28, 28]  # Conf AL SAT
+        _FLT_W = [44] * len(FILTER_COLS)  # 9 filter cols
 
         # === MIDDLE: Scan Results Table ===
         table_frame = ctk.CTkFrame(self)
@@ -254,23 +256,27 @@ class ScannerPanel(ctk.CTkFrame):
             ["#", "Sinyal", "Sembol", "Skor"] +
             ["ATR%", "Lev", "TF", "Fnd", "OI%", "OB"] +
             CONF_SHORT +
-            ["Conf", "AL", "SAT", "Red"] +
-            FILTER_COLS
+            ["Conf", "AL", "SAT"] +
+            FILTER_COLS +
+            ["Red"]
         )
         self._scan_widths = (
-            [20, 50, 78, 40] +
+            [22, 54, 90, 44] +
             _SHARED_MID +
             _IND_W +
-            _CONF_W + [60] +
-            _FLT_W
+            _CONF_W +
+            _FLT_W +
+            [80]
         )
-        filter_start_idx = len(self._scan_headers) - len(FILTER_COLS)
+        # Filter columns start right after Conf/AL/SAT (same as position table)
+        filter_start_idx = 4 + len(_SHARED_MID) + len(_IND_W) + len(_CONF_W)
+        filter_end_idx = filter_start_idx + len(FILTER_COLS)
         for col_idx, (h, w) in enumerate(zip(self._scan_headers, self._scan_widths)):
-            if col_idx >= filter_start_idx:
+            if filter_start_idx <= col_idx < filter_end_idx:
                 hdr_color = "#FF8A65"
             else:
                 hdr_color = CONF_HDR_COLORS.get(h, "#7799BB")
-            ctk.CTkLabel(hdr, text=h, width=w, font=ctk.CTkFont(size=11, weight="bold"),
+            ctk.CTkLabel(hdr, text=h, width=w, font=ctk.CTkFont(size=13, weight="bold"),
                          text_color=hdr_color).pack(side="left", padx=0)
 
         # Scrollable results
@@ -300,12 +306,12 @@ class ScannerPanel(ctk.CTkFrame):
             ["SL%", "Acil", "AktR%", "Kar/A", "Geri%", "Trail", "Kalan", "$"]
         )
         self._pos_widths = (
-            [20, 50, 78, 40] +
+            [22, 54, 90, 44] +
             _SHARED_MID +
             _IND_W +
             _CONF_W +
             _FLT_W +
-            [38, 38, 40, 38, 38, 38, 40, 36]
+            [40, 40, 42, 40, 40, 40, 42, 38]
         )
         # Filter columns start right after Conf/AL/SAT
         pos_filter_start_idx = 4 + len(_SHARED_MID) + len(_IND_W) + len(_CONF_W)
@@ -316,7 +322,7 @@ class ScannerPanel(ctk.CTkFrame):
             else:
                 hdr_color = CONF_HDR_COLORS.get(h, "#7799BB")
             ctk.CTkLabel(pos_hdr, text=h, width=w,
-                         font=ctk.CTkFont(size=11, weight="bold"),
+                         font=ctk.CTkFont(size=13, weight="bold"),
                          text_color=hdr_color).pack(side="left", padx=0)
 
         self._pos_scroll = ctk.CTkScrollableFrame(pos_frame_outer, height=160)
@@ -357,7 +363,17 @@ class ScannerPanel(ctk.CTkFrame):
         try:
             self._update_state()
             self._update_results()
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Refresh scan error: {e}")
+        try:
             self._update_position()
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Refresh position error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        try:
             self._update_trade()
         except Exception:
             pass
@@ -374,7 +390,7 @@ class ScannerPanel(ctk.CTkFrame):
     def _ensure_scan_rows(self, count: int) -> None:
         """Ensure exactly `count` rows exist in the scan results table."""
         widths = self._scan_widths
-        font = ctk.CTkFont(size=11)
+        font = ctk.CTkFont(size=12)
         # Remove excess rows
         while len(self._result_rows) > count:
             frame, labels = self._result_rows.pop()
@@ -391,7 +407,7 @@ class ScannerPanel(ctk.CTkFrame):
             for w in widths:
                 lbl = ctk.CTkLabel(row_frame, text="", width=w,
                                    font=font, text_color="gray")
-                lbl.pack(side="left", padx=1)
+                lbl.pack(side="left", padx=0)
                 labels.append(lbl)
             self._result_rows.append((row_frame, labels))
             self._result_cache.append(None)
@@ -501,8 +517,9 @@ class ScannerPanel(ctk.CTkFrame):
             (conf_str, conf_color),
             (f"{bullish}", "#00C853" if bullish > 0 else "gray"),
             (f"{bearish}", "#FF1744" if bearish > 0 else "gray"),
+        ] + filter_cells + [
             (reject_short, "#FF5252" if reject_short else "gray"),
-        ] + filter_cells
+        ]
 
         return vals
 
@@ -556,8 +573,9 @@ class ScannerPanel(ctk.CTkFrame):
             (conf_str, conf_color),                     # Conf
             (f"{bullish}", "#00C853" if bullish > 0 else "#555555"),  # AL
             (f"{bearish}", "#FF1744" if bearish > 0 else "#555555"),  # SAT
-            empty,                                      # Red
-        ] + [empty] * n_filters                         # Filters empty
+        ] + [empty] * n_filters + [                     # Filters empty
+            empty,                                      # Red (last)
+        ]
 
         return vals
 
@@ -624,7 +642,7 @@ class ScannerPanel(ctk.CTkFrame):
     def _ensure_pos_rows(self, count: int) -> None:
         """Ensure exactly `count` rows exist in positions table."""
         widths = self._pos_widths
-        font = ctk.CTkFont(size=11)
+        font = ctk.CTkFont(size=12)
         while len(self._pos_rows) > count:
             frame, labels = self._pos_rows.pop()
             frame.destroy()
@@ -639,7 +657,7 @@ class ScannerPanel(ctk.CTkFrame):
             for w in widths:
                 lbl = ctk.CTkLabel(row_frame, text="", width=w,
                                    font=font, text_color="gray")
-                lbl.pack(side="left", padx=1)
+                lbl.pack(side="left", padx=0)
                 labels.append(lbl)
             self._pos_rows.append((row_frame, labels))
             self._pos_cache.append(None)
@@ -800,7 +818,7 @@ class ScannerPanel(ctk.CTkFrame):
 
             # Build vals: filters BEFORE exit columns (aligned with scan table)
             vals = [
-                ("", "transparent"),  # spacer to align with scan table "#" column
+                ("", "#1a1a2e"),  # spacer to align with scan table "#" column
                 signal_merged,
                 (symbol, "white"),
                 (f"{roi:+.1f}%", roi_color),
