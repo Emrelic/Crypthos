@@ -2144,10 +2144,10 @@ class ScannerStateMachine:
 
     def _place_initial_trailing(self, symbol: str, pos, entry_price: float,
                                 atr: float) -> None:
-        """Pozisyon açılır açılmaz Binance'e sadece trailing emir gönderir.
+        """Pozisyon açılır açılmaz Binance'e SL + trailing emir gönderir.
 
-        Server SL kaldırıldı — yazılım emergency exit (liq yakını limit emir) korur.
-        Sadece TRAILING_STOP_MARKET: 4×ATR'de aktif, 1×ATR geri gelme (kar alma).
+        Katman 1: 2×ATR STOP_MARKET (crash koruması — server SL)
+        Katman 2: TRAILING_STOP_MARKET: 4×ATR'de aktif, 1×ATR geri gelme (kar alma).
         """
         try:
             rest = self._order_executor._rest
@@ -2161,9 +2161,25 @@ class ScannerStateMachine:
 
             atr_pct = atr / entry_price * 100 if entry_price > 0 and atr > 0 else 0
 
-            # Server SL kaldırıldı — emergency exit yazılım tarafında korur
-            # Liq yakınında limit emir ile çıkış yapılır (maker fee %0.02)
-            logger.info(f"[NO SERVER SL] {symbol}: SL devre disi, emergency exit aktif")
+            # === SERVER SL: 2×ATR STOP_MARKET (crash koruması) ===
+            sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
+            if atr > 0 and entry_price > 0:
+                if is_long:
+                    sl_price = round(entry_price - (atr * sl_atr_mult), pp)
+                else:
+                    sl_price = round(entry_price + (atr * sl_atr_mult), pp)
+
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=pos.size,
+                    stop_price=sl_price,
+                )
+                logger.info(f"[SERVER SL] {symbol}: {sl_atr_mult}xATR SL @ {sl_price} "
+                            f"({'long' if is_long else 'short'}, entry={entry_price})")
+            else:
+                logger.info(f"[NO SERVER SL] {symbol}: ATR=0, emergency exit korur")
 
             # === TRAILING_STOP_MARKET: 4×ATR'de aktif, 1×ATR callback ===
             if atr > 0 and entry_price > 0:
