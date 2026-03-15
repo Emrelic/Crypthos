@@ -2229,40 +2229,22 @@ class ScannerStateMachine:
 
     def _calc_trailing_callback(self, pos, current_price: float,
                                  confluence: dict = None) -> float:
-        """Calculate optimal callback rate based on ATR and signal strength.
+        """Calculate trailing callback rate = sabit 1×ATR.
+        Sinyal gücüne göre dinamik daraltma/genişletme KAPATILDI.
+        Fiyat 1×ATR geri çekilmeden trailing tetiklemez.
         Returns callback % (0.1 to 5.0) for Binance TRAILING_STOP_MARKET."""
         atr = pos.atr_at_entry
         strat = self._config.get("strategy", {})
         distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
 
-        # Base callback = 1×ATR distance
+        # Sabit callback = 1×ATR distance (sinyal gücüne göre değişmez)
         if atr > 0 and current_price > 0:
-            base_callback = (atr * distance_mult) / current_price * 100
+            callback = (atr * distance_mult) / current_price * 100
         else:
-            base_callback = 1.0
+            callback = 1.0
 
-        # Minimum callback = 0.5×ATR (asla bunun altına düşmemeli)
-        min_callback = base_callback * 0.5
-
-        # Adjust based on confluence signal strength
-        if confluence:
-            conf_score = confluence.get("score", 0)
-            is_long = pos.side == OrderSide.BUY_LONG
-
-            # Signal supports position → widen callback (be patient)
-            if (is_long and conf_score >= 4.0) or (not is_long and conf_score <= -4.0):
-                base_callback *= 1.5  # 50% wider — strong trend
-            elif (is_long and conf_score >= 2.0) or (not is_long and conf_score <= -2.0):
-                base_callback *= 1.2  # 20% wider — moderate support
-
-            # Signal against position → tighten callback (but never below 0.5×ATR)
-            elif (is_long and conf_score <= -2.0) or (not is_long and conf_score >= 2.0):
-                base_callback *= 0.7  # 30% tighter (was 50% — too aggressive)
-            elif (is_long and conf_score <= 0) or (not is_long and conf_score >= 0):
-                base_callback *= 0.85  # 15% tighter (was 20%)
-
-        # Clamp: minimum 0.5×ATR (prevent whipsaw), max Binance limit 5.0%
-        return max(max(0.1, min_callback), min(5.0, round(base_callback, 1)))
+        # Clamp to Binance limits (0.1% - 5.0%)
+        return max(0.1, min(5.0, round(callback, 1)))
 
     def _sync_server_trailing(self, symbol: str, pos, current_price: float,
                                confluence: dict = None) -> None:
@@ -2302,10 +2284,6 @@ class ScannerStateMachine:
             reason = ""
             if pos.trailing_renewal_count != old_renewal:
                 reason = f" (renew #{pos.trailing_renewal_count})"
-            elif new_callback < old_callback:
-                reason = " (sinyal zayifliyor, daraltiliyor)"
-            elif new_callback > old_callback:
-                reason = " (sinyal guclu, genisletiliyor)"
 
             logger.info(f"[SERVER TRAILING] {symbol}: "
                         f"callback {old_callback:.1f}% -> {new_callback:.1f}%{reason}")
