@@ -463,7 +463,7 @@ class ScannerStateMachine:
                     regime = self._hold_regime.detect(indicators)
                     if self._config.get("strategy.divergence_exit_enabled", False):
                         ind_series = {}
-                        for name in ["RSI", "CCI", "OBV"]:
+                        for name in ["RSI", "OBV"]:
                             ind = self._hold_engine.get_indicator(name)
                             if ind and ind._series is not None:
                                 ind_series[name] = ind._series
@@ -897,7 +897,7 @@ class ScannerStateMachine:
                     confluence = self._hold_confluence.score(indicators)
                     if self._config.get("strategy.divergence_exit_enabled", False):
                         ind_series = {}
-                        for name in ["RSI", "CCI", "OBV"]:
+                        for name in ["RSI", "OBV"]:
                             ind = self._hold_engine.get_indicator(name)
                             if ind and ind._series is not None:
                                 ind_series[name] = ind._series
@@ -2241,6 +2241,9 @@ class ScannerStateMachine:
         else:
             base_callback = 1.0
 
+        # Minimum callback = 0.5×ATR (asla bunun altına düşmemeli)
+        min_callback = base_callback * 0.5
+
         # Adjust based on confluence signal strength
         if confluence:
             conf_score = confluence.get("score", 0)
@@ -2252,14 +2255,14 @@ class ScannerStateMachine:
             elif (is_long and conf_score >= 2.0) or (not is_long and conf_score <= -2.0):
                 base_callback *= 1.2  # 20% wider — moderate support
 
-            # Signal against position → tighten callback (take profit faster)
+            # Signal against position → tighten callback (but never below 0.5×ATR)
             elif (is_long and conf_score <= -2.0) or (not is_long and conf_score >= 2.0):
-                base_callback *= 0.5  # 50% tighter — signal weakening
+                base_callback *= 0.7  # 30% tighter (was 50% — too aggressive)
             elif (is_long and conf_score <= 0) or (not is_long and conf_score >= 0):
-                base_callback *= 0.8  # 20% tighter — neutral/weak
+                base_callback *= 0.85  # 15% tighter (was 20%)
 
-        # Clamp to Binance limits (0.1% - 5.0%)
-        return max(0.1, min(5.0, round(base_callback, 1)))
+        # Clamp: minimum 0.5×ATR (prevent whipsaw), max Binance limit 5.0%
+        return max(max(0.1, min_callback), min(5.0, round(base_callback, 1)))
 
     def _sync_server_trailing(self, symbol: str, pos, current_price: float,
                                confluence: dict = None) -> None:
