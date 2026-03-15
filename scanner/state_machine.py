@@ -486,7 +486,11 @@ class ScannerStateMachine:
                 divergences=divergences,
             )
 
-            # Server SL + trailing bir kez konuldu, dokunma (sadece renew'da güncellenir)
+            # Server trailing dynamic update (config flag ile kontrol)
+            if self._config.get("strategy", {}).get("server_trailing_dynamic_update", False):
+                pos_now = self._position_mgr.get_position(symbol)
+                if pos_now:
+                    self._sync_server_trailing(symbol, pos_now, current_price, confluence)
 
             if exit_reason == self._position_mgr.EXIT_PARTIAL_TP:
                 self._execute_partial_tp(symbol, current_price)
@@ -922,7 +926,11 @@ class ScannerStateMachine:
                 divergences=divergences,
             )
 
-            # Server SL + trailing bir kez konuldu, dokunma (sadece renew'da güncellenir)
+            # Server trailing dynamic update (config flag ile kontrol)
+            if self._config.get("strategy", {}).get("server_trailing_dynamic_update", False):
+                pos_now = self._position_mgr.get_position(symbol)
+                if pos_now:
+                    self._sync_server_trailing(symbol, pos_now, current_price, confluence)
 
             if exit_reason == self._position_mgr.EXIT_PARTIAL_TP:
                 self._execute_partial_tp(symbol, current_price)

@@ -158,7 +158,7 @@ PRESETS = {
             "server_sl_atr_mult": 2.0,
             "emergency_enabled": True, "emergency_liq_percent": 80,
             # Trailing: ATR bazli (4x tetik, 1x geri cekilme)
-            "trailing_enabled": True, "trailing_mode": "atr",
+            "trailing_enabled": True, "server_trailing_dynamic_update": False, "trailing_mode": "atr",
             "trailing_atr_activate_mult": 4.0, "trailing_atr_distance_mult": 1.0,
             "trailing_activate_roi": 0, "trailing_distance_roi": 0,
             "trailing_activate_fee_mult": 3.0, "trailing_distance_fee_mult": 2.0,
@@ -676,6 +676,21 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "ROI MODU:\n"
                           "  Dogrudan ROI% uzerinden hesaplanir.\n"
                           "  Fee carpani ile otomatik ayarlanabilir."))
+
+        self._checkbox(s, "server_trailing_dynamic_update", "Server Trailing Dinamik Guncelleme",
+                      help_text=(
+                          "SERVER TRAILING DINAMIK GUNCELLEME\n"
+                          "──────────────────────────────────\n"
+                          "KAPALI (onerilen): Server SL + trailing\n"
+                          "  pozisyon acilisinda bir kez konur,\n"
+                          "  bir daha dokunulmaz.\n"
+                          "  Fiyat 2xATR ters → SL tetikler\n"
+                          "  Fiyat 4xATR dogru + 1xATR geri → trailing tetikler\n\n"
+                          "ACIK: Her 30 saniyede sinyal gucune\n"
+                          "  gore callback daraltilir/genisletilir.\n"
+                          "  DIKKAT: erken kapanma riski yuksek!\n"
+                          "  Normal piyasa gurultusu pozisyonu\n"
+                          "  kapatabilir."))
 
         # Trailing mode selector
         row_tmode = ctk.CTkFrame(s, fg_color="transparent")
