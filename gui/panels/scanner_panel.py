@@ -310,7 +310,7 @@ class ScannerPanel(ctk.CTkFrame):
             self._update_trade()
         except Exception:
             pass
-        self.after(2000, self._refresh)
+        self.after(4000, self._refresh)
 
     def _get_status_bar(self):
         """Find the StatusBar widget from the main window."""

@@ -43,6 +43,7 @@ class ScannerStateMachine:
         # State
         self._state = ScannerState.IDLE
         self._running = False
+        self._stop_event = threading.Event()
         self._thread = None
 
         # Scanner components
@@ -151,6 +152,7 @@ class ScannerStateMachine:
         self._sync_api_positions()
 
         self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._main_loop, daemon=True,
                                         name="ScannerStateMachine")
         self._thread.start()
@@ -164,6 +166,7 @@ class ScannerStateMachine:
 
     def stop(self) -> None:
         self._running = False
+        self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=15)
         self._transition(ScannerState.IDLE)
@@ -196,10 +199,10 @@ class ScannerStateMachine:
                 elif self._state == ScannerState.COOLDOWN:
                     self._do_cooldown()
                 else:
-                    time.sleep(1)
+                    self._stop_event.wait(timeout=1)
             except Exception as e:
                 logger.error(f"Scanner error in {self._state.value}: {e}")
-                time.sleep(5)
+                self._stop_event.wait(timeout=5)
 
     # ──── SCANNING State ────
 
@@ -231,7 +234,7 @@ class ScannerStateMachine:
         symbols = self._universe.refresh()
         if not symbols:
             logger.warning("No symbols to scan")
-            time.sleep(10)
+            self._stop_event.wait(timeout=10)
             return
 
         # 2. Dynamic timeframe analysis (refreshes every 5 min)
@@ -350,6 +353,31 @@ class ScannerStateMachine:
             s: t for s, t in self._loss_cooldown_symbols.items()
             if now - t < self._loss_cooldown_seconds
         }
+
+        # Periodic cleanup: coin loss history (remove entries older than ban window)
+        ban_hours = self._config.get("strategy.coin_daily_ban_hours", 24)
+        ban_cutoff = now - (ban_hours * 3600)
+        for sym in list(self._coin_loss_history.keys()):
+            self._coin_loss_history[sym] = [
+                t for t in self._coin_loss_history[sym] if t > ban_cutoff
+            ]
+            if not self._coin_loss_history[sym]:
+                del self._coin_loss_history[sym]
+
+        # Cleanup: expired close retries (stale entries from permanently failed closes)
+        for sym in list(self._close_retries.keys()):
+            if sym not in self._position_mgr.get_held_symbols():
+                self._close_retries.pop(sym, None)
+
+        # Cleanup: stale server trailing entries (orphaned)
+        for sym in list(self._server_trailing.keys()):
+            if sym not in self._position_mgr.get_held_symbols():
+                self._server_trailing.pop(sym, None)
+
+        # Cleanup: stale held indicators
+        for sym in list(self._held_indicators.keys()):
+            if sym not in self._position_mgr.get_held_symbols():
+                self._held_indicators.pop(sym, None)
 
         eligible = [r for r in results if r.eligible]
         min_score = self._config.get("strategy.min_buy_score", 65)
@@ -1712,6 +1740,9 @@ class ScannerStateMachine:
         now = time.time()
         self._trade_timestamps = [t for t in self._trade_timestamps
                                   if now - t < 3600]
+        # Cap list size as safety measure
+        if len(self._trade_timestamps) > 100:
+            self._trade_timestamps = self._trade_timestamps[-100:]
         if len(self._trade_timestamps) >= self._max_trades_per_hour:
             logger.info(f"Trade frequency limit reached: "
                         f"{len(self._trade_timestamps)}/{self._max_trades_per_hour} "
@@ -2307,21 +2338,21 @@ class ScannerStateMachine:
     # ──── Position Monitor (fast check thread) ────
 
     def _position_monitor_loop(self) -> None:
-        """Separate thread that checks positions every 2 seconds.
+        """Separate thread that checks positions every 5 seconds.
         Uses single bulk API call for ALL prices instead of per-symbol calls.
         Critical for anti-liquidation: server-side SL handles sub-second protection,
         this loop handles trailing, signal exit, and emergency close."""
-        check_interval = 2  # 2 seconds — bulk fetch + check all positions
+        check_interval = 5  # 5 seconds — server SL covers fast protection
         logger.info("Position monitor thread started")
         while self._running:
             try:
                 if not self._position_mgr.has_position:
-                    time.sleep(check_interval)
+                    self._stop_event.wait(timeout=check_interval)
                     continue
 
                 # Don't interfere while buying/selling on UI
                 if self._state == ScannerState.BUYING:
-                    time.sleep(2)
+                    self._stop_event.wait(timeout=check_interval)
                     continue
 
                 # Single bulk API call: fetch ALL ticker prices at once
@@ -2330,7 +2361,7 @@ class ScannerStateMachine:
                     price_map = {t["symbol"]: float(t["price"])
                                  for t in all_tickers if float(t.get("price", 0)) > 0}
                 except Exception:
-                    time.sleep(check_interval)
+                    self._stop_event.wait(timeout=check_interval)
                     continue
 
                 for symbol in list(self._position_mgr.get_held_symbols()):
@@ -2372,12 +2403,12 @@ class ScannerStateMachine:
                             except Exception as sell_err:
                                 logger.error(f"[MONITOR] Error closing {symbol}: {sell_err}")
 
-                time.sleep(check_interval)
+                self._stop_event.wait(timeout=check_interval)
             except Exception as e:
                 logger.error(f"Position monitor error: {e}")
                 import traceback
                 logger.error(f"Position monitor traceback: {traceback.format_exc()}")
-                time.sleep(5)
+                self._stop_event.wait(timeout=5)
 
     # ──── Hybrid Trailing Evaluation ────
 
@@ -3028,10 +3059,8 @@ class ScannerStateMachine:
     # ──── Helpers ────
 
     def _wait(self, seconds: float) -> None:
-        """Wait while checking if still running."""
-        end = time.time() + seconds
-        while self._running and time.time() < end:
-            time.sleep(0.5)
+        """Wait while checking if still running. Uses Event for efficient sleep."""
+        self._stop_event.wait(timeout=seconds)
 
     # ──── Getters (for GUI) ────
 
