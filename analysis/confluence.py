@@ -24,8 +24,9 @@ class ConfluenceScorer:
     Only trades when groups agree or one dominates.
     """
 
-    def __init__(self, threshold: float = 4.0):
+    def __init__(self, threshold: float = 4.0, config=None):
         self.threshold = threshold
+        self._config = config
 
     def score(self, indicator_values: dict, regime_weights: dict = None) -> dict:
         """Calculate confluence score with dual-philosophy logic.
@@ -64,36 +65,52 @@ class ConfluenceScorer:
         trend_details["MACD"] = round(s * w, 2)
         trend_score += s * w
 
-        # ADX + DI (boosted: ±2.0 max, was ±1.5)
+        # ADX + DI (guclu trend: ±2.0, orta: ±1.0, erken trend: ±0.5)
         adx = indicator_values.get("ADX", 0)
         plus_di = indicator_values.get("ADX_plus_DI", 0)
         minus_di = indicator_values.get("ADX_minus_DI", 0)
+        di_momentum = indicator_values.get("DI_momentum", 0)
+        di_threshold = self._config.get("indicators.adx_di_momentum_threshold", 5) if self._config else 5
         w = weights.get("ADX", 1.0)
         if adx > 30:
             s = 2.0 if plus_di > minus_di else -2.0
         elif adx > 22:
             s = 1.0 if plus_di > minus_di else -1.0
+        elif di_momentum > di_threshold:
+            # ADX dusuk ama DI farki hizla aciliyor — trend basliyor
+            s = 0.5 if plus_di > minus_di else -0.5
         else:
             s = 0.0
         trend_details["ADX"] = round(s * w, 2)
         trend_score += s * w
 
-        # Price vs SMA (boosted: ±1.5 max, was ±1.0)
+        # Price vs SMA (taze cross: ±1.5, eski pozisyon: ±0.7)
         price = indicator_values.get("Price", 0)
         sma_slow = indicator_values.get("SMA_slow", 0)
         if price > 0 and sma_slow > 0:
-            s = 1.5 if price > sma_slow else -1.5
+            direction = 1.0 if price > sma_slow else -1.0
+            if indicator_values.get("SMA_fresh_cross", False):
+                s = 1.5 * direction  # taze cross — guclu sinyal
+            else:
+                s = 0.7 * direction  # coktan kesmiş — trend hala gecerli ama eski
             trend_details["Price_vs_SMA"] = round(s, 2)
             trend_score += s
 
-        # EMA50 Golden/Death Cross (trend confirmation)
+        # EMA50 Golden/Death Cross (taze cross: ±1.0, eski pozisyon: ±0.4)
         ema_fast = indicator_values.get("EMA_fast", 0)  # EMA20
         ema50 = indicator_values.get("EMA50", 0)
         if ema_fast > 0 and ema50 > 0:
             if ema_fast > ema50:
-                s = 1.0   # golden cross territory (bullish)
+                direction = 1.0
             elif ema_fast < ema50:
-                s = -1.0  # death cross territory (bearish)
+                direction = -1.0
+            else:
+                direction = 0.0
+            if direction != 0.0:
+                if indicator_values.get("EMA_fresh_cross", False):
+                    s = 1.0 * direction   # taze golden/death cross
+                else:
+                    s = 0.4 * direction   # coktan kesmiş, hala gecerli ama eski
             else:
                 s = 0.0
             trend_details["EMA50"] = round(s, 2)

@@ -52,9 +52,17 @@ PRESETS = {
             "coin_daily_loss_limit": 0, "coin_daily_ban_hours": 24,
             "limit_exit_enabled": False, "limit_exit_atr_offset": 0.2,
             # Market fallback / partial TP / BTC korelasyon
-            "market_fallback_on_limit_timeout": False,
+            "market_fallback_on_limit_timeout": False, "market_fallback_max_drift_atr": 1.5,
             "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
             "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
+            # Mean Reversion: konservatif kapali
+            "mean_reversion_enabled": False,
+            "mr_max_adx": 18, "mr_max_positions": 2, "mr_min_score": 65,
+            "mr_rsi_oversold": 30, "mr_rsi_overbought": 70,
+            "mr_sl_atr_mult": 1.5, "mr_bb_proximity_pct": 20.0,
+            "mr_volume_exhaustion_max": 0.8, "mr_min_bb_range_fee_mult": 3.0,
+            "mr_time_limit_minutes": 240,
+            "mr_breakout_to_trend": True, "mr_stop_flip_enabled": True,
         },
     },
     "dengeli": {
@@ -93,9 +101,17 @@ PRESETS = {
             "coin_daily_loss_limit": 0, "coin_daily_ban_hours": 24,
             "limit_exit_enabled": False, "limit_exit_atr_offset": 0.2,
             # Market fallback / partial TP / BTC korelasyon
-            "market_fallback_on_limit_timeout": False,
+            "market_fallback_on_limit_timeout": False, "market_fallback_max_drift_atr": 1.5,
             "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
             "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
+            # Mean Reversion: dengeli kapali
+            "mean_reversion_enabled": False,
+            "mr_max_adx": 18, "mr_max_positions": 2, "mr_min_score": 65,
+            "mr_rsi_oversold": 30, "mr_rsi_overbought": 70,
+            "mr_sl_atr_mult": 1.5, "mr_bb_proximity_pct": 20.0,
+            "mr_volume_exhaustion_max": 0.8, "mr_min_bb_range_fee_mult": 3.0,
+            "mr_time_limit_minutes": 240,
+            "mr_breakout_to_trend": True, "mr_stop_flip_enabled": True,
         },
     },
     "agresif": {
@@ -136,9 +152,17 @@ PRESETS = {
             "coin_daily_loss_limit": 0, "coin_daily_ban_hours": 24,
             "limit_exit_enabled": False, "limit_exit_atr_offset": 0.2,
             # Market fallback / partial TP / BTC korelasyon
-            "market_fallback_on_limit_timeout": False,
+            "market_fallback_on_limit_timeout": False, "market_fallback_max_drift_atr": 1.5,
             "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
             "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
+            # Mean Reversion: agresif kapali
+            "mean_reversion_enabled": False,
+            "mr_max_adx": 18, "mr_max_positions": 2, "mr_min_score": 65,
+            "mr_rsi_oversold": 30, "mr_rsi_overbought": 70,
+            "mr_sl_atr_mult": 1.5, "mr_bb_proximity_pct": 20.0,
+            "mr_volume_exhaustion_max": 0.8, "mr_min_bb_range_fee_mult": 3.0,
+            "mr_time_limit_minutes": 240,
+            "mr_breakout_to_trend": True, "mr_stop_flip_enabled": True,
         },
     },
     "emre_ortalama": {
@@ -171,6 +195,7 @@ PRESETS = {
             # Sinyal: sadece kârda + ters pozisyon açılacak güçte sinyal
             "signal_exit_enabled": True, "signal_exit_threshold": 4.0,
             "signal_min_hold_seconds": 60, "signal_only_in_profit": False,
+            "signal_deep_exit_threshold": 8.0,
             "divergence_exit_enabled": False,
             # Zaman: 8 saat, trailing aktifse uzat
             "time_limit_enabled": True, "time_limit_minutes": 480,
@@ -190,7 +215,7 @@ PRESETS = {
             # Limit cikis: maker fee ile kapama
             "limit_exit_enabled": True, "limit_exit_atr_offset": 0.2,
             # Market fallback / partial TP / BTC korelasyon
-            "market_fallback_on_limit_timeout": True,
+            "market_fallback_on_limit_timeout": True, "market_fallback_max_drift_atr": 1.5,
             "partial_tp_enabled": False, "partial_tp_atr_mult": 3.0, "partial_tp_close_pct": 50,
             "btc_correlation_enabled": False, "btc_max_portfolio_beta": 2.5,
             # ADX Rejim Sistemi
@@ -210,6 +235,14 @@ PRESETS = {
             "adx_regime_strong_sl_atr": 2.0,
             "adx_regime_strong_trail_activate_atr": 4.0,
             "adx_regime_strong_trail_callback_atr": 1.0,
+            # Mean Reversion
+            "mean_reversion_enabled": True,
+            "mr_max_adx": 18, "mr_max_positions": 2, "mr_min_score": 65,
+            "mr_rsi_oversold": 30, "mr_rsi_overbought": 70,
+            "mr_sl_atr_mult": 1.5, "mr_bb_proximity_pct": 20.0,
+            "mr_volume_exhaustion_max": 0.8, "mr_min_bb_range_fee_mult": 3.0,
+            "mr_time_limit_minutes": 240,
+            "mr_breakout_to_trend": True, "mr_stop_flip_enabled": True,
         },
     },
 }
@@ -255,12 +288,12 @@ class StrategySettingsPanel(ctk.CTkFrame):
     # ════════════════════════════════════════
 
     def _build_ui(self) -> None:
-        # ── Top: Mode selector ──
+        # ── Top: Mode selector + Save + Presets + Templates ──
         top = ctk.CTkFrame(self, fg_color="#1a1a2e")
-        top.pack(fill="x", padx=10, pady=(10, 5))
+        top.pack(fill="x", padx=5, pady=(5, 2))
 
         ctk.CTkLabel(top, text="Strateji Ayarlari",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(side="left", padx=10, pady=10)
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(side="left", padx=10, pady=6)
 
         self._mode_var = ctk.StringVar(
             value=self.controller.config.get("strategy.mode", "standard"))
@@ -270,46 +303,111 @@ class StrategySettingsPanel(ctk.CTkFrame):
             command=self._on_mode_change,
             font=ctk.CTkFont(weight="bold"),
         )
-        self._mode_seg.pack(side="right", padx=10, pady=10)
+        self._mode_seg.pack(side="left", padx=15, pady=6)
 
-        # ── Preset buttons (visible in standard mode) ──
-        self._preset_frame = ctk.CTkFrame(self)
-        self._preset_frame.pack(fill="x", padx=10, pady=3)
+        # Hint label (right-most, pack first so it anchors right)
+        ctk.CTkLabel(
+            top, text="Degisiklikler KAYDET ile gecerli olur",
+            text_color="#FF9800", font=ctk.CTkFont(size=10, slant="italic"),
+        ).pack(side="right", padx=8, pady=6)
 
-        ctk.CTkLabel(self._preset_frame, text="Hazir Ayarlar:",
-                     font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10)
+        # Save button — always visible (right-anchored so it never gets clipped)
+        self._save_btn = ctk.CTkButton(
+            top, text="KAYDET", width=120, height=32,
+            fg_color="#00C853", hover_color="#00A846",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._save)
+        self._save_btn.pack(side="right", padx=(5, 5), pady=6)
+
+        ctk.CTkButton(
+            top, text="Sifirla", width=80, height=28,
+            fg_color="gray30", hover_color="gray40",
+            font=ctk.CTkFont(size=11),
+            command=self._reset_to_default).pack(side="right", padx=3, pady=6)
+
+        self._feedback = ctk.CTkLabel(top, text="", height=20,
+                                      font=ctk.CTkFont(size=12, weight="bold"))
+        self._feedback.pack(side="right", padx=10, pady=6)
+
+        # ── Preset + Template bar ──
+        bar2 = ctk.CTkFrame(self, fg_color="transparent")
+        bar2.pack(fill="x", padx=5, pady=(2, 2))
+
+        # Presets
+        self._preset_frame = ctk.CTkFrame(bar2, fg_color="transparent")
+        self._preset_frame.pack(side="left")
+        ctk.CTkLabel(self._preset_frame, text="Hazir:",
+                     font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(5, 3))
 
         current_preset = self.controller.config.get("strategy.preset", "")
         self._preset_var = ctk.StringVar(value=current_preset)
 
         for key, preset in PRESETS.items():
             btn = ctk.CTkButton(
-                self._preset_frame, text=preset["name"], width=120, height=32,
-                fg_color=preset["color"],
-                hover_color=preset["color"],
+                self._preset_frame, text=preset["name"], width=100, height=26,
+                fg_color=preset["color"], hover_color=preset["color"],
                 command=lambda k=key: self._apply_preset(k),
-                font=ctk.CTkFont(weight="bold"),
+                font=ctk.CTkFont(size=11, weight="bold"),
             )
-            btn.pack(side="left", padx=5, pady=5)
+            btn.pack(side="left", padx=2, pady=2)
 
         self._preset_desc = ctk.CTkLabel(
             self._preset_frame, text="", text_color="gray60",
-            font=ctk.CTkFont(size=11))
-        self._preset_desc.pack(side="left", padx=15)
+            font=ctk.CTkFont(size=10))
+        self._preset_desc.pack(side="left", padx=8)
 
-        # ── Feedback ──
-        self._feedback = ctk.CTkLabel(self, text="", height=20,
-                                      font=ctk.CTkFont(size=12, weight="bold"))
-        self._feedback.pack(fill="x", padx=10)
+        # Templates (right side)
+        self._tmpl_frame = ctk.CTkFrame(bar2, fg_color="transparent")
+        self._tmpl_frame.pack(side="right")
+        ctk.CTkLabel(self._tmpl_frame, text="Sablon:",
+                     font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(5, 3))
+        self._tmpl_var = ctk.StringVar(value="")
+        self._tmpl_menu = ctk.CTkOptionMenu(
+            self._tmpl_frame, variable=self._tmpl_var,
+            values=["(sablon sec)"], width=150, height=26,
+            command=self._on_template_select,
+        )
+        self._tmpl_menu.pack(side="left", padx=2)
+        ctk.CTkButton(self._tmpl_frame, text="Yukle", width=55, height=26,
+                      fg_color="#2196F3", hover_color="#1976D2",
+                      font=ctk.CTkFont(size=10),
+                      command=self._load_template).pack(side="left", padx=2)
+        ctk.CTkButton(self._tmpl_frame, text="Kaydet", width=60, height=26,
+                      fg_color="#FF9800", hover_color="#F57C00",
+                      font=ctk.CTkFont(size=10),
+                      command=self._save_template).pack(side="left", padx=2)
+        ctk.CTkButton(self._tmpl_frame, text="Sil", width=40, height=26,
+                      fg_color="#FF1744", hover_color="#D50000",
+                      font=ctk.CTkFont(size=10),
+                      command=self._delete_template).pack(side="left", padx=2)
+        self._refresh_template_list()
 
-        # ── Scrollable settings area ──
+        # ══════════════════════════════════════════════════════
+        # 3-COLUMN SCROLLABLE LAYOUT
+        # ══════════════════════════════════════════════════════
         self._scroll = ctk.CTkScrollableFrame(self)
-        self._scroll.pack(fill="both", expand=True, padx=10, pady=5)
-        s = self._scroll
+        self._scroll.pack(fill="both", expand=True, padx=5, pady=(2, 2))
 
-        # ──────────────── GIRIS AYARLARI ────────────────
-        self._section(s, "Giris Ayarlari (Entry)")
-        self._field(s, "min_buy_score", "Min Alim Skoru", "70",
+        # 3 columns inside scroll
+        col_container = ctk.CTkFrame(self._scroll, fg_color="transparent")
+        col_container.pack(fill="both", expand=True)
+        col_container.columnconfigure(0, weight=1)
+        col_container.columnconfigure(1, weight=1)
+        col_container.columnconfigure(2, weight=1)
+
+        c1 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c1.grid(row=0, column=0, sticky="nsew", padx=3, pady=0)
+        c2 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c2.grid(row=0, column=1, sticky="nsew", padx=3, pady=0)
+        c3 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c3.grid(row=0, column=2, sticky="nsew", padx=3, pady=0)
+
+        # Alias for old code compat
+        s = c1
+
+        # ════════════════ COLUMN 1: Giris + Emir + Kaldirac ════════════════
+        g = self._section(c1, "Giris Ayarlari (Entry)")
+        self._field(g, "min_buy_score", "Min Alim Skoru", "70",
                     tip="Kompozit skor esigi (0-100). 70=kaliteli, 80+=cok secici",
                     help_text=(
                         "KOMPOZIT SKOR (0-100)\n"
@@ -323,7 +421,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "55 = orta kaliteli (cok fazla zarar)\n"
                         "70 = kaliteli firsatlar (onerilen)\n"
                         "80+ = cok secici, az islem"))
-        self._field(s, "min_confluence", "Min Confluence", "6.5",
+        self._field(g,"min_confluence", "Min Confluence", "6.5",
                     tip="Kac indikator uyumlu olmali. 4.0=gevsek, 6.5=standart, 8.0+=siki",
                     help_text=(
                         "CONFLUENCE SKORU (indikator uyumu)\n"
@@ -351,7 +449,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "Skor <= -4.0 → SAT sinyali\n\n"
                         "4.0 = en az 3 indikator uyumlu\n"
                         "5.0+ = 4+ indikator uyumlu"))
-        self._field(s, "min_adx", "Min ADX", "18",
+        self._field(g,"min_adx", "Min ADX", "18",
                     tip="Trend gucu esigi. <15=yatay, 18=min trend, 25+=guclu trend",
                     help_text=(
                         "ADX (Average Directional Index)\n"
@@ -369,14 +467,15 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "Fiyat yatay gidip gelir, SL tetiklenir.\n"
                         "Tavsiye: 18 (min) - 25 (guvenli)"))
 
-        row_rsi = ctk.CTkFrame(s, fg_color="transparent")
-        row_rsi.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(row_rsi, text="RSI Araligi:", width=180, anchor="w").pack(side="left")
-        self._entries["max_rsi_long"] = e1 = ctk.CTkEntry(row_rsi, width=70)
+        row_rsi = ctk.CTkFrame(g, fg_color="transparent")
+        row_rsi.pack(fill="x", padx=8, pady=1)
+        ctk.CTkLabel(row_rsi, text="RSI Araligi:", width=180, anchor="w",
+                     font=ctk.CTkFont(size=11)).pack(side="left")
+        self._entries["max_rsi_long"] = e1 = ctk.CTkEntry(row_rsi, width=55, font=ctk.CTkFont(size=11))
         e1.pack(side="left", padx=2)
         self._all_widgets.append((e1, "entry"))
         ctk.CTkLabel(row_rsi, text="(Long max)").pack(side="left", padx=(0, 10))
-        self._entries["min_rsi_short"] = e2 = ctk.CTkEntry(row_rsi, width=70)
+        self._entries["min_rsi_short"] = e2 = ctk.CTkEntry(row_rsi, width=55, font=ctk.CTkFont(size=11))
         e2.pack(side="left", padx=2)
         self._all_widgets.append((e2, "entry"))
         ctk.CTkLabel(row_rsi, text="(Short min)  62/38=standart, 58/42=siki",
@@ -405,7 +504,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "Gevsek filtre:        65/35"
                       ))).pack(side="left", padx=5)
 
-        self._checkbox(s, "macd_filter", "MACD Histogram Filtresi (yon uyumu zorunlu)",
+        self._checkbox(g,"macd_filter", "MACD Histogram Filtresi (yon uyumu zorunlu)",
                       help_text=(
                           "MACD (Moving Average Convergence Divergence)\n"
                           "─────────────────────────────────────────────\n"
@@ -418,7 +517,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "Yuksek kaldiracta onemli: MACD yon\n"
                           "uyumu olmadan giris yapilirsa trend\n"
                           "tersine gidebilir, SL hemen tetiklenir."))
-        self._checkbox(s, "volume_filter", "Hacim Onay Filtresi (OBV/CMF)",
+        self._checkbox(g,"volume_filter", "Hacim Onay Filtresi (OBV/CMF)",
                       help_text=(
                           "HACIM ONAYI (OBV + CMF)\n"
                           "───────────────────────\n"
@@ -434,7 +533,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "  SHORT: OBV veya CMF negatif olmali\n\n"
                           "Hacimsiz fiyat hareketi guvensizdir,\n"
                           "geri donme ihtimali yuksektir."))
-        self._checkbox(s, "volatile_filter", "Volatile Rejim Filtresi (volatilde islem acma)",
+        self._checkbox(g,"volatile_filter", "Volatile Rejim Filtresi (volatilde islem acma)",
                       help_text=(
                           "VOLATILE REJIM FILTRESI\n"
                           "───────────────────────\n"
@@ -446,7 +545,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "  Acik: Volatile rejimde giris yok\n"
                           "  Kapali: ATR kontrolune guven"))
 
-        self._field(s, "wall_min_tf_ratio", "Duvar Kalinligi (TF orani)", "0.5",
+        self._field(g,"wall_min_tf_ratio", "Duvar Kalinligi (TF orani)", "0.5",
                     help_text=(
                         "DUVAR KALINLIGI FILTRESI\n"
                         "────────────────────────\n"
@@ -465,7 +564,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  0.5: Varsayilan\n"
                         "  1.0: Siki (1 mum dayanamayan engeller)\n"
                         "  0: Duvar filtresi kapali"))
-        self._field(s, "depth_min_tf_ratio", "Toplam Derinlik (TF orani)", "3.0",
+        self._field(g,"depth_min_tf_ratio", "Toplam Derinlik (TF orani)", "3.0",
                     help_text=(
                         "TOPLAM DERINLIK FILTRESI\n"
                         "────────────────────────\n"
@@ -481,7 +580,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  3.0: Varsayilan\n"
                         "  5.0: Siki\n"
                         "  0: Toplam derinlik filtresi kapali"))
-        self._field(s, "thin_book_seconds", "Ince Book Esigi (saniye)", "5.0",
+        self._field(g,"thin_book_seconds", "Ince Book Esigi (saniye)", "5.0",
                     help_text=(
                         "INCE BOOK (THIN BOOK) FILTRESI\n"
                         "──────────────────────────────\n"
@@ -499,10 +598,22 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  5: Varsayilan\n"
                         "  10: Siki (daha derin book iste)"))
 
-        self._field(s, "scan_interval_seconds", "Tarama Araligi (sn)", "30")
+        self._field(g,"scan_interval_seconds", "Tarama Araligi (sn)", "30",
+                    tip="Her tarama arasinda kac saniye beklensin",
+                    help_text=(
+                        "TARAMA ARALIGI\n"
+                        "──────────────\n"
+                        "Scanner her dongu sonunda bu kadar\n"
+                        "saniye bekler. Kisa aralik = daha hizli\n"
+                        "tepki ama daha fazla API kullanimi.\n\n"
+                        "  15: Hizli (agresif, rate limit riski)\n"
+                        "  30: Standart (onerilen)\n"
+                        "  60: Yavas (API dostu)\n\n"
+                        "Not: Tarama suresi ~30-40sn surer.\n"
+                        "30sn aralik = ~60-70sn'de bir yeni tarama."))
 
-        row_kline = ctk.CTkFrame(s, fg_color="transparent")
-        row_kline.pack(fill="x", padx=20, pady=2)
+        row_kline = ctk.CTkFrame(g, fg_color="transparent")
+        row_kline.pack(fill="x", padx=8, pady=1)
         ctk.CTkLabel(row_kline, text="Mum Araligi:", width=180, anchor="w").pack(side="left")
         self._kline_var = ctk.StringVar(value="1m")
         kline_menu = ctk.CTkOptionMenu(row_kline, variable=self._kline_var,
@@ -513,8 +624,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
         self._all_widgets.append((kline_menu, "menu"))
 
         # Min timeframe dropdown
-        row_min_tf = ctk.CTkFrame(s, fg_color="transparent")
-        row_min_tf.pack(fill="x", padx=20, pady=2)
+        row_min_tf = ctk.CTkFrame(g, fg_color="transparent")
+        row_min_tf.pack(fill="x", padx=8, pady=1)
         ctk.CTkLabel(row_min_tf, text="Min Vade (Timeframe):", width=180, anchor="w").pack(side="left")
         self._min_tf_var = ctk.StringVar(value="5m")
         min_tf_menu = ctk.CTkOptionMenu(row_min_tf, variable=self._min_tf_var,
@@ -547,15 +658,27 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "  Dusuk kaldirac: 1m veya 3m yeterli"
                       ))).pack(side="left", padx=5)
 
-        self._field(s, "kline_limit", "Mum Sayisi", "200")
+        self._field(g,"kline_limit", "Mum Sayisi", "200",
+                    tip="Indikator hesabi icin kac mum cekilsin",
+                    help_text=(
+                        "MUM SAYISI (Kline Limit)\n"
+                        "────────────────────────\n"
+                        "Her coin icin API'den cekilecek mum adedi.\n"
+                        "Indikatörler bu mumlar uzerinde hesaplanir.\n\n"
+                        "  100: Hizli ama kisa gecmis\n"
+                        "  200: Standart (onerilen)\n"
+                        "  500: Derin analiz (yavas)\n\n"
+                        "SMA200 gibi uzun periyot indikatorler\n"
+                        "icin en az 200 mum gereklidir.\n"
+                        "Daha az mum = eksik indikator verisi."))
 
         # ──────────────── LIMIT EMIR (PAZARLIKLI GIRIS) ────────────────
-        self._section(s, "Emir Tipi (Limit / Market)")
+        g = self._section(s,"Emir Tipi (Limit / Market)")
 
         # Checkbox: Pazarlikli fiyat kullan
         self._cb_vars["limit_entry_enabled"] = ctk.BooleanVar(value=False)
-        row_lim = ctk.CTkFrame(s, fg_color="transparent")
-        row_lim.pack(fill="x", padx=20, pady=2)
+        row_lim = ctk.CTkFrame(g, fg_color="transparent")
+        row_lim.pack(fill="x", padx=8, pady=1)
         cb_lim = ctk.CTkCheckBox(row_lim, text="Pazarlikli Limit Emir Kullan",
                                   variable=self._cb_vars["limit_entry_enabled"])
         cb_lim.pack(side="left")
@@ -585,19 +708,42 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "  Stop: 2 ATR altinda (98.75 vs 99.00)"
                       ))).pack(side="left", padx=5)
 
-        self._field(s, "limit_atr_offset", "Limit ATR Ofseti", "0.5",
-                    tip="Kac ATR asagiya/yukariya limit emir konur. 0.25=yakin, 0.5=orta, 1.0=uzak")
-        self._field(s, "limit_timeout_seconds", "Limit Timeout (sn)", "300",
-                    tip="Dolmayan limit emir kac saniye sonra iptal edilir. 300=5dk")
+        self._field(g,"limit_atr_offset", "Limit ATR Ofseti", "0.5",
+                    tip="Kac ATR asagiya/yukariya limit emir konur. 0.25=yakin, 0.5=orta, 1.0=uzak",
+                    help_text=(
+                        "LIMIT ATR OFSETI\n"
+                        "─────────────────\n"
+                        "Limit emir fiyati = piyasa +/- (N x ATR)\n\n"
+                        "LONG: piyasa fiyatinin N ATR ALTINA\n"
+                        "SHORT: piyasa fiyatinin N ATR USTUNE\n\n"
+                        "  0.25: Yakin (hizli dolar, az tasarruf)\n"
+                        "  0.50: Orta (onerilen)\n"
+                        "  1.00: Uzak (cok tasarruf, az dolar)\n\n"
+                        "ORNEK (ATR=0.50, fiyat=100):\n"
+                        "  0.5 offset → LONG limit: 99.75\n"
+                        "  1.0 offset → LONG limit: 99.50"))
+        self._field(g,"limit_timeout_seconds", "Limit Timeout (sn)", "300",
+                    tip="Dolmayan limit emir kac saniye sonra iptal edilir. 300=5dk",
+                    help_text=(
+                        "LIMIT EMIR TIMEOUT\n"
+                        "──────────────────\n"
+                        "Limit emir bu sure icinde dolmazsa iptal\n"
+                        "edilir. Timeout sonrasi market_fallback\n"
+                        "aciksa market emre donebilir.\n\n"
+                        "  120: 2dk (sabrisiz, cok iptal)\n"
+                        "  300: 5dk (standart, onerilen)\n"
+                        "  600: 10dk (sabir, firsat kacabilir)\n\n"
+                        "Pending limit'ler pozisyon slotu kapar.\n"
+                        "5dk beklerken baska coin acilamaz."))
         self._cb_vars["limit_recheck_signal"] = ctk.BooleanVar(value=True)
-        row_rchk = ctk.CTkFrame(s, fg_color="transparent")
-        row_rchk.pack(fill="x", padx=20, pady=2)
+        row_rchk = ctk.CTkFrame(g, fg_color="transparent")
+        row_rchk.pack(fill="x", padx=8, pady=1)
         cb_rchk = ctk.CTkCheckBox(row_rchk, text="Dolunca sinyal tekrar kontrol et",
                                    variable=self._cb_vars["limit_recheck_signal"])
         cb_rchk.pack(side="left")
         self._all_widgets.append((cb_rchk, "checkbox"))
 
-        self._checkbox(s, "market_fallback_on_limit_timeout",
+        self._checkbox(g,"market_fallback_on_limit_timeout",
                        "Limit Timeout → Market Fallback",
                        default=False,
                        help_text=(
@@ -605,27 +751,49 @@ class StrategySettingsPanel(ctk.CTkFrame):
                            "─────────────────────────────\n"
                            "Limit emir suresi dolunca otomatik\n"
                            "olarak market emre doner.\n\n"
-                           "Aktif: Timeout sonrasi market ile girilir\n"
-                           "  (firsat kacirilmaz ama taker fee odenır)\n\n"
-                           "Kapali: Timeout sonrasi emir iptal edilir\n"
-                           "  (firsat kacirilabilir ama fee tasarrufu)"))
+                           "Guvenlik: Timeout'ta sinyal TAZE olarak\n"
+                           "  tekrar hesaplanir (eski skor kullanilmaz).\n"
+                           "  Fiyat sapma kontrolu de yapilir\n"
+                           "  (max drift ATR ayari ile).\n\n"
+                           "Aktif: Timeout sonrasi sinyal hala gecerli\n"
+                           "  VE fiyat fazla kaymamissa market giris\n\n"
+                           "Kapali: Timeout sonrasi emir iptal edilir"))
+
+        self._field(g,"market_fallback_max_drift_atr",
+                    "Market Fallback Max Sapma (ATR)", "1.5",
+                    tip=("Limit timeout sonrasi market fallback icin\n"
+                         "fiyat en fazla kac ATR kaymis olabilir.\n"
+                         "1.0=siki (yakin fiyat), 1.5=orta, 2.0=gevsek.\n"
+                         "Fiyat bu kadar ATR'den fazla kaymissa\n"
+                         "market giris yapilmaz (trende gec kalindi)."),
+                    help_text=(
+                        "MARKET FALLBACK MAX SAPMA\n"
+                        "─────────────────────────\n"
+                        "Limit emir timeout sonrasi market emre\n"
+                        "donulecekse, fiyat limit fiyattan en\n"
+                        "fazla bu kadar ATR uzaklasmis olabilir.\n\n"
+                        "  1.0: Siki (fiyat yakinsa market gir)\n"
+                        "  1.5: Orta (onerilen)\n"
+                        "  2.0: Gevsek (genis sapma tolere)\n\n"
+                        "Fiyat daha fazla kaymissa market giris\n"
+                        "yapilmaz (trende gec kalinmis, SL riski)."))
 
         # ──────────────── KALDIRAC & POZISYON ────────────────
-        self._section(s, "Kaldirac & Pozisyon Boyutu")
+        g = self._section(s,"Kaldirac & Pozisyon Boyutu")
 
-        row_lev = ctk.CTkFrame(s, fg_color="transparent")
-        row_lev.pack(fill="x", padx=20, pady=2)
+        row_lev = ctk.CTkFrame(g, fg_color="transparent")
+        row_lev.pack(fill="x", padx=8, pady=1)
         ctk.CTkLabel(row_lev, text="Kaldirac Araligi:", width=180, anchor="w").pack(side="left")
-        self._entries["min_leverage"] = e3 = ctk.CTkEntry(row_lev, width=70)
+        self._entries["min_leverage"] = e3 = ctk.CTkEntry(row_lev, width=55, font=ctk.CTkFont(size=11))
         e3.pack(side="left", padx=2)
         self._all_widgets.append((e3, "entry"))
         ctk.CTkLabel(row_lev, text=" - ").pack(side="left")
-        self._entries["max_leverage"] = e4 = ctk.CTkEntry(row_lev, width=70)
+        self._entries["max_leverage"] = e4 = ctk.CTkEntry(row_lev, width=55, font=ctk.CTkFont(size=11))
         e4.pack(side="left", padx=2)
         self._all_widgets.append((e4, "entry"))
         ctk.CTkLabel(row_lev, text="x").pack(side="left")
 
-        self._field(s, "max_positions", "Max Esanli Pozisyon", "6",
+        self._field(g,"max_positions", "Max Esanli Pozisyon", "6",
                     help_text=(
                         "ESANLI POZISYON LIMITI\n"
                         "──────────────────────\n"
@@ -640,9 +808,21 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "ama daha fazla firsat. Korelasyon\n"
                         "riski: 4 LONG ayni anda BTC duserse\n"
                         "hepsi SL'ye takilabilir."))
-        self._field(s, "portfolio_percent", "Portfoy Yuzdesi (%)", "25",
-                    tip="Her pozisyon icin bakiyenin yuzde kaci kullanilsin")
-        self._field(s, "portfolio_divider", "Portfoy Boleni (1/N)", "0",
+        self._field(g,"portfolio_percent", "Portfoy Yuzdesi (%)", "25",
+                    tip="Her pozisyon icin bakiyenin yuzde kaci kullanilsin",
+                    help_text=(
+                        "PORTFOY YUZDESI\n"
+                        "───────────────\n"
+                        "portfolio_divider=0 ise bu kullanilir.\n"
+                        "Her pozisyon icin bakiyenin yuzde kaci\n"
+                        "margin olarak kullanilir.\n\n"
+                        "  8:  Cok konservatif (1/12.5)\n"
+                        "  15: Konservatif\n"
+                        "  25: Dengeli (onerilen)\n"
+                        "  50: Agresif\n\n"
+                        "portfolio_divider > 0 ise bu ayar\n"
+                        "goz ardi edilir (1/N sistemi kullanilir)."))
+        self._field(g,"portfolio_divider", "Portfoy Boleni (1/N)", "0",
                     tip="Bakiyenin 1/N'i (ornek: 12 = 1/12). 0=yuzde modu kullan",
                     help_text=(
                         "PORTFOY BOLENI (1/N sistemi)\n"
@@ -659,11 +839,13 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  36$ → 4 poz x 3.0$\n\n"
                         "Min margin: 1.0 USDT (bu kural sabit)"))
 
-        # ──────────────── STOP LOSS ────────────────
-        self._section(s, "Stop Loss")
-        self._checkbox(s, "sl_enabled", "Stop Loss Aktif")
-        self._field(s, "liq_factor", "Pratik Liq Faktoru (%)", "70",
-                    tip="Teorik liq mesafesinin yuzde kaci pratik liq (Binance erken likide eder, 70=gercekci)",
+        # ════════════════ COLUMN 2: SL + Trailing + TP + Sinyal + Zaman + Risk ════════════════
+        s = c2  # switch to column 2
+
+        # ──────────────── STOP LOSS: ORTAK PARAMETRELER ────────────────
+        g = self._section(s, "Stop Loss - Ortak")
+        self._field(g, "liq_factor", "Pratik Liq Faktoru (%)", "70",
+                    tip="Binance erken likide eder, 70=gercekci",
                     help_text=(
                         "PRATIK LIKIDASYON FAKTORU\n"
                         "─────────────────────────\n"
@@ -673,62 +855,158 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "Pratik liq = teorik x bu_faktor\n\n"
                         "Ornek (100x):\n"
                         "  Teorik liq = %1.0\n"
-                        "  %70 faktor → Pratik = %0.70\n"
-                        "  %80 faktor → Pratik = %0.80\n\n"
+                        "  %70 faktor → Pratik = %0.70\n\n"
                         "70 = gercekci (onerilen)\n"
-                        "80 = daha rahat ama riskli"))
-        self._field(s, "sl_liq_percent", "SL Yuzde (pratik liq %)", "50",
-                    tip="Pratik liq mesafesinin yuzde kacinda SL olsun (50 = yaridaki mesafe)",
+                        "80 = daha rahat ama riskli\n\n"
+                        "Bu deger hem Server SL fallback'inde\n"
+                        "hem Yazilim SL'de hem de Emergency\n"
+                        "hesaplamada kullanilir."))
+        self._field(g, "fee_pct", "Fee (round-trip %)", "0.10",
+                    tip="Giris+cikis toplam komisyon (taker: 0.10, maker: 0.04)",
                     help_text=(
-                        "STOP LOSS MESAFESI\n"
-                        "──────────────────\n"
-                        "Pratik liq mesafesinin yuzde kaci.\n"
-                        "Binance'te STOP_MARKET olarak yerlesir.\n\n"
-                        "SL = pratik_liq x bu_yuzde\n\n"
-                        "Ornek (100x, liq_factor=70):\n"
-                        "  Pratik liq = %0.70\n"
-                        "  %50 → SL = %0.35 (onerilen)\n"
-                        "  %40 → SL = %0.28 (siki)\n"
-                        "  %60 → SL = %0.42 (gevsek)\n\n"
-                        "SL = 2x ATR kurali:\n"
-                        "  ATR referans = SL / 2\n"
-                        "  Vade secimi bu ATR'ye gore yapilir"))
-        self._field(s, "server_sl_atr_mult", "Server SL ATR Carpani", "2.0",
-                    tip="Sunucu STOP_MARKET emri kac ATR uzakta olsun (2.0=standart)",
+                        "FEE (KOMISYON) YUZDESI\n"
+                        "──────────────────────\n"
+                        "Giris + cikis toplam islem komisyonu.\n"
+                        "SL hesabinda fee dusulur (fee-aware).\n\n"
+                        "BINANCE FUTURES:\n"
+                        "  Taker (market): %0.04 × 2 = %0.08\n"
+                        "  Maker (limit):  %0.02 × 2 = %0.04\n"
+                        "  Varsayilan:     %0.10 (emniyet payı)\n\n"
+                        "ORNEK (100x, fee=%0.10):\n"
+                        "  Fee ROI = 0.10 × 100 = %10 margin\n"
+                        "  Bu kadar ROI sadece fee'ye gider.\n"
+                        "  SL bu tutarin USTUNDE ayarlanir.\n\n"
+                        "VIP seviyenize gore dusurulabilir:\n"
+                        "  VIP0: %0.10 (varsayilan)\n"
+                        "  VIP1: %0.08\n"
+                        "  BNB indirimli: %0.075"))
+        self._field(g, "slippage_mult", "Slippage Carpani (fee x)", "0.5",
+                    tip="Tahmini kayma = fee × bu_carpan (0.5=standart, 1.0=kotU likidite)",
                     help_text=(
-                        "SERVER SL ATR CARPANI\n"
-                        "─────────────────────\n"
-                        "Pozisyon acildiginda Binance'e\n"
+                        "SLIPPAGE (KAYMA) CARPANI\n"
+                        "────────────────────────\n"
+                        "Market emirlerde fiyat kayabilir.\n"
+                        "Slippage = fee × bu_carpan\n\n"
+                        "SL hesabinda fee + slippage toplam\n"
+                        "kayiptan dusulur (fee-aware SL).\n\n"
+                        "  0.3: Likit coinler (BTC, ETH)\n"
+                        "  0.5: Standart (onerilen)\n"
+                        "  1.0: Dusuk likidite / haber ani\n"
+                        "  0.0: Slippage hesaba katilmaz\n\n"
+                        "ORNEK (100x, fee=%0.10, slip=0.5):\n"
+                        "  Fee ROI  = %10\n"
+                        "  Slip ROI = %10 × 0.5 = %5\n"
+                        "  Toplam   = %15 ROI (SL'den dusulur)"))
+
+        # ──────────────── a) SERVER SL (Binance tarafı) ────────────────
+        g = self._section(s, "Stop Loss a) Server (Binance)")
+        ctk.CTkLabel(g, text="Binance'e STOP_MARKET emri gonderilir. Bot cokse bile korur.",
+                     text_color="gray50", font=ctk.CTkFont(size=10, slant="italic"),
+                     wraplength=350).pack(anchor="w", padx=8, pady=(0, 3))
+        self._field(g, "server_sl_atr_mult", "SL Mesafesi (x ATR)", "2.0",
+                    tip="Giris fiyatindan kac ATR uzakta SL olsun",
+                    help_text=(
+                        "SERVER STOP LOSS (Binance STOP_MARKET)\n"
+                        "──────────────────────────────────────\n"
+                        "Pozisyon acilir acilmaz Binance'e\n"
                         "STOP_MARKET emri gonderilir.\n\n"
-                        "SL fiyati = giris +/- (N x ATR)\n\n"
-                        "  2.0 = standart (onerilen)\n"
-                        "  1.5 = siki (erken tetiklenir)\n"
-                        "  3.0 = gevsek (daha fazla kayip)\n\n"
-                        "Bu deger yazilim SL'si ile AYNI\n"
-                        "olmali. Ikisi birbirini tamamlar:\n"
-                        "  Yazilim: her saniye kontrol\n"
-                        "  Server: yazilim cokerse devreye girer"))
-        self._checkbox(s, "emergency_enabled", "Emergency Close (yazilim korumasi)",
+                        "HESAPLAMA:\n"
+                        "  LONG:  SL = giris - (ATR × carpan)\n"
+                        "  SHORT: SL = giris + (ATR × carpan)\n\n"
+                        "ORNEK (BTC $50K, ATR=$150, 2.0x):\n"
+                        "  SL = $50,000 - ($150 × 2) = $49,700\n"
+                        "  Fiyat $49,700'e duserse Binance\n"
+                        "  otomatik MARKET SELL yapar.\n\n"
+                        "  1.5 = Siki (erken tetiklenir, whipsaw)\n"
+                        "  2.0 = Standart (onerilen)\n"
+                        "  3.0 = Gevsek (buyuk kayip ama az tetik)\n\n"
+                        "AVANTAJ: Bot cokse, internet kopsa,\n"
+                        "PC kapansa bile calismaya devam eder.\n"
+                        "Binance sunucusunda yasar.\n\n"
+                        "NOT: Her zaman gonderilir, kapatılamaz."))
+
+        # ──────────────── b) SOFTWARE SL (yazılım tarafı) ────────────────
+        g = self._section(s, "Stop Loss b) Yazilim (Fee-Aware)")
+        ctk.CTkLabel(g, text="Yazilim her 2sn'de fiyat kontrol eder. Fee+slippage dusulerek hesaplanir.",
+                     text_color="gray50", font=ctk.CTkFont(size=10, slant="italic"),
+                     wraplength=350).pack(anchor="w", padx=8, pady=(0, 3))
+        self._checkbox(g, "sl_enabled", "Yazilim SL Aktif",
+                      help_text=(
+                          "YAZILIM STOP LOSS (fee-aware)\n"
+                          "─────────────────────────────\n"
+                          "Server SL'den FARKLI bir hesaplama:\n"
+                          "  Likidasyon mesafesi bazli,\n"
+                          "  fee ve slippage dusulmus.\n\n"
+                          "HESAPLAMA:\n"
+                          "  liq = (1/leverage) × liq_factor\n"
+                          "  raw_sl = liq × sl_liq_percent\n"
+                          "  fee_roi = fee × leverage × 100\n"
+                          "  slip_roi = fee_roi × slip_carpan\n"
+                          "  net_sl = raw_sl - fee_roi - slip_roi\n\n"
+                          "Server SL zaten Binance'de koruma\n"
+                          "sagladigı icin yazilim SL genellikle\n"
+                          "KAPALI tutulur.\n\n"
+                          "KULLANIM:\n"
+                          "  Kapali: Sadece Server SL (onerilen)\n"
+                          "  Acik: Cift katman (ekstra guvenlik)"))
+        self._field(g, "sl_liq_percent", "SL Yuzde (liq mesafesi %)", "50",
+                    tip="Pratik liq mesafesinin yuzde kacinda SL (50=orta)",
+                    help_text=(
+                        "YAZILIM SL MESAFESI\n"
+                        "───────────────────\n"
+                        "Pratik liq mesafesinin yuzde kaci.\n"
+                        "Fee ve slippage otomatik dusulur.\n\n"
+                        "ORNEK (100x, liq_factor=70):\n"
+                        "  Pratik liq = %0.70\n"
+                        "  %50 → SL = %0.35 (fee oncesi)\n"
+                        "  Fee+slip dusuldukten sonra:\n"
+                        "  Net SL = ~%0.20 fiyat hareketi\n\n"
+                        "  40 = Siki (erken cikis)\n"
+                        "  50 = Standart (onerilen)\n"
+                        "  60 = Gevsek (daha fazla kayip)"))
+
+        # ──────────────── c) EMERGENCY (son savunma) ────────────────
+        g = self._section(s, "Stop Loss c) Emergency (Son Savunma)")
+        ctk.CTkLabel(g, text="SL'lerin arkasindaki son savunma. Liq'e yakin noktada acil kapatir.",
+                     text_color="gray50", font=ctk.CTkFont(size=10, slant="italic"),
+                     wraplength=350).pack(anchor="w", padx=8, pady=(0, 3))
+        self._checkbox(g, "emergency_enabled", "Emergency Close Aktif",
                       help_text=(
                           "EMERGENCY ANTI-LIKIDASYON\n"
                           "─────────────────────────\n"
-                          "SL'nin ARKASINDA bekleyen son savunma.\n\n"
-                          "SL (sunucu) tetiklenmezse devreye girer:\n"
+                          "Server SL ve yazilim SL'nin ARKASINDA\n"
+                          "bekleyen son savunma hatti.\n\n"
+                          "NE ZAMAN DEVREYE GIRER:\n"
+                          "  - Server SL emri iptal edildi/red\n"
                           "  - API hatasi, slippage, ani gap\n"
-                          "  - SL emri red edildi/iptal oldu\n\n"
-                          "Yazilim her 1 sn fiyat kontrol eder.\n"
-                          "Liq mesafesinin %80'inde acil kapatir.\n\n"
-                          "  SL tetiklenir:        %0.35 (100x)\n"
-                          "  Emergency tetiklenir:  %0.56 (100x)\n"
-                          "  Likidasyon olur:       %0.70 (100x)\n\n"
-                          "SL'yi ezmez, tamamlar. Her zaman acik\n"
-                          "tutulmasi onerilen guvenlik katmani."))
-        self._field(s, "emergency_liq_percent", "Emergency Yuzde (liq mesafesi %)", "80",
-                    tip="Likidasyon mesafesinin yuzde kacinda acil kapat (SL'den sonra, son savunma)")
+                          "  - SL fiyati atlanarak gecildi\n\n"
+                          "MESAFE ORNEK (100x):\n"
+                          "  Server SL:   %0.30 (2×ATR)\n"
+                          "  Yazilim SL:  %0.35\n"
+                          "  Emergency:   %0.56  ← BURADASIN\n"
+                          "  Likidasyon:  %0.70\n\n"
+                          "Her zaman ACIK tutulmasi onerilir."))
+        self._field(g, "emergency_liq_percent", "Emergency Yuzde (liq %)", "80",
+                    tip="Liq mesafesinin %kacinda acil kapat (80=onerilen)",
+                    help_text=(
+                        "EMERGENCY LIKIDASYON YUZDESI\n"
+                        "────────────────────────────\n"
+                        "Pratik liq mesafesinin yuzde kacinda\n"
+                        "yazilim ACIL kapatma yapar.\n\n"
+                        "SL'nin ARKASINDA bekleyen son savunma.\n"
+                        "SL tetiklenmediyse (API hatasi, gap)\n"
+                        "bu devreye girer.\n\n"
+                        "  70: Erken (SL'ye yakin, gereksiz)\n"
+                        "  80: Standart (onerilen)\n"
+                        "  90: Gec (liq'e cok yakin, riskli)\n\n"
+                        "Ornek (20x):\n"
+                        "  SL = 2xATR (~%1.4 fiyat)\n"
+                        "  Emergency = liq x %80 = %2.8 fiyat\n"
+                        "  Liq = %3.5 fiyat"))
 
         # ──────────────── TRAILING STOP ────────────────
-        self._section(s, "Iz Suren Stop (Trailing)")
-        self._checkbox(s, "trailing_enabled", "Trailing Stop Aktif",
+        g = self._section(s,"Iz Suren Stop (Trailing)")
+        self._checkbox(g,"trailing_enabled", "Trailing Stop Aktif",
                       help_text=(
                           "TRAILING STOP (Iz Suren Stop)\n"
                           "─────────────────────────────\n"
@@ -750,7 +1028,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "  Dogrudan ROI% uzerinden hesaplanir.\n"
                           "  Fee carpani ile otomatik ayarlanabilir."))
 
-        self._checkbox(s, "server_trailing_dynamic_update", "Server Trailing Dinamik Guncelleme",
+        self._checkbox(g,"server_trailing_dynamic_update", "Server Trailing Dinamik Guncelleme",
                       help_text=(
                           "SERVER TRAILING DINAMIK GUNCELLEME\n"
                           "──────────────────────────────────\n"
@@ -766,9 +1044,9 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "  kapatabilir."))
 
         # Trailing mode selector
-        row_tmode = ctk.CTkFrame(s, fg_color="transparent")
-        row_tmode.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(row_tmode, text="Trailing Modu:", width=240, anchor="w").pack(side="left")
+        row_tmode = ctk.CTkFrame(g, fg_color="transparent")
+        row_tmode.pack(fill="x", padx=8, pady=1)
+        ctk.CTkLabel(row_tmode, text="Trailing Modu:", width=180, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
         self._trailing_mode_var = ctk.StringVar(value="roi")
         tmode_seg = ctk.CTkSegmentedButton(
             row_tmode, values=["atr", "roi"],
@@ -781,28 +1059,112 @@ class StrategySettingsPanel(ctk.CTkFrame):
                      text_color="gray60", font=ctk.CTkFont(size=10)).pack(side="left", padx=5)
 
         # ATR-based trailing fields
-        self._field(s, "trailing_atr_activate_mult", "ATR Aktivasyon (x ATR)", "4.0",
-                    tip="Kac ATR kar olunca trailing baslasin (4=konservatif, 5=agresif)")
-        self._field(s, "trailing_atr_distance_mult", "ATR Mesafe (x ATR)", "1.0",
-                    tip="Kac ATR geri cekilince sat (1=konservatif, 2=agresif)")
+        self._field(g,"trailing_atr_activate_mult", "ATR Aktivasyon (x ATR)", "4.0",
+                    tip="Kac ATR kar olunca trailing baslasin (3=erken, 4=standart, 7=gec)",
+                    help_text=(
+                        "TRAILING ATR AKTIVASYON\n"
+                        "───────────────────────\n"
+                        "Fiyat giristen N x ATR uzaklasinca\n"
+                        "trailing stop aktif olur.\n\n"
+                        "  3.0: Erken aktivasyon (daha az kar\n"
+                        "       garanti ama daha sik tetiklenir)\n"
+                        "  4.0: Standart (onerilen)\n"
+                        "  7.0: Gec (buyuk karlar ama nadir)\n\n"
+                        "Min garanti kar = (aktivasyon - mesafe) x ATR\n"
+                        "Ornek: 4/1 = min 3 ATR kar garanti"))
+        self._field(g,"trailing_atr_distance_mult", "ATR Mesafe (x ATR)", "1.0",
+                    tip="Kac ATR geri cekilince sat (0.5=siki, 1=standart, 2=gevsek)",
+                    help_text=(
+                        "TRAILING ATR MESAFE (Callback)\n"
+                        "──────────────────────────────\n"
+                        "Trailing aktif olduktan sonra fiyat\n"
+                        "N x ATR geri cekilince pozisyon kapatilir.\n\n"
+                        "  0.5: Siki (az geri cekilme tolere edilir)\n"
+                        "  1.0: Standart (onerilen)\n"
+                        "  2.0: Gevsek (buyuk geri cekilme tolere)\n\n"
+                        "Server'a callback_rate olarak gonderilir.\n"
+                        "Binance limiti: %0.1 - %5.0"))
         # ROI-based trailing fields
-        self._field(s, "trailing_activate_roi", "ROI Aktivasyon (%)", "0",
-                    tip="Dogrudan ROI% (ornek: 60 = %60 ROI'de basla). 0=fee carpani kullan")
-        self._field(s, "trailing_distance_roi", "ROI Mesafe (%)", "0",
-                    tip="Geri cekilme ROI% (ornek: 10 = %10 geri gelince sat). 0=fee carpani kullan")
-        self._field(s, "trailing_activate_fee_mult", "Fee Carpani Aktivasyon", "3.0",
-                    tip="ROI=0 ise kullanilir. Kac x fee ROI'de trailing baslasin")
-        self._field(s, "trailing_distance_fee_mult", "Fee Carpani Mesafe", "2.0",
-                    tip="ROI=0 ise kullanilir. Trailing mesafesi")
+        self._field(g,"trailing_activate_roi", "ROI Aktivasyon (%)", "0",
+                    tip="Dogrudan ROI% (ornek: 60 = %60 ROI'de basla). 0=fee carpani kullan",
+                    help_text=(
+                        "ROI AKTIVASYON\n"
+                        "──────────────\n"
+                        "ROI modu secildiyse: trailing bu ROI%'de\n"
+                        "aktif olur. 0 ise fee carpani kullanilir.\n\n"
+                        "  0:  Fee carpani ile otomatik hesapla\n"
+                        "  30: %30 ROI'de trailing basla\n"
+                        "  60: %60 ROI'de trailing basla\n\n"
+                        "ATR modu secildiyse bu deger kullanilmaz."))
+        self._field(g,"trailing_distance_roi", "ROI Mesafe (%)", "0",
+                    tip="Geri cekilme ROI% (ornek: 10 = %10 geri gelince sat). 0=fee carpani kullan",
+                    help_text=(
+                        "ROI MESAFE (Callback)\n"
+                        "─────────────────────\n"
+                        "ROI modu secildiyse: trailing aktif\n"
+                        "olduktan sonra ROI bu kadar dusunce sat.\n\n"
+                        "  0:  Fee carpani ile otomatik hesapla\n"
+                        "  5:  %5 ROI geri cekilmede sat\n"
+                        "  10: %10 ROI geri cekilmede sat\n\n"
+                        "ATR modu secildiyse bu deger kullanilmaz."))
+        self._field(g,"trailing_activate_fee_mult", "Fee Carpani Aktivasyon", "3.0",
+                    tip="ROI=0 ise kullanilir. Kac x fee ROI'de trailing baslasin",
+                    help_text=(
+                        "FEE CARPANI AKTIVASYON\n"
+                        "──────────────────────\n"
+                        "ROI modu + ROI=0 ise: trailing\n"
+                        "fee x N ROI'de aktif olur.\n\n"
+                        "  Fee ROI = %0.1 x kaldirac x 100\n"
+                        "  20x → fee ROI = %2\n"
+                        "  3x fee → %6 ROI'de trailing basla\n\n"
+                        "  2.0: Erken (fee'yi 2x karsiladiktan sonra)\n"
+                        "  3.0: Standart (onerilen)\n"
+                        "  5.0: Gec (buyuk kar icin)"))
+        self._field(g,"trailing_distance_fee_mult", "Fee Carpani Mesafe", "2.0",
+                    tip="ROI=0 ise kullanilir. Trailing mesafesi",
+                    help_text=(
+                        "FEE CARPANI MESAFE\n"
+                        "──────────────────\n"
+                        "Trailing mesafesi = fee ROI x N\n\n"
+                        "  20x → fee ROI = %2\n"
+                        "  2x fee mesafe → %4 geri cekilmede sat\n\n"
+                        "  1.5: Siki (fee kadar geri gelince sat)\n"
+                        "  2.0: Standart (onerilen)\n"
+                        "  4.0: Gevsek (buyuk dalgalanma tolere)"))
 
         # ──────────────── KAR HEDEFI ────────────────
-        self._section(s, "Kar Hedefi (Take Profit)")
-        self._checkbox(s, "tp_enabled", "Take Profit Aktif")
-        self._field(s, "tp_liq_multiplier", "TP Carpani (liq mesafesi x)", "3.0",
-                    tip="Likidasyon mesafesinin kac kati (3.0 = 75x'te %3.4 fiyat hareketi)")
+        g = self._section(s,"Kar Hedefi (Take Profit)")
+        self._checkbox(g,"tp_enabled", "Take Profit Aktif",
+                      help_text=(
+                          "TAKE PROFIT (Kar Hedefi)\n"
+                          "────────────────────────\n"
+                          "Aktif: Fiyat hedefe ulasinca pozisyon\n"
+                          "  otomatik kapatilir. Binance'e TP emri\n"
+                          "  gonderilir.\n\n"
+                          "Kapali (onerilen): TP gonderilmez.\n"
+                          "  Kar yonetimi trailing stop ve sinyal\n"
+                          "  cikisi ile yapilir.\n\n"
+                          "Neden kapali tutulmali:\n"
+                          "  TP aktifken trailing calismaz!\n"
+                          "  Fiyat TP'ye gelince pozisyon kapanir,\n"
+                          "  trend devam etse bile kar kesilir.\n"
+                          "  Trailing ile trend sonuna kadar kalabilirsiniz."))
+        self._field(g,"tp_liq_multiplier", "TP Carpani (liq mesafesi x)", "3.0",
+                    tip="Likidasyon mesafesinin kac kati (3.0 = 75x'te %3.4 fiyat hareketi)",
+                    help_text=(
+                        "TP CARPANI\n"
+                        "──────────\n"
+                        "TP mesafesi = pratik_liq x bu_carpan\n\n"
+                        "Ornek (20x, liq_factor=%70):\n"
+                        "  Pratik liq = %3.5\n"
+                        "  3x → TP = %10.5 fiyat hareketi\n"
+                        "  ROI = %210\n\n"
+                        "  2.0: Yakin TP (daha sik kar)\n"
+                        "  3.0: Standart\n"
+                        "  5.0: Uzak TP (buyuk hedef)"))
 
-        row_tp_mode = ctk.CTkFrame(s, fg_color="transparent")
-        row_tp_mode.pack(fill="x", padx=20, pady=2)
+        row_tp_mode = ctk.CTkFrame(g, fg_color="transparent")
+        row_tp_mode.pack(fill="x", padx=8, pady=1)
         ctk.CTkLabel(row_tp_mode, text="Cikis Modu:", width=180, anchor="w").pack(side="left")
         self._tp_mode_var = ctk.StringVar(value="immediate")
         tp_seg = ctk.CTkSegmentedButton(
@@ -816,8 +1178,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
                      text_color="gray60", font=ctk.CTkFont(size=10)).pack(side="left", padx=5)
 
         # ──────────────── KISMI KAR AL (PARTIAL TP) ────────────────
-        self._section(s, "Kismi Kar Al (Partial TP)")
-        self._checkbox(s, "partial_tp_enabled", "Kismi Kar Al (Partial TP)",
+        g = self._section(s,"Kismi Kar Al (Partial TP)")
+        self._checkbox(g,"partial_tp_enabled", "Kismi Kar Al (Partial TP)",
                        default=False,
                        help_text=(
                            "KISMI KAR AL (PARTIAL TP)\n"
@@ -832,14 +1194,35 @@ class StrategySettingsPanel(ctk.CTkFrame):
                            "  ATR mult=3, kapanis=%50\n"
                            "  3 ATR karda pozisyonun %50'si kapanir\n"
                            "  Kalan %50 trailing ile devam eder"))
-        self._field(s, "partial_tp_atr_mult", "Partial TP ATR Mult", "3.0",
-                    tip="Kac ATR karda kismi kar al tetiklensin (3.0=standart)")
-        self._field(s, "partial_tp_close_pct", "Kapanacak Oran (%)", "50",
-                    tip="Pozisyonun yuzde kaci kapansin (50=%50)")
+        self._field(g,"partial_tp_atr_mult", "Partial TP ATR Mult", "3.0",
+                    tip="Kac ATR karda kismi kar al tetiklensin (2=erken, 3=standart)",
+                    help_text=(
+                        "KISMI KAR AL ATR CARPANI\n"
+                        "─────────────────────────\n"
+                        "Fiyat giristen N x ATR uzaklasinca\n"
+                        "pozisyonun belirli yuzdesi kapatilir.\n\n"
+                        "  2.0: Erken kismi kar (daha az kar ama\n"
+                        "       riski erken azaltir)\n"
+                        "  3.0: Standart (onerilen)\n"
+                        "  4.0: Gec (trailing aktivasyonuna yakin)\n\n"
+                        "Trailing aktivasyonundan ONCE olmali!\n"
+                        "Ornek: partial=2, trailing=4 → ideal"))
+        self._field(g,"partial_tp_close_pct", "Kapanacak Oran (%)", "50",
+                    tip="Pozisyonun yuzde kaci kapansin (30=az, 50=yari, 70=cogu)",
+                    help_text=(
+                        "KISMI KAPANIS ORANI\n"
+                        "────────────────────\n"
+                        "Partial TP tetiklenince pozisyonun\n"
+                        "yuzde kaci kapatilir.\n\n"
+                        "  30: Az kapat, cogu trailing'e kalsin\n"
+                        "  50: Yari yari (onerilen)\n"
+                        "  70: Cogu kapat, az trailing'e kalsin\n\n"
+                        "Kalan kisim trailing ile devam eder.\n"
+                        "Kapatilan kismin kari realize olur."))
 
         # ──────────────── SINYAL CIKIS ────────────────
-        self._section(s, "Sinyal Bazli Cikis")
-        self._checkbox(s, "signal_exit_enabled", "Sinyal Donusu Cikis (karda + ters sinyal guclu)",
+        g = self._section(s,"Sinyal Bazli Cikis")
+        self._checkbox(g,"signal_exit_enabled", "Sinyal Donusu Cikis (karda + ters sinyal guclu)",
                       help_text=(
                           "SINYAL CIKIS (KARDA + TERS POZISYON)\n"
                           "────────────────────────────────────\n"
@@ -858,25 +1241,56 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "  Sinyal -40 (zayif SHORT)\n"
                           "  → Cikma, sinyal yeterince guclu\n"
                           "    degil (whipsaw olabilir)."))
-        self._field(s, "signal_exit_threshold", "Sinyal Esik Degeri", "4.0",
-                    tip="Confluence skoru bu degerin altina dusunce sat (ornek: 4.0)")
-        self._field(s, "signal_min_hold_seconds", "Min Bekle (sn)", "30",
-                    tip="Pozisyon acildiktan sonra min bekleme suresi")
-        self._checkbox(s, "signal_only_in_profit", "Eski: Sadece Karda Cik (artik varsayilan davranis)",
+        self._field(g,"signal_exit_threshold", "Sinyal Esik Degeri", "4.0",
+                    tip="Confluence skoru bu degerin altina dusunce sat (ornek: 4.0)",
+                    help_text=(
+                        "SINYAL CIKIS ESIGI\n"
+                        "───────────────────\n"
+                        "Karda iken: confluence bu degerin\n"
+                        "tersine duserse pozisyon kapatilir.\n\n"
+                        "LONG icin: conf <= -4.0 → SAT\n"
+                        "SHORT icin: conf >= +4.0 → AL\n\n"
+                        "  3.0: Hassas (erken cikar, az kar)\n"
+                        "  4.0: Standart (onerilen)\n"
+                        "  6.0: Direncli (gec cikar, risk)\n\n"
+                        "Ayrica ters skor >= min_buy_score\n"
+                        "olmali (ters pozisyon acilacak gucte)."))
+        self._field(g,"signal_min_hold_seconds", "Min Bekle (sn)", "30",
+                    tip="Pozisyon acildiktan sonra min bekleme suresi",
+                    help_text=(
+                        "MINIMUM BEKLEME SURESI\n"
+                        "──────────────────────\n"
+                        "Pozisyon acildiktan sonra bu sure\n"
+                        "boyunca sinyal cikisi yapilmaz.\n\n"
+                        "Neden gerekli:\n"
+                        "  Giris aninda indikatorler gecici olarak\n"
+                        "  ters sinyal uretebilir (noise).\n"
+                        "  Bu bekleme suresi bunu onler.\n\n"
+                        "  30:  Kisa (hizli tepki)\n"
+                        "  60:  Orta\n"
+                        "  180: Uzun (sinyal stabilizasyonu icin)"))
+        self._checkbox(g,"signal_only_in_profit", "Sadece Karda Sinyal Cikisi",
                       help_text=(
-                          "NOT: Bu ayar artik etkisiz.\n"
-                          "─────────────────────────\n"
-                          "Sinyal cikis sistemi guncellendi:\n"
-                          "Sadece karda (fee dahil) VE sinyal\n"
-                          "ters pozisyon acilacak kadar guclu\n"
-                          "ise (min_buy_score) cikis yapilir.\n\n"
-                          "Zararda sinyal cikisi tamamen\n"
-                          "kaldirildi — server SL korur."))
-        self._field(s, "signal_deep_exit_threshold", "Eski: Zararda Cikis Esigi", "8.0",
-                    tip=("Artik etkisiz — zararda sinyal cikisi kaldirildi.\n"
-                         "Sadece karda + ters sinyal >= min_buy_score\n"
-                         "kosulu ile cikis yapilir."))
-        self._checkbox(s, "divergence_exit_enabled", "Divergence Cikis (bearish divergence'ta sat)",
+                          "SINYAL CIKISI — KAR/ZARAR MODU\n"
+                          "───────────────────────────────\n"
+                          "Aktif (true): Sinyal cikisi SADECE\n"
+                          "  karda (fee dahil) calisir.\n"
+                          "  Zararda server SL korur.\n\n"
+                          "Kapali (false): Zararda da sinyal\n"
+                          "  cikisi yapar, AMA daha yuksek\n"
+                          "  esikle (derin reversal esigi).\n"
+                          "  Karda: conf >= 4 (normal esik)\n"
+                          "  Zararda: conf >= 8 (derin esik)\n\n"
+                          "Ornek: LONG pozisyon, zarar var,\n"
+                          "  conf = -9 → guclu SHORT sinyali\n"
+                          "  → server SL'yi bekleme, hemen cik"))
+        self._field(g,"signal_deep_exit_threshold", "Zararda Derin Reversal Esigi", "8.0",
+                    tip=("Zararda sinyal cikisi icin gereken\n"
+                         "minimum confluence esigi.\n"
+                         "Karda normal esik (4) kullanilir,\n"
+                         "zararda bu daha yuksek esik (8) gerekir.\n"
+                         "signal_only_in_profit=false iken aktif."))
+        self._checkbox(g,"divergence_exit_enabled", "Divergence Cikis (bearish divergence'ta sat)",
                       help_text=(
                           "DIVERGENCE (Iraksama) CIKIS\n"
                           "───────────────────────────\n"
@@ -896,20 +1310,72 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "Kar koruma araci olarak degerli."))
 
         # ──────────────── ZAMAN LIMITI ────────────────
-        self._section(s, "Zaman Limiti")
-        self._checkbox(s, "time_limit_enabled", "Zaman Limiti Aktif")
-        self._field(s, "time_limit_minutes", "Max Tutma (dk)", "480",
-                    tip="Pozisyon en fazla kac dakika tutulsun")
-        self._checkbox(s, "time_limit_extend_trailing",
-                       "Trailing Aktifse Uzat (trailing varsa zaman limiti iptal)")
-        self._checkbox(s, "time_limit_extend_breakeven",
-                       "Breakeven'da Uzat (fee civarindaysa 2x sure ver)")
+        g = self._section(s,"Zaman Limiti")
+        self._checkbox(g,"time_limit_enabled", "Zaman Limiti Aktif",
+                      help_text=(
+                          "ZAMAN LIMITI\n"
+                          "────────────\n"
+                          "Pozisyon belirtilen sureden fazla\n"
+                          "tutulursa otomatik kapatilir.\n\n"
+                          "Neden gerekli:\n"
+                          "  Yatay piyasada takilmis pozisyonlar\n"
+                          "  funding fee oderler (8 saatte 1).\n"
+                          "  Uzun sure hic hareket etmeyen\n"
+                          "  pozisyon kaynagi baglar.\n\n"
+                          "Uzatma secenekleri ile esnek yonetim."))
+        self._field(g,"time_limit_minutes", "Max Tutma (dk)", "480",
+                    tip="Pozisyon en fazla kac dakika tutulsun",
+                    help_text=(
+                        "MAX TUTMA SURESI\n"
+                        "─────────────────\n"
+                        "Bu sureden sonra pozisyon kapatilir.\n\n"
+                        "  60:  1 saat (agresif)\n"
+                        "  120: 2 saat\n"
+                        "  480: 8 saat (onerilen, 1 funding)\n"
+                        "  1440: 24 saat\n\n"
+                        "480dk = 1 funding periyodu (Binance\n"
+                        "her 8 saatte funding fee keser).\n"
+                        "Uzatma secenekleri ile override edilebilir."))
+        self._checkbox(g,"time_limit_extend_trailing",
+                       "Trailing Aktifse Uzat (trailing varsa zaman limiti iptal)",
+                       help_text=(
+                           "TRAILING UZATMA\n"
+                           "───────────────\n"
+                           "Trailing stop aktif olduysa (fiyat\n"
+                           "N x ATR ilerledi) zaman limiti iptal.\n\n"
+                           "Mantik: Fiyat hedefe gelmis, trend\n"
+                           "devam edebilir. Zaman limiti ile\n"
+                           "erken kapatmak mantikli degil.\n"
+                           "Trailing zaten cikisi yonetir."))
+        self._checkbox(g,"time_limit_extend_breakeven",
+                       "Breakeven'da Uzat (fee civarindaysa 2x sure ver)",
+                       help_text=(
+                           "BREAKEVEN UZATMA\n"
+                           "─────────────────\n"
+                           "Pozisyon fee civarinda karda ise\n"
+                           "sure 2 katina uzatilir.\n\n"
+                           "Mantik: Fee'yi yeni karsilamis,\n"
+                           "biraz daha sure verilirse kara\n"
+                           "gecebilir. Hemen kapatmak sadece\n"
+                           "fee kaybina neden olur."))
 
         # ──────────────── RISK ────────────────
-        self._section(s, "Risk & Bekleme")
-        self._field(s, "cooldown_seconds", "Satis Sonrasi Bekleme (sn)", "120",
-                    tip="Pozisyon kapatildiktan sonra kac saniye bekle")
-        self._field(s, "loss_cooldown_seconds", "Zarar Cooldown (sn)", "3600",
+        g = self._section(s,"Risk & Bekleme")
+        self._field(g,"cooldown_seconds", "Satis Sonrasi Bekleme (sn)", "120",
+                    tip="Pozisyon kapatildiktan sonra kac saniye bekle",
+                    help_text=(
+                        "SATIS SONRASI BEKLEME\n"
+                        "─────────────────────\n"
+                        "Bir pozisyon kapatildiktan sonra\n"
+                        "(kar veya zarar farketmez) bu sure\n"
+                        "boyunca yeni pozisyon acilmaz.\n\n"
+                        "  30:  Kisa (hizli yeni giris)\n"
+                        "  60:  Standart\n"
+                        "  120: Orta (onerilen)\n"
+                        "  300: Uzun (sakin islem)\n\n"
+                        "Anti-churning: cok hizli alis-satis\n"
+                        "dongusunu onler. Fee kaybini azaltir."))
+        self._field(g,"loss_cooldown_seconds", "Zarar Cooldown (sn)", "3600",
                     tip="Ayni coinde zarar sonrasi tekrar giris bekleme suresi (3600=1saat)",
                     help_text=(
                         "ZARAR COOLDOWN\n"
@@ -928,12 +1394,15 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "uygulanir. Karla kapanan coinler\n"
                         "cooldown'a girmez."))
 
+        # ════════════════ COLUMN 3: Yon + BTC + ADX + Coin + Limit + Tarayici ════════════════
+        s = c3  # switch to column 3
+
         # ──────────────── YON DENGESI (LONG/SHORT) ────────────────
-        self._section(s, "Yon Dengesi (Long/Short Orani)")
+        g = self._section(s,"Yon Dengesi (Long/Short Orani)")
 
         self._cb_vars["direction_balance_enabled"] = ctk.BooleanVar(value=False)
-        row_db = ctk.CTkFrame(s, fg_color="transparent")
-        row_db.pack(fill="x", padx=20, pady=2)
+        row_db = ctk.CTkFrame(g, fg_color="transparent")
+        row_db.pack(fill="x", padx=8, pady=1)
         cb_db = ctk.CTkCheckBox(row_db, text="Yon Dengeleme Aktif",
                                  variable=self._cb_vars["direction_balance_enabled"])
         cb_db.pack(side="left")
@@ -962,9 +1431,9 @@ class StrategySettingsPanel(ctk.CTkFrame):
                       ))).pack(side="left", padx=5)
 
         # Ratio combo box
-        row_ratio = ctk.CTkFrame(s, fg_color="transparent")
-        row_ratio.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(row_ratio, text="Oran (X-Y):", width=240, anchor="w").pack(side="left")
+        row_ratio = ctk.CTkFrame(g, fg_color="transparent")
+        row_ratio.pack(fill="x", padx=8, pady=1)
+        ctk.CTkLabel(row_ratio, text="Oran (X-Y):", width=180, anchor="w", font=ctk.CTkFont(size=11)).pack(side="left")
         ratio_values = [
             "1-1", "2-1", "3-1", "3-2",
             "4-1", "4-3", "5-1", "5-2", "5-3", "5-4",
@@ -979,9 +1448,9 @@ class StrategySettingsPanel(ctk.CTkFrame):
                      text_color="gray50", font=ctk.CTkFont(size=10)).pack(side="left", padx=5)
 
         # ──────────────── BTC KORELASYON FILTRESI ────────────────
-        self._section(s, "BTC Korelasyon Filtresi")
+        g = self._section(s,"BTC Korelasyon Filtresi")
 
-        self._checkbox(s, "btc_correlation_enabled", "BTC Korelasyon Filtresi",
+        self._checkbox(g,"btc_correlation_enabled", "BTC Korelasyon Filtresi",
                        default=False,
                        help_text=(
                            "BTC KORELASYON FILTRESI\n"
@@ -997,13 +1466,27 @@ class StrategySettingsPanel(ctk.CTkFrame):
                            "Yuksek beta = yuksek korelasyon riski.\n"
                            "BTC duserse tum portfoy birlikte duser.\n\n"
                            "Max portfoy beta limiti bu riski sinirlar."))
-        self._field(s, "btc_max_portfolio_beta", "Max Portfoy Beta", "2.5",
-                    tip="Portfoy toplam beta'si bu degeri asarsa yeni pozisyon acilmaz (2.5=standart)")
+        self._field(g,"btc_max_portfolio_beta", "Max Portfoy Beta", "2.5",
+                    tip="Portfoy toplam beta'si bu degeri asarsa yeni pozisyon acilmaz (2.5=standart)",
+                    help_text=(
+                        "MAX PORTFOY BETA\n"
+                        "─────────────────\n"
+                        "Tum acik pozisyonlarin toplam BTC\n"
+                        "beta'si bu degeri asarsa yeni pozisyon\n"
+                        "acilmasi engellenir.\n\n"
+                        "  1.5: Cok konservatif\n"
+                        "  2.0: Konservatif\n"
+                        "  2.5: Standart (onerilen)\n"
+                        "  4.0: Gevsek\n\n"
+                        "Beta hesabi: Her coinin BTC ile\n"
+                        "korelasyonu x pozisyon agirligi.\n"
+                        "Yuksek beta = BTC dustugunde\n"
+                        "tum portfoy duser."))
 
         # ──────────────── ADX REJIM SISTEMI ────────────────
-        self._section(s, "ADX Rejim Sistemi")
+        g = self._section(s,"ADX Rejim Sistemi")
 
-        self._checkbox(s, "adx_regime_enabled", "ADX Rejim Sistemi Aktif",
+        self._checkbox(g,"adx_regime_enabled", "ADX Rejim Sistemi Aktif",
                        default=False,
                        help_text=(
                            "ADX REJIM SISTEMI\n"
@@ -1025,12 +1508,33 @@ class StrategySettingsPanel(ctk.CTkFrame):
                            "  2-ust ve 5-ust timeframe\n"
                            "  ayni yonu desteklemeli."))
 
-        self._field(s, "adx_regime_no_trade", "No Trade Esigi (ADX <)", "18",
-                    tip="Bu ADX altinda islem acilmaz (yatar piyasa)")
-        self._field(s, "adx_regime_strong_trend", "Strong Trend Esigi (ADX >)", "25",
-                    tip="Bu ADX ustunde guclu trend: market giris")
+        self._field(g,"adx_regime_no_trade", "No Trade Esigi (ADX <)", "18",
+                    tip="Bu ADX altinda islem acilmaz (yatar piyasa)",
+                    help_text=(
+                        "NO TRADE ESIGI\n"
+                        "──────────────\n"
+                        "ADX bu degerin altindaysa hic islem\n"
+                        "acilmaz. Piyasa yatay, trend yok.\n\n"
+                        "  15: Gevsek (yatayda bile islem acar)\n"
+                        "  18: Standart (onerilen)\n"
+                        "  20: Siki (sadece net trendlerde)\n\n"
+                        "Yatar piyasada whipsaw riski cok yuksek.\n"
+                        "SL surekli tetiklenir, zarar birikir."))
+        self._field(g,"adx_regime_strong_trend", "Strong Trend Esigi (ADX >)", "25",
+                    tip="Bu ADX ustunde guclu trend: market giris",
+                    help_text=(
+                        "STRONG TREND ESIGI\n"
+                        "──────────────────\n"
+                        "ADX bu degerin ustundeyse guclu trend.\n"
+                        "Market fiyattan giris yapilir (limit yok).\n\n"
+                        "  20: Gevsek (zayif trendde bile market)\n"
+                        "  25: Standart (onerilen)\n"
+                        "  30: Siki (sadece cok guclu trendlerde)\n\n"
+                        "No Trade ve Strong Trend arasindaki\n"
+                        "bolge (18-25) ranging/weak_trend olarak\n"
+                        "siniflandirilir ve limit giris kullanilir."))
 
-        self._checkbox(s, "adx_regime_mtf_required", "MTF Teyit Zorunlu (2-ust + 5-ust TF)",
+        self._checkbox(g,"adx_regime_mtf_required", "MTF Teyit Zorunlu (2-ust + 5-ust TF)",
                        default=True,
                        help_text=(
                            "MTF (Multi-Timeframe) TEYIT\n"
@@ -1046,47 +1550,126 @@ class StrategySettingsPanel(ctk.CTkFrame):
                            "Tum rejimlerde uygulanir."))
 
         # Ranging (ADX 18-25, trend yok) parametreleri
-        ctk.CTkLabel(s, text="  Ranging (ADX 18-25, trend yok):",
+        ctk.CTkLabel(g, text="  Ranging (ADX 18-25, trend yok):",
                      font=ctk.CTkFont(size=12, slant="italic"),
                      text_color="#CE93D8").pack(anchor="w", padx=15, pady=(8, 2))
-        self._field(s, "adx_regime_ranging_entry_atr", "  Limit Giris ATR Ofseti", "2.0",
-                    tip="Kac ATR asagiya/yukariya limit emir (2.0=genis pazarlik)")
-        self._field(s, "adx_regime_ranging_sl_atr", "  SL (ATR)", "2.0",
-                    tip="Stop Loss mesafesi ATR cinsinden")
-        self._field(s, "adx_regime_ranging_tp_atr", "  TP (ATR)", "3.0",
-                    tip="Take Profit mesafesi ATR cinsinden (ranging'de sabit TP)")
-        self._field(s, "adx_regime_ranging_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0",
-                    tip="Trailing stop aktif olma mesafesi")
-        self._field(s, "adx_regime_ranging_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0",
-                    tip="Trailing stop geri cekilme mesafesi")
+        self._field(g,"adx_regime_ranging_entry_atr", "  Limit Giris ATR Ofseti", "2.0",
+                    tip="Kac ATR asagiya/yukariya limit emir (2.0=genis pazarlik)",
+                    help_text="RANGING rejimde limit giris ofseti.\nYatay piyasada genis pazarlik yapilir.\n2.0 = 2 ATR uzaga limit emir konur.")
+        self._field(g,"adx_regime_ranging_sl_atr", "  SL (ATR)", "2.0",
+                    tip="Stop Loss mesafesi ATR cinsinden",
+                    help_text="RANGING rejimde SL mesafesi.\nServer'a STOP_MARKET olarak gonderilir.\n2.0 ATR = standart mesafe.")
+        self._field(g,"adx_regime_ranging_tp_atr", "  TP (ATR)", "3.0",
+                    tip="Take Profit mesafesi ATR cinsinden (ranging'de sabit TP)",
+                    help_text="RANGING rejimde sabit TP hedefi.\nYatay piyasada trend uzun surmez,\nbu yuzden sabit TP kullanilir.\n3.0 ATR = standart hedef.")
+        self._field(g,"adx_regime_ranging_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0",
+                    tip="Trailing stop aktif olma mesafesi",
+                    help_text="RANGING rejimde trailing aktivasyonu.\nFiyat 4 ATR ilerlediginde trailing baslar.\nTP (3 ATR) oncesinde tetiklenebilir.")
+        self._field(g,"adx_regime_ranging_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0",
+                    tip="Trailing stop geri cekilme mesafesi",
+                    help_text="RANGING rejimde trailing callback.\nFiyat 1 ATR geri cekilince pozisyon kapatilir.")
 
         # Weak Trend (ADX 18-25, trend var) parametreleri
-        ctk.CTkLabel(s, text="  Weak Trend (ADX 18-25, trend var):",
+        ctk.CTkLabel(g, text="  Weak Trend (ADX 18-25, trend var):",
                      font=ctk.CTkFont(size=12, slant="italic"),
                      text_color="#4FC3F7").pack(anchor="w", padx=15, pady=(8, 2))
-        self._field(s, "adx_regime_weak_entry_atr", "  Limit Giris ATR Ofseti", "1.0",
-                    tip="Kac ATR asagiya/yukariya limit emir (1.0=orta pazarlik)")
-        self._field(s, "adx_regime_weak_sl_atr", "  SL (ATR)", "2.0",
-                    tip="Stop Loss mesafesi ATR cinsinden")
-        self._field(s, "adx_regime_weak_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0")
-        self._field(s, "adx_regime_weak_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0")
+        self._field(g,"adx_regime_weak_entry_atr", "  Limit Giris ATR Ofseti", "1.0",
+                    tip="Kac ATR asagiya/yukariya limit emir (1.0=orta pazarlik)",
+                    help_text="WEAK TREND rejimde limit giris.\nTrend baslangici, 1 ATR pazarlik yeterli.\nDaha yakin giris = daha iyi maliyet.")
+        self._field(g,"adx_regime_weak_sl_atr", "  SL (ATR)", "2.0",
+                    tip="Stop Loss mesafesi ATR cinsinden",
+                    help_text="WEAK TREND rejimde SL mesafesi.\n2.0 ATR = standart, tum rejimlerde ayni.")
+        self._field(g,"adx_regime_weak_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0",
+                    tip="Trailing stop aktif olma mesafesi",
+                    help_text="WEAK TREND rejimde trailing aktivasyonu.\n4 ATR = standart mesafe.")
+        self._field(g,"adx_regime_weak_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0",
+                    tip="Trailing stop geri cekilme mesafesi",
+                    help_text="WEAK TREND rejimde trailing callback.\n1 ATR geri cekilme = standart.")
 
         # Strong Trend (ADX > 25) parametreleri
-        ctk.CTkLabel(s, text="  Strong Trend (ADX > 25):",
+        ctk.CTkLabel(g, text="  Strong Trend (ADX > 25):",
                      font=ctk.CTkFont(size=12, slant="italic"),
                      text_color="#00C853").pack(anchor="w", padx=15, pady=(8, 2))
-        ctk.CTkLabel(s, text="    Giris: Market fiyat (pazarlik yok)",
+        ctk.CTkLabel(g, text="    Giris: Market fiyat (pazarlik yok)",
                      text_color="gray50", font=ctk.CTkFont(size=11)).pack(
             anchor="w", padx=25, pady=1)
-        self._field(s, "adx_regime_strong_sl_atr", "  SL (ATR)", "2.0",
-                    tip="Stop Loss mesafesi ATR cinsinden")
-        self._field(s, "adx_regime_strong_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0")
-        self._field(s, "adx_regime_strong_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0")
+        self._field(g,"adx_regime_strong_sl_atr", "  SL (ATR)", "2.0",
+                    tip="Stop Loss mesafesi ATR cinsinden",
+                    help_text="STRONG TREND rejimde SL mesafesi.\n2.0 ATR = standart, tum rejimlerde ayni.")
+        self._field(g,"adx_regime_strong_trail_activate_atr", "  Trailing Tetikleme (ATR)", "4.0",
+                    tip="Trailing stop aktif olma mesafesi",
+                    help_text="STRONG TREND rejimde trailing aktivasyonu.\nGuclu trendde 4 ATR hizla gecilir.")
+        self._field(g,"adx_regime_strong_trail_callback_atr", "  Trailing Geri Cekilme (ATR)", "1.0",
+                    tip="Trailing stop geri cekilme mesafesi",
+                    help_text="STRONG TREND rejimde trailing callback.\n1 ATR geri cekilme = standart.")
+
+        # ──────────────── MEAN REVERSION ────────────────
+        g = self._section(s,"Mean Reversion (Bant Ici Islem)")
+
+        self._checkbox(g,"mean_reversion_enabled", "Mean Reversion Aktif",
+                       default=False,
+                       help_text=(
+                           "MEAN REVERSION SISTEMI\n"
+                           "──────────────────────\n"
+                           "ADX < 18 olan yatay piyasa coinlerinde\n"
+                           "Bollinger bandi ici islem acar.\n\n"
+                           "Nasil calisir:\n"
+                           "  ADX < 18 → MR havuzuna yonlendirilir\n"
+                           "  ADX 18-25 → Gray zone: 5 sinyal oylar\n"
+                           "  BB bandina yakin limit emir ile giris\n"
+                           "  BB orta cizgisi = TP hedefi\n\n"
+                           "NOT: ADX Rejim Sistemi ile birlikte\n"
+                           "calisir. ADX < 18 coinler NO_TRADE yerine\n"
+                           "MR havuzuna yonlendirilir."))
+
+        self._field(g,"mr_max_adx", "Max ADX (MR Havuzu)", "18",
+                    tip="Bu ADX altindaki coinler MR havuzuna girer",
+                    help_text="ADX < 18 = yatay piyasa, trend yok.\nMR stratejisi bu coinlerde calisir.")
+        self._field(g,"mr_max_positions", "Max MR Pozisyon", "2",
+                    tip="Ayni anda max kac MR pozisyon acilabilir (trend pozisyonlarindan ayri)",
+                    help_text="MR pozisyonlari trend pozisyonlarindan ayri sayilir.\n2 = max 2 MR + max N trend.")
+        self._field(g,"mr_min_score", "Min MR Skoru", "65",
+                    tip="MR skoru en az bu kadar olmali (0-100)",
+                    help_text="MR skoru: BB proximity %25 + RSI extreme %25\n+ Volume exhaustion %20 + BB width %15 + Momentum %15")
+        self._field(g,"mr_rsi_oversold", "RSI Oversold Esigi", "30",
+                    tip="RSI bu deger altinda = asiri satim (LONG firsati)",
+                    help_text="RSI < 30 → asiri satim bolgesi.\nMR LONG icin gerekli kosul.")
+        self._field(g,"mr_rsi_overbought", "RSI Overbought Esigi", "70",
+                    tip="RSI bu deger ustunde = asiri alim (SHORT firsati)",
+                    help_text="RSI > 70 → asiri alim bolgesi.\nMR SHORT icin gerekli kosul.")
+        self._field(g,"mr_sl_atr_mult", "SL (ATR Carpani)", "1.5",
+                    tip="MR pozisyon SL mesafesi (ATR cinsinden). Trend'den daha siki.",
+                    help_text="MR SL = 1.5 ATR (trend 2.0 ATR).\nYatay piyasada daha siki SL yeterli.")
+        self._field(g,"mr_bb_proximity_pct", "BB Proximity (%)", "20.0",
+                    tip="Fiyat BB bandina bu yuzde kadar yakin olmali",
+                    help_text="Fiyat BB bandinin %20 yakininda mi?\nDaha kucuk = daha secici (banda cok yakin).")
+        self._field(g,"mr_volume_exhaustion_max", "Volume Exhaustion Max", "0.8",
+                    tip="Hacim ortalamaya kiyasla bu orandan dusuk olmali (tukenmislik)",
+                    help_text="Hacim orani < 0.8 = tukenmislik.\nDusuk hacim = hareket bitiyor, donus gelebilir.")
+        self._field(g,"mr_min_bb_range_fee_mult", "Min BB Range (Fee Carpani)", "3.0",
+                    tip="BB bant genisligi en az fee'nin kac kati olmali (karlilik filtresi)",
+                    help_text="BB araligi cok darsa kar fee'yi karsilamaz.\n3.0 = BB range en az 3x fee olmali.")
+        self._field(g,"mr_time_limit_minutes", "MR Zaman Limiti (dk)", "240",
+                    tip="MR pozisyon max ne kadar acik kalabilir",
+                    help_text="MR pozisyonlari trend'den kisa tutulur.\n240dk = 4 saat (trend 8 saat).")
+        self._checkbox(g,"mr_breakout_to_trend", "Breakout → Trend Gecisi",
+                       default=True,
+                       help_text=(
+                           "MR pozisyondayken breakout olursa\n"
+                           "(BB kirilim + hacim + ADX yukselisi)\n"
+                           "otomatik TREND moduna gecer.\n\n"
+                           "TP hedefi kalkar, trailing aktif olur."))
+        self._checkbox(g,"mr_stop_flip_enabled", "Stop Flip (Ters Pozisyon)",
+                       default=True,
+                       help_text=(
+                           "MR pozisyon SL'ye takilirsa\n"
+                           "ters yonde yeni pozisyon acar.\n\n"
+                           "Ornek: LONG SL → SHORT ac."))
 
         # ──────────────── COIN GUNLUK YASAK ────────────────
-        self._section(s, "Coin Gunluk Yasak (Kayip Limiti)")
+        g = self._section(s,"Coin Gunluk Yasak (Kayip Limiti)")
 
-        self._field(s, "coin_daily_loss_limit", "Max Zarar Sayisi (0=kapali)", "0",
+        self._field(g,"coin_daily_loss_limit", "Max Zarar Sayisi (0=kapali)", "0",
                     tip="Bir coin 24 saatte kac kere zarar ederse yasaklanir (0=kapali)",
                     help_text=(
                         "COIN GUNLUK ZARAR YASAGI\n"
@@ -1104,15 +1687,27 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  0 = kapali (yasak yok)\n"
                         "  3 = 3 zarar sonrasi yasak (onerilen)\n"
                         "  5 = daha toleransli"))
-        self._field(s, "coin_daily_ban_hours", "Yasak Suresi (saat)", "24",
-                    tip="Zarar limiti asilinca coin kac saat yasakli kalir (24=1 gun)")
+        self._field(g,"coin_daily_ban_hours", "Yasak Suresi (saat)", "24",
+                    tip="Zarar limiti asilinca coin kac saat yasakli kalir (24=1 gun)",
+                    help_text=(
+                        "YASAK SURESI\n"
+                        "────────────\n"
+                        "Coin zarar limitine ulasinca bu kadar\n"
+                        "saat boyunca yasakli kalir.\n\n"
+                        "  6:  Kisa yasak\n"
+                        "  12: Yari gun\n"
+                        "  24: 1 gun (onerilen)\n"
+                        "  48: 2 gun (cok siki)\n\n"
+                        "Sure ilk zarardan itibaren sayilir.\n"
+                        "Ornek: 3 zarar/24s → ilk zarardan\n"
+                        "24 saat sonra yasak kalkar."))
 
         # ──────────────── LIMIT CIKIS ────────────────
-        self._section(s, "Limit Cikis (Fee Tasarrufu)")
+        g = self._section(s,"Limit Cikis (Fee Tasarrufu)")
 
         self._cb_vars["limit_exit_enabled"] = ctk.BooleanVar(value=False)
-        row_le = ctk.CTkFrame(s, fg_color="transparent")
-        row_le.pack(fill="x", padx=20, pady=2)
+        row_le = ctk.CTkFrame(g, fg_color="transparent")
+        row_le.pack(fill="x", padx=8, pady=1)
         cb_le = ctk.CTkCheckBox(row_le, text="Cikista Limit Emir Kullan (Maker Fee)",
                                  variable=self._cb_vars["limit_exit_enabled"])
         cb_le.pack(side="left")
@@ -1138,14 +1733,37 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "market emre doner."
                       ))).pack(side="left", padx=5)
 
-        self._field(s, "limit_exit_atr_offset", "Cikis ATR Ofseti", "0.2",
-                    tip="Cikista kac ATR lehimize limit fiyat konur (0.2=yakin, hizli dolsun)")
+        self._field(g,"limit_exit_atr_offset", "Cikis ATR Ofseti", "0.2",
+                    tip="Cikista kac ATR lehimize limit fiyat konur (0.2=yakin, hizli dolsun)",
+                    help_text=(
+                        "CIKIS LIMIT ATR OFSETI\n"
+                        "──────────────────────\n"
+                        "Cikista limit emir fiyati ne kadar\n"
+                        "lehimize konur.\n\n"
+                        "  LONG kapama: piyasa + (N x ATR)\n"
+                        "  SHORT kapama: piyasa - (N x ATR)\n\n"
+                        "  0.1: Cok yakin (hizli dolar, maker fee)\n"
+                        "  0.2: Yakin (onerilen)\n"
+                        "  0.5: Uzak (daha kar ama dolmayabilir)\n\n"
+                        "Dolmazsa otomatik market emre doner."))
 
         # ──────────────── TARAYICI AYARLARI ────────────────
-        self._section(s, "Tarayici (Scanner)")
-        self._field(s, "max_symbols_to_scan", "Taranacak Coin Sayisi", "50",
-                    tip="Hacim siralamasindan en fazla kac coin taransin")
-        self._checkbox(s, "battle_mode", "Savas Modu (tek coin odakli)",
+        g = self._section(s,"Tarayici (Scanner)")
+        self._field(g,"max_symbols_to_scan", "Taranacak Coin Sayisi", "50",
+                    tip="Hacim siralamasindan en fazla kac coin taransin",
+                    help_text=(
+                        "TARANACAK COIN SAYISI\n"
+                        "─────────────────────\n"
+                        "Binance Futures'tan 24s hacim\n"
+                        "siralamasina gore en fazla kac coin\n"
+                        "indikatör analizi yapilacak.\n\n"
+                        "  30: Hizli tarama (sadece en likit)\n"
+                        "  50: Standart (onerilen)\n"
+                        "  100: Genis (daha fazla firsat ama\n"
+                        "        tarama suresi artar)\n\n"
+                        "Spike coinler (>%3 degisim) ekstra\n"
+                        "olarak eklenir (max 20 adet)."))
+        self._checkbox(g,"battle_mode", "Savas Modu (tek coin odakli)",
                       help_text=(
                           "SAVAS MODU (Battle Mode)\n"
                           "────────────────────────\n"
@@ -1154,7 +1772,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "Scanner genis piyasayi taramaz,\n"
                           "odak dar tutulur. Manuel secilen\n"
                           "coinlerle sinirli islem yapilir."))
-        self._checkbox(s, "close_only", "Sadece Kapama Modu (yeni pozisyon acma)",
+        self._checkbox(g,"close_only", "Sadece Kapama Modu (yeni pozisyon acma)",
                       help_text=(
                           "SADECE KAPAMA MODU\n"
                           "──────────────────\n"
@@ -1166,7 +1784,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "  - Risk yonetimi (buyuk haber oncesi)\n"
                           "  - Sistemin sadece kapatma yapmasini\n"
                           "    istediginizde"))
-        self._checkbox(s, "focus_mode", "Odak Modu (aktif sembole odaklan)",
+        self._checkbox(g,"focus_mode", "Odak Modu (aktif sembole odaklan)",
                       help_text=(
                           "ODAK MODU (Focus Mode)\n"
                           "──────────────────────\n"
@@ -1175,9 +1793,10 @@ class StrategySettingsPanel(ctk.CTkFrame):
                           "odaklanir. Diger coinleri taramaz.\n\n"
                           "Manuel islem yaparken kullanisli."))
 
-        # ── Info box with dynamic calculations ──
-        self._info_frame = ctk.CTkFrame(s, fg_color="#1a1a2e", corner_radius=8)
-        self._info_frame.pack(fill="x", padx=10, pady=10)
+        # ── Info box with dynamic calculations (bottom, full width) ──
+        info_parent = self._scroll  # below all 3 columns
+        self._info_frame = ctk.CTkFrame(info_parent, fg_color="#1a1a2e", corner_radius=8)
+        self._info_frame.pack(fill="x", padx=5, pady=(10, 5))
         self._info_label = ctk.CTkLabel(
             self._info_frame, text="", justify="left",
             font=ctk.CTkFont(size=11, family="Consolas"),
@@ -1186,75 +1805,82 @@ class StrategySettingsPanel(ctk.CTkFrame):
         self._info_label.pack(padx=10, pady=8, anchor="w")
         self._update_info()
 
-        # ── Save / Reset buttons ──
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=(5, 2))
-        ctk.CTkButton(btn_frame, text="Kaydet", width=120, fg_color="#00C853",
-                      hover_color="#00A846",
-                      command=self._save).pack(side="left", padx=5)
-        ctk.CTkButton(btn_frame, text="Sifirla (Varsayilan)", width=150,
-                      fg_color="gray30", command=self._reset_to_default).pack(side="left", padx=5)
-
-        # ── Template system (visible in manuel mode) ──
-        self._tmpl_frame = ctk.CTkFrame(self, fg_color="#1a1a2e")
-        self._tmpl_frame.pack(fill="x", padx=10, pady=(2, 10))
-
-        ctk.CTkLabel(self._tmpl_frame, text="Sablonlar:",
-                     font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10, pady=8)
-
-        self._tmpl_var = ctk.StringVar(value="")
-        self._tmpl_menu = ctk.CTkOptionMenu(
-            self._tmpl_frame, variable=self._tmpl_var,
-            values=["(sablon sec)"], width=200,
-            command=self._on_template_select,
-        )
-        self._tmpl_menu.pack(side="left", padx=5, pady=8)
-
-        ctk.CTkButton(self._tmpl_frame, text="Yukle", width=80,
-                      fg_color="#2196F3", hover_color="#1976D2",
-                      command=self._load_template).pack(side="left", padx=3)
-        ctk.CTkButton(self._tmpl_frame, text="Kaydet", width=100,
-                      fg_color="#FF9800", hover_color="#F57C00",
-                      command=self._save_template).pack(side="left", padx=3)
-        ctk.CTkButton(self._tmpl_frame, text="Sil", width=60,
-                      fg_color="#FF1744", hover_color="#D50000",
-                      command=self._delete_template).pack(side="left", padx=3)
-
-        self._refresh_template_list()
-
     # ════════════════════════════════════════
     # UI HELPERS
     # ════════════════════════════════════════
 
-    def _section(self, parent, title: str) -> None:
-        ctk.CTkLabel(parent, text=title,
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(
-            anchor="w", padx=10, pady=(15, 5))
+    # Section color mapping for visual grouping
+    _SECTION_COLORS = {
+        "Giris": "#4FC3F7",          # blue - entry
+        "Emir": "#4FC3F7",           # blue - order type
+        "Kaldirac": "#FF9800",       # orange - leverage
+        "Stop Loss": "#FF1744",      # red - SL
+        "Iz Suren": "#CE93D8",       # purple - trailing
+        "Kar Hedefi": "#00C853",     # green - TP
+        "Kismi Kar": "#00C853",      # green - partial TP
+        "Sinyal": "#FFD54F",         # yellow - signal exit
+        "Zaman": "#64B5F6",          # light blue - time
+        "Risk": "#FF5722",           # deep orange - risk
+        "Yon Dengesi": "#AB47BC",    # purple - direction
+        "BTC": "#78909C",            # gray-blue - correlation
+        "ADX Rejim": "#00E676",      # bright green - ADX regime
+        "Coin Gunluk": "#FF8A65",    # salmon - coin ban
+        "Limit Cikis": "#4DB6AC",    # teal - limit exit
+        "Tarayici": "#7E57C2",       # deep purple - scanner
+    }
+
+    def _section(self, parent, title: str) -> ctk.CTkFrame:
+        """Create a bordered group frame with colored title. Returns inner frame for fields."""
+        # Find matching color
+        color = "#7799BB"
+        for key, c in self._SECTION_COLORS.items():
+            if title.startswith(key):
+                color = c
+                break
+        # Outer bordered frame
+        outer = ctk.CTkFrame(parent, fg_color="#1a1a2e", border_width=1,
+                             border_color=color, corner_radius=8)
+        outer.pack(fill="x", padx=2, pady=(6, 2))
+        # Title bar
+        title_bar = ctk.CTkFrame(outer, fg_color=color, height=24, corner_radius=6)
+        title_bar.pack(fill="x", padx=2, pady=(2, 0))
+        title_bar.pack_propagate(False)
+        ctk.CTkLabel(title_bar, text=f"  {title}",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="#0a0a1a").pack(side="left", padx=2)
+        # Inner content frame
+        inner = ctk.CTkFrame(outer, fg_color="transparent")
+        inner.pack(fill="x", padx=4, pady=(4, 6))
+        return inner
 
     def _field(self, parent, key: str, label: str, default: str,
               tip: str = "", help_text: str = "") -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(row, text=f"{label}:", width=240, anchor="w").pack(side="left")
-        entry = ctk.CTkEntry(row, width=100)
-        entry.pack(side="left", padx=5)
+        row.pack(fill="x", padx=8, pady=1)
+        lbl = ctk.CTkLabel(row, text=f"{label}:", width=180, anchor="w",
+                           font=ctk.CTkFont(size=11))
+        lbl.pack(side="left")
+        # Tooltip on hover for the label
+        if tip:
+            lbl.bind("<Enter>", lambda e, t=tip: self._feedback.configure(
+                text=t, text_color="gray60"))
+            lbl.bind("<Leave>", lambda e: self._feedback.configure(text=""))
+        entry = ctk.CTkEntry(row, width=75, font=ctk.CTkFont(size=11))
+        entry.pack(side="left", padx=3)
         entry.insert(0, default)
         self._entries[key] = entry
         self._all_widgets.append((entry, "entry"))
         if help_text:
-            btn = ctk.CTkButton(row, text="?", width=24, height=24,
+            btn = ctk.CTkButton(row, text="?", width=22, height=22,
                                 fg_color="gray40", hover_color="gray50",
-                                font=ctk.CTkFont(size=11, weight="bold"),
+                                font=ctk.CTkFont(size=10, weight="bold"),
                                 command=lambda t=label, h=help_text: self._show_help(t, h))
-            btn.pack(side="left", padx=2)
-        if tip:
-            ctk.CTkLabel(row, text=tip, text_color="gray50",
-                         font=ctk.CTkFont(size=10)).pack(side="left", padx=5)
+            btn.pack(side="left", padx=1)
 
     def _checkbox(self, parent, key: str, label: str,
                   default: bool = True, help_text: str = "") -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=20, pady=2)
+        row.pack(fill="x", padx=8, pady=1)
         var = ctk.BooleanVar(value=default)
         cb = ctk.CTkCheckBox(row, text=label, variable=var)
         cb.pack(side="left")
@@ -1273,14 +1899,13 @@ class StrategySettingsPanel(ctk.CTkFrame):
 
     def _on_mode_change(self, mode: str) -> None:
         is_manual = mode == "manuel"
-        # Show/hide preset frame
+        # Show/hide preset and template frames based on mode
         if is_manual:
             self._preset_frame.pack_forget()
+            self._tmpl_frame.pack(side="right")
         else:
-            self._preset_frame.pack(fill="x", padx=10, pady=3,
-                                     after=self._feedback.master.winfo_children()[0])
-            # Re-pack it after the top frame
-            self._preset_frame.pack(fill="x", padx=10, pady=3, before=self._feedback)
+            self._preset_frame.pack(side="left")
+            # Templates also available in standard mode
 
         # Both modes: fields always editable (preset fills defaults, user can fine-tune)
         for widget, wtype in self._all_widgets:
@@ -1462,25 +2087,43 @@ class StrategySettingsPanel(ctk.CTkFrame):
             trail_act = float(self._entries["trailing_activate_fee_mult"].get() or 3.0)
             trail_dist = float(self._entries["trailing_distance_fee_mult"].get() or 2.0)
 
-            liq_dist = (1.0 / max_lev) * (liq_f / 100.0) * 100  # % price move to liq
-            fee_roi = 0.1 * max_lev  # fee as % of margin
+            fee_input = float(self._entries.get("fee_pct",
+                              type("", (), {"get": lambda s: "0.10"})()).get() or 0.10)
+            slip_input = float(self._entries.get("slippage_mult",
+                               type("", (), {"get": lambda s: "0.5"})()).get() or 0.5)
 
-            sl_price_pct = liq_dist * sl_pct / 100
-            sl_roi = sl_price_pct / 100 * max_lev * 100
+            liq_dist = (1.0 / max_lev) * (liq_f / 100.0) * 100  # % price move to liq
+            fee_pct_dec = fee_input / 100.0  # 0.10 -> 0.001
+            fee_roi = fee_pct_dec * max_lev * 100  # fee as % of margin
+            slip_roi = fee_roi * slip_input
+
+            # Fee-aware software SL
+            raw_sl_roi = liq_dist / 100 * sl_pct / 100 * max_lev * 100
+            net_sl_roi = max(raw_sl_roi - fee_roi - slip_roi, fee_roi)
+            sl_price_pct = net_sl_roi / (max_lev * 100) * 100  # back to % price
+            sl_roi = net_sl_roi
             em_price_pct = liq_dist * em_pct / 100
             tp_price_pct = liq_dist * tp_mult
             tp_roi = tp_price_pct / 100 * max_lev * 100
             trail_act_roi = fee_roi * trail_act
             trail_dist_roi = fee_roi * trail_dist
 
+            # Server SL (ATR-based)
+            srv_atr = float(self._entries.get("server_sl_atr_mult",
+                            type("", (), {"get": lambda s: "2.0"})()).get() or 2.0)
+
             theo_liq = (1.0 / max_lev) * 100
             lines = [
-                f"  {max_lev}x Kaldirac Hesaplamalari (liq_factor=%{liq_f}):",
+                f"  {max_lev}x Kaldirac (liq_factor=%{liq_f}, fee=%{fee_input}, slip=x{slip_input}):",
                 f"  Teorik liq:              %{theo_liq:.2f} geri gelme",
                 f"  Pratik liq:              %{liq_dist:.2f} fiyat hareketi",
-                f"  Fee (round-trip):        %{fee_roi:.1f} ROI (marjinin yuzde kaci)",
-                f"  Fee breakeven:           %{fee_roi/max_lev:.3f} fiyat hareketi",
-                f"  SL:                      %{sl_price_pct:.2f} fiyat = %{sl_roi:.0f} ROI kayip",
+                f"  Fee (round-trip):        %{fee_roi:.1f} ROI + Slip %{slip_roi:.1f} ROI = %{fee_roi+slip_roi:.1f} ROI",
+                f"  Fee breakeven:           %{fee_pct_dec*100:.3f} fiyat hareketi",
+                f"  --- a) Server SL ---",
+                f"  Server SL:               {srv_atr}x ATR (Binance STOP_MARKET)",
+                f"  --- b) Yazilim SL (fee-aware) ---",
+                f"  Yazilim SL:              %{sl_price_pct:.3f} fiyat = %{sl_roi:.0f} ROI kayip (fee+slip dusulmus)",
+                f"  --- c) Emergency ---",
                 f"  Emergency:               %{em_price_pct:.2f} fiyat = son savunma",
             ]
             if self._cb_vars.get("tp_enabled", ctk.BooleanVar(value=True)).get():
@@ -1574,10 +2217,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
         """Collect all current settings as a dict."""
         vals = {}
         for key, entry in self._entries.items():
-            entry.configure(state="normal")
             raw = entry.get().strip()
-            if self._mode_var.get() == "standard":
-                entry.configure(state="disabled")
             if not raw:
                 continue
             try:

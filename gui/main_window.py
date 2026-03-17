@@ -11,6 +11,7 @@ from gui.panels.settings_panel import SettingsPanel
 from gui.panels.scanner_panel import ScannerPanel
 from gui.panels.strategy_settings_panel import StrategySettingsPanel
 from gui.panels.indicator_analysis_panel import IndicatorAnalysisPanel
+from gui.panels.indicator_detail_panel import IndicatorDetailPanel
 from gui.panels.trade_report_panel import TradeReportPanel
 
 
@@ -43,6 +44,7 @@ class MainWindow(ctk.CTk):
         tab_strategy = self._tabview.add("Strateji")
         tab_strat_settings = self._tabview.add("Strateji Ayarlari")
         tab_analysis = self._tabview.add("Grafik Analiz")
+        tab_ind_detail = self._tabview.add("Indikator Detay")
         tab_report = self._tabview.add("Islem Raporu")
         tab_activity = self._tabview.add("Aktivite")
         tab_settings = self._tabview.add("Ayarlar")
@@ -54,6 +56,8 @@ class MainWindow(ctk.CTk):
         self._strategy_settings_panel = StrategySettingsPanel(tab_strat_settings, controller)
         self._analysis_panel = IndicatorAnalysisPanel(tab_analysis, controller)
         self._analysis_panel.pack(fill="both", expand=True)
+        self._ind_detail_panel = IndicatorDetailPanel(tab_ind_detail, controller)
+        self._ind_detail_panel.pack(fill="both", expand=True)
         self._report_panel = TradeReportPanel(tab_report, controller)
         self._activity_panel = ActivityPanel(tab_activity, controller)
         self._settings_panel = SettingsPanel(tab_settings, controller)

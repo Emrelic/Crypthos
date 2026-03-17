@@ -2,87 +2,120 @@ import customtkinter as ctk
 
 
 class StatusBar(ctk.CTkFrame):
-    """Top status bar: connection, pair, price, kill switch."""
+    """Top status bar: connection + scanner controls + kill switch.
+    All scanner controls (start/stop, scan count, candidate) live here
+    to maximize table space in the scanner panel."""
 
     def __init__(self, parent, controller):
-        super().__init__(parent, height=40)
+        super().__init__(parent, height=36)
         self.controller = controller
         self.pack_propagate(False)
 
-        # Connection indicator + reconnect button
-        self._conn_label = ctk.CTkLabel(self, text="  Disconnected", width=130,
-                                        text_color="red", anchor="w")
-        self._conn_label.pack(side="left", padx=5)
+        # ── LEFT: Connection ──
+        self._conn_label = ctk.CTkLabel(self, text="  Disconnected", width=110,
+                                        text_color="red", anchor="w",
+                                        font=ctk.CTkFont(size=12))
+        self._conn_label.pack(side="left", padx=3)
 
         self._reconnect_btn = ctk.CTkButton(
-            self, text="Baglan", width=60, height=24,
+            self, text="Baglan", width=55, height=22,
             fg_color="gray30", hover_color="gray40",
-            command=self._on_reconnect,
-        )
+            font=ctk.CTkFont(size=11),
+            command=self._on_reconnect)
         self._reconnect_btn.pack(side="left", padx=2)
 
         # WS indicator
-        self._ws_label = ctk.CTkLabel(self, text="WS: --", width=80,
-                                      text_color="gray", anchor="w")
-        self._ws_label.pack(side="left", padx=5)
+        self._ws_label = ctk.CTkLabel(self, text="WS:--", width=50,
+                                      text_color="gray", anchor="w",
+                                      font=ctk.CTkFont(size=11))
+        self._ws_label.pack(side="left", padx=3)
 
-        # Active pair
-        self._pair_label = ctk.CTkLabel(self, text="DOGEUSDT", width=100,
-                                        font=ctk.CTkFont(weight="bold"))
-        self._pair_label.pack(side="left", padx=10)
+        # Separator
+        ctk.CTkLabel(self, text="|", text_color="#555555", width=8).pack(side="left")
 
-        # Price
-        self._price_label = ctk.CTkLabel(self, text="$0.00000", width=120,
-                                         font=ctk.CTkFont(size=14, weight="bold"))
-        self._price_label.pack(side="left", padx=5)
+        # ── CENTER: Scanner controls ──
+        self._state_lbl = ctk.CTkLabel(
+            self, text="IDLE", width=70,
+            font=ctk.CTkFont(size=13, weight="bold"), text_color="gray")
+        self._state_lbl.pack(side="left", padx=(5, 3))
 
-        # Price change
-        self._change_label = ctk.CTkLabel(self, text="0.00%", width=80)
-        self._change_label.pack(side="left", padx=5)
+        self._start_btn = ctk.CTkButton(
+            self, text="BASLAT", fg_color="#00C853", hover_color="#00A846",
+            width=70, height=24, font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_start)
+        self._start_btn.pack(side="left", padx=2)
 
-        # Strategy status
-        self._strategy_label = ctk.CTkLabel(self, text="Strategy: OFF", width=120,
-                                            text_color="gray")
-        self._strategy_label.pack(side="left", padx=10)
+        self._stop_btn = ctk.CTkButton(
+            self, text="DURDUR", fg_color="#FF1744", hover_color="#D50000",
+            width=70, height=24, font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_stop)
+        self._stop_btn.pack(side="left", padx=2)
 
-        # Kill switch button
+        ctk.CTkLabel(self, text="|", text_color="#555555", width=8).pack(side="left")
+
+        self._scan_count_lbl = ctk.CTkLabel(self, text="Tarama: 0", width=75,
+                                             font=ctk.CTkFont(size=12))
+        self._scan_count_lbl.pack(side="left", padx=4)
+
+        self._candidate_lbl = ctk.CTkLabel(self, text="Aday: --", width=140,
+                                            font=ctk.CTkFont(size=12, weight="bold"))
+        self._candidate_lbl.pack(side="left", padx=4)
+
+        self._trade_lbl = ctk.CTkLabel(self, text="Son: --", width=200,
+                                        font=ctk.CTkFont(size=11))
+        self._trade_lbl.pack(side="left", padx=4)
+
+        # Strategy status (compact)
+        self._strategy_label = ctk.CTkLabel(self, text="Str:OFF", width=55,
+                                            text_color="gray",
+                                            font=ctk.CTkFont(size=11))
+        self._strategy_label.pack(side="left", padx=3)
+
+        # ── RIGHT: Kill switch ──
         self._kill_btn = ctk.CTkButton(
-            self, text="KILL SWITCH", width=110, height=28,
+            self, text="KILL", width=60, height=24,
             fg_color="darkred", hover_color="red",
-            command=self._on_kill,
-        )
-        self._kill_btn.pack(side="right", padx=10)
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_kill)
+        self._kill_btn.pack(side="right", padx=5)
+
+    # ── Scanner state colors ──
+    STATE_COLORS = {
+        "IDLE": "gray", "SCANNING": "#2196F3", "BUYING": "#FF9800",
+        "HOLDING": "#00C853", "SELLING": "#FF1744", "COOLDOWN": "#9E9E9E",
+    }
 
     def _on_reconnect(self) -> None:
-        """Force reconnect — API test or Binance Desktop."""
         self._conn_label.configure(text="  Baglaniyor...", text_color="yellow")
         self.update()
         use_api = getattr(self.controller, 'config', None)
         api_mode = use_api.get("trading.use_api", False) if use_api else False
         if api_mode:
-            # API mode: test API connection
             try:
-                from automation.api_order_executor import ApiOrderExecutor
                 scanner = self.controller.scanner
                 if scanner and hasattr(scanner, '_order_executor'):
                     executor = scanner._order_executor
                     if hasattr(executor, 'test_connection') and executor.test_connection():
-                        self._conn_label.configure(
-                            text="  API Connected", text_color="green")
+                        self._conn_label.configure(text="  API Connected", text_color="green")
                     else:
                         self._conn_label.configure(text="  API BASARISIZ", text_color="red")
                 else:
-                    self._conn_label.configure(text="  API not configured", text_color="red")
+                    self._conn_label.configure(text="  API yok", text_color="red")
             except Exception:
                 self._conn_label.configure(text="  API BASARISIZ", text_color="red")
         elif self.controller.binance_app:
             success = self.controller.binance_app.refresh_connection()
             if success:
                 count = len(self.controller.binance_app._descendants)
-                self._conn_label.configure(
-                    text=f"  Connected ({count})", text_color="green")
+                self._conn_label.configure(text=f"  OK ({count})", text_color="green")
             else:
                 self._conn_label.configure(text="  BASARISIZ", text_color="red")
+
+    def _on_start(self) -> None:
+        self.controller.start_scanner()
+
+    def _on_stop(self) -> None:
+        self.controller.stop_scanner()
 
     def _on_kill(self) -> None:
         self.controller.activate_kill_switch()
@@ -92,14 +125,7 @@ class StatusBar(ctk.CTkFrame):
                     binance_connected: bool = False, ws_connected: bool = False,
                     symbol: str = "", strategy_running: bool = False,
                     killed: bool = False) -> None:
-        if symbol:
-            self._pair_label.configure(text=symbol)
-
-        self._price_label.configure(text=f"${price:.6f}" if price < 1 else f"${price:.2f}")
-
-        color = "green" if change_pct >= 0 else "red"
-        self._change_label.configure(text=f"{change_pct:+.2f}%", text_color=color)
-
+        # Connection
         if binance_connected:
             use_api = getattr(self.controller, 'config', None)
             api_mode = use_api.get("trading.use_api", False) if use_api else False
@@ -108,15 +134,30 @@ class StatusBar(ctk.CTkFrame):
         else:
             self._conn_label.configure(text="  Disconnected", text_color="red")
 
-        ws_text = "WS: ON" if ws_connected else "WS: OFF"
+        # WS
+        ws_text = "WS:ON" if ws_connected else "WS:--"
         ws_color = "green" if ws_connected else "red"
         self._ws_label.configure(text=ws_text, text_color=ws_color)
 
-        strat_text = "Strategy: ON" if strategy_running else "Strategy: OFF"
+        # Strategy
+        strat_text = "Str:ON" if strategy_running else "Str:OFF"
         strat_color = "green" if strategy_running else "gray"
         self._strategy_label.configure(text=strat_text, text_color=strat_color)
 
+        # Kill
         if killed:
             self._kill_btn.configure(fg_color="red", text="KILLED!")
         else:
-            self._kill_btn.configure(fg_color="darkred", text="KILL SWITCH")
+            self._kill_btn.configure(fg_color="darkred", text="KILL")
+
+    def update_scanner_state(self, state: str, scan_count: int = 0,
+                              candidate_text: str = "", candidate_color: str = "gray",
+                              trade_text: str = "", trade_color: str = "gray") -> None:
+        """Called by scanner panel to update scanner-specific status bar fields."""
+        color = self.STATE_COLORS.get(state, "gray")
+        self._state_lbl.configure(text=state, text_color=color)
+        self._scan_count_lbl.configure(text=f"Tarama: {scan_count}")
+        if candidate_text:
+            self._candidate_lbl.configure(text=candidate_text, text_color=candidate_color)
+        if trade_text:
+            self._trade_lbl.configure(text=trade_text, text_color=trade_color)

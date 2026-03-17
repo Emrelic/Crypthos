@@ -53,11 +53,12 @@ class ApiOrderExecutor:
                     api_type = "LIMIT"
 
                 # 5. Place main order
+                rounded_size = round(size, qty_precision) if size else size
                 order_resp = self._rest.place_order(
                     symbol=symbol,
                     side=api_side,
                     order_type=api_type,
-                    quantity=size,
+                    quantity=rounded_size,
                     price=price if api_type == "LIMIT" else None,
                     reduce_only=reduce_only,
                 )
@@ -78,7 +79,7 @@ class ApiOrderExecutor:
                 if executed_qty == 0:
                     executed_qty = size or 0
 
-                logger.info(f"Order placed: {api_side} {size} {symbol} "
+                logger.info(f"Order placed: {api_side} {rounded_size} {symbol} "
                             f"id={order_id} status={status} "
                             f"avgPrice={avg_price} executedQty={executed_qty}")
 
@@ -90,9 +91,25 @@ class ApiOrderExecutor:
 
                 # 6. Place TP/SL orders (server-side, Binance manages them)
                 if not reduce_only and avg_price > 0:
-                    self._place_tp_sl(symbol, api_side, executed_qty,
-                                      avg_price, tp_percent, sl_percent,
-                                      leverage or 1)
+                    sl_ok = self._place_tp_sl(symbol, api_side, executed_qty,
+                                              avg_price, tp_percent, sl_percent,
+                                              leverage or 1)
+                    if not sl_ok:
+                        logger.error(f"SL failed for {symbol} — closing position immediately!")
+                        try:
+                            emergency_side = "SELL" if api_side == "BUY" else "BUY"
+                            self._rest.place_order(
+                                symbol=symbol, side=emergency_side,
+                                order_type="MARKET",
+                                close_position=True,
+                            )
+                            logger.info(f"Emergency close done for {symbol}")
+                        except Exception as close_err:
+                            logger.critical(f"EMERGENCY CLOSE ALSO FAILED for {symbol}: {close_err} "
+                                            f"— POSITION IS UNPROTECTED, MANUAL ACTION REQUIRED!")
+                        self._event_bus.publish(EventType.ORDER_FAILED, {
+                            "symbol": symbol, "reason": "SL placement failed, position closed"})
+                        return False
 
                 self._event_bus.publish(EventType.ORDER_PLACED, {
                     "symbol": symbol, "side": api_side,
@@ -108,33 +125,43 @@ class ApiOrderExecutor:
                 return False
 
     def _get_price_precision(self, symbol: str) -> int:
-        """Get price precision from tickSize (more accurate than pricePrecision).
-        tickSize=0.0000100 → 5 decimals, tickSize=0.01 → 2 decimals."""
+        """Get price precision from tickSize using Decimal for accuracy.
+        tickSize=0.0000100 → 7 decimals, tickSize=0.01 → 2 decimals.
+
+        BUG FIX: Old code used rstrip('0') which turned '0.0000100' into
+        '0.00001' (5 decimals) instead of 7. This caused SL orders to be
+        rounded to wrong precision and rejected by Binance with -2021."""
         try:
             info = self._rest.get_exchange_info(symbol)
             if info:
                 filters = {f["filterType"]: f for f in info.get("filters", [])}
                 tick_size = filters.get("PRICE_FILTER", {}).get("tickSize", "")
                 if tick_size:
-                    # Count decimals from tickSize: "0.0000100" → strip trailing 0s → "0.00001" → 5
-                    tick_str = str(tick_size).rstrip("0")
-                    if "." in tick_str:
-                        return len(tick_str.split(".")[1])
+                    from decimal import Decimal
+                    # Decimal preserves trailing zeros: Decimal("0.0000100") → 7 places
+                    d = Decimal(str(tick_size))
+                    # -d.as_tuple().exponent gives number of decimal places
+                    precision = -d.as_tuple().exponent
+                    if precision >= 0:
+                        return precision
+                # Fallback to pricePrecision from exchangeInfo
                 return info.get("pricePrecision", 4)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Price precision lookup failed for {symbol}: {e}")
         return 4
 
     def _place_tp_sl(self, symbol: str, entry_side: str,
                      qty: float, entry_price: float,
                      tp_roi_pct: float, sl_roi_pct: float,
-                     leverage: int):
+                     leverage: int) -> bool:
         """Place TP and SL as separate server-side orders via Algo API.
         tp_roi_pct / sl_roi_pct are ROI% on margin (not price %).
-        Convert to price: price_move_pct = roi_pct / leverage."""
+        Convert to price: price_move_pct = roi_pct / leverage.
+        Returns False if SL placement fails (critical)."""
         close_side = "SELL" if entry_side == "BUY" else "BUY"
         is_long = entry_side == "BUY"
         pp = self._get_price_precision(symbol)
+        sl_ok = True
 
         # SL first (more critical)
         if sl_roi_pct and sl_roi_pct > 0:
@@ -153,7 +180,8 @@ class ApiOrderExecutor:
                 logger.info(f"SL order: {symbol} @ {sl_price} "
                             f"(ROI -{sl_roi_pct:.1f}%)")
             except Exception as e:
-                logger.warning(f"SL order failed for {symbol}: {e}")
+                logger.error(f"SL order FAILED for {symbol}: {e} — position is UNPROTECTED!")
+                sl_ok = False
 
         # TP (safety net, trailing handles real exits)
         if tp_roi_pct and tp_roi_pct > 0:
@@ -173,6 +201,8 @@ class ApiOrderExecutor:
                             f"(ROI {tp_roi_pct:.1f}%)")
             except Exception as e:
                 logger.warning(f"TP order failed for {symbol}: {e}")
+
+        return sl_ok
 
     def update_tp_sl(self, symbol: str, entry_side: str, qty: float,
                      entry_price: float, leverage: int,

@@ -191,9 +191,47 @@ class SettingsPanel(ctk.CTkFrame):
         self._field(scroll, "rsi_period", "RSI Periyodu", str(ind.get("rsi_period", 14)))
         self._field(scroll, "ma_fast", "MA Hizli", str(ind.get("ma_fast", 20)))
         self._field(scroll, "ma_slow", "MA Yavas", str(ind.get("ma_slow", 200)))
+
+        # ── SMA Parametreleri ──
+        self._section_sub(scroll, "SMA Parametreleri")
+        self._field(scroll, "sma_cross_lookback", "SMA Cross Lookback (mum)",
+                    str(ind.get("sma_cross_lookback", 3)))
+        ctk.CTkLabel(scroll,
+                     text="Fiyat SMA200'u son N mum icinde kestiyse taze sinyal (1.5p), eskiyse 0.7p",
+                     text_color="gray60", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=30, pady=(0, 4))
+
+        # ── EMA Parametreleri ──
+        self._section_sub(scroll, "EMA Parametreleri")
+        self._field(scroll, "ema_cross_lookback", "EMA Cross Lookback (mum)",
+                    str(ind.get("ema_cross_lookback", 3)))
+        ctk.CTkLabel(scroll,
+                     text="EMA20/EMA50 son N mum icinde kestiyse taze sinyal (1.0p), eskiyse 0.4p",
+                     text_color="gray60", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=30, pady=(0, 4))
+
+        # ── ADX / DI Parametreleri ──
+        self._section_sub(scroll, "ADX / DI Parametreleri")
+        self._field(scroll, "adx_di_momentum_lookback", "DI Momentum Lookback (mum)",
+                    str(ind.get("adx_di_momentum_lookback", 3)))
+        self._field(scroll, "adx_di_momentum_threshold", "DI Momentum Esik Degeri",
+                    str(ind.get("adx_di_momentum_threshold", 5)))
+        ctk.CTkLabel(scroll,
+                     text="ADX dusukken DI farki bu esigi asarsa erken trend sinyali verir (0.5p)",
+                     text_color="gray60", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=30, pady=(0, 4))
+
+        # ── MACD Parametreleri ──
+        self._section_sub(scroll, "MACD Parametreleri")
         self._field(scroll, "macd_fast", "MACD Hizli", str(ind.get("macd_fast", 12)))
         self._field(scroll, "macd_slow", "MACD Yavas", str(ind.get("macd_slow", 26)))
         self._field(scroll, "macd_signal", "MACD Sinyal", str(ind.get("macd_signal", 9)))
+        self._field(scroll, "macd_cross_lookback", "MACD Cross Lookback (mum)",
+                    str(ind.get("macd_cross_lookback", 3)))
+        ctk.CTkLabel(scroll,
+                     text="Son N mum icinde cross olduysa taze sinyal sayilir (1=sadece son mum)",
+                     text_color="gray60", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=30, pady=(0, 4))
 
         # Connection
         self._section(scroll, "Binance Baglantisi")
@@ -291,8 +329,13 @@ class SettingsPanel(ctk.CTkFrame):
 
         # Position sizing mode
         c.set("leverage.position_sizing", self._sizing_mode_var.get())
-        c.set("leverage.portfolio_percent",
-              int(self._entries["portfolio_pct"].get() or 100))
+        portfolio_pct = int(self._entries["portfolio_pct"].get() or 100)
+        c.set("leverage.portfolio_percent", portfolio_pct)
+        # If user sets percent here, disable divider mode so this value takes effect
+        # (portfolio_divider > 0 overrides portfolio_percent in scanner)
+        if c.get("strategy.portfolio_divider", 0) > 0:
+            c.set("strategy.portfolio_divider", 0)
+            c.set("strategy.portfolio_percent", portfolio_pct)
         c.set("leverage.margin_usdt",
               float(self._entries["lev_margin"].get() or 1.0))
         c.set("leverage.max_position_usdt",
@@ -324,6 +367,11 @@ class SettingsPanel(ctk.CTkFrame):
         c.set("indicators.macd_fast", int(self._entries["macd_fast"].get() or 12))
         c.set("indicators.macd_slow", int(self._entries["macd_slow"].get() or 26))
         c.set("indicators.macd_signal", int(self._entries["macd_signal"].get() or 9))
+        c.set("indicators.sma_cross_lookback", int(self._entries["sma_cross_lookback"].get() or 3))
+        c.set("indicators.ema_cross_lookback", int(self._entries["ema_cross_lookback"].get() or 3))
+        c.set("indicators.adx_di_momentum_lookback", int(self._entries["adx_di_momentum_lookback"].get() or 3))
+        c.set("indicators.adx_di_momentum_threshold", int(self._entries["adx_di_momentum_threshold"].get() or 5))
+        c.set("indicators.macd_cross_lookback", int(self._entries["macd_cross_lookback"].get() or 3))
 
         c.save()
 

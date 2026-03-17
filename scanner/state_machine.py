@@ -12,6 +12,7 @@ from market.binance_rest import BinanceRestClient
 from scanner.symbol_universe import SymbolUniverse
 from scanner.batch_fetcher import BatchKlineFetcher
 from scanner.scanner_scorer import ScannerScorer, ScanResult
+from scanner.scanner_scorer_mr import MRScannerScorer, MRScanResult
 from scanner.position_manager import PositionManager
 from scanner.timeframe_selector import TimeframeSelector
 from indicators.indicator_engine import IndicatorEngine
@@ -56,6 +57,7 @@ class ScannerStateMachine:
             requests_per_second=config.get("scanner.requests_per_second", 3.5),
         )
         self._scorer = ScannerScorer(config)
+        self._mr_scorer = MRScannerScorer(config)
         self._position_mgr = PositionManager(config, event_bus)
         self._tf_selector = TimeframeSelector(rest_client, config=config)
         self._ob_analyzer = OrderBookAnalyzer()
@@ -63,7 +65,7 @@ class ScannerStateMachine:
 
         # Holding-phase analysis (separate engine for held symbols)
         self._hold_engine = IndicatorEngine(config)
-        self._hold_confluence = ConfluenceScorer(threshold=4.0)
+        self._hold_confluence = ConfluenceScorer(threshold=4.0, config=config)
         self._hold_regime = MarketRegimeDetector()
         self._hold_divergence = DivergenceDetector(lookback=20)
 
@@ -77,6 +79,7 @@ class ScannerStateMachine:
 
         # Scan results (for GUI)
         self._last_scan_results: list[ScanResult] = []
+        self._last_mr_results: list[MRScanResult] = []  # MR pool results
         self._last_candidate: ScanResult = None
         self._scan_count = 0
         self._last_trade_result: dict = {}
@@ -113,6 +116,10 @@ class ScannerStateMachine:
 
         # Per-coin daily loss ban: symbol -> [loss_timestamp, ...]
         self._coin_loss_history: dict[str, list[float]] = {}
+
+        # Server order verification: last check time
+        self._last_order_verify_time: float = 0.0
+        self._order_verify_interval: float = 120.0  # check every 120 seconds
 
     # ──── Setters ────
 
@@ -289,6 +296,49 @@ class ScannerStateMachine:
 
         self._last_scan_results = results
 
+        # === MEAN REVERSION POOL ===
+        mr_enabled = self._config.get("strategy.mean_reversion_enabled", False)
+        mr_results = []
+        if mr_enabled:
+            mr_max_adx = self._config.get("strategy.mr_max_adx", 18)
+            gray_low = mr_max_adx      # 18
+            gray_high = self._config.get("strategy.adx_regime_strong_trend", 25)
+
+            # Separate coins into pools based on ADX from trend scoring
+            mr_symbols = {}  # symbol -> source ("R" or "G->R")
+            for r in results:
+                adx = r.adx if hasattr(r, 'adx') else 0
+                if adx < gray_low:
+                    # Net range: ADX < 18
+                    mr_symbols[r.symbol] = "R"
+                elif adx < gray_high:
+                    # Gray zone: ADX 18-25 — classify via voting
+                    indicators = r.indicator_values if hasattr(r, 'indicator_values') else {}
+                    zone = self._mr_scorer.classify_gray_zone(indicators)
+                    if zone == "RANGE":
+                        mr_symbols[r.symbol] = "G->R"
+
+            if mr_symbols:
+                mr_klines = {s: klines_map[s] for s in mr_symbols if s in klines_map}
+                mr_source_map = {s: src for s, src in mr_symbols.items() if s in mr_klines}
+                mr_results = self._mr_scorer.score_batch(
+                    mr_klines, market_ctx, mr_source_map)
+
+                # Enrich with leverage and timeframe
+                if dynamic_tf:
+                    for r in mr_results:
+                        coin_info = self._tf_selector.get_coin_info(r.symbol)
+                        if coin_info:
+                            r.leverage = coin_info.max_leverage
+                            r.timeframe = coin_info.optimal_tf
+                        else:
+                            r.timeframe = symbol_intervals.get(r.symbol, default_interval)
+
+                logger.info(f"MR pool: {len(mr_symbols)} coins, "
+                            f"{sum(1 for r in mr_results if r.eligible)} eligible")
+
+        self._last_mr_results = mr_results
+
         # 5. Find best eligible candidate
         now = time.time()
         self._failed_symbols = {
@@ -348,12 +398,46 @@ class ScannerStateMachine:
                         continue
                 candidates.append(r)
 
+        # === MR CANDIDATES ===
+        mr_candidates = []
+        if mr_enabled and mr_results:
+            mr_eligible = [r for r in mr_results if r.eligible]
+            mr_min_score = self._config.get("strategy.mr_min_score", 65)
+            mr_max_pos = self._config.get("strategy.mr_max_positions", 2)
+
+            for r in mr_eligible:
+                if abs(r.score) < mr_min_score:
+                    continue
+                if r.symbol in self._failed_symbols:
+                    continue
+                if r.symbol in self._loss_cooldown_symbols:
+                    continue
+                if self._position_mgr.is_holding(r.symbol):
+                    continue
+                if r.symbol in self._pending_limits:
+                    continue
+                coin_ok, coin_reason = self._check_coin_daily_ban(r.symbol)
+                if not coin_ok:
+                    continue
+                # Check MR slot limit
+                if self._position_mgr.get_mr_position_count() >= mr_max_pos:
+                    break
+                mr_candidates.append(r)
+
+            if mr_eligible:
+                logger.info(f"  MR eligible: {len(mr_eligible)} symbols, "
+                            f"candidates: {len(mr_candidates)}, "
+                            f"top={mr_eligible[0].symbol if mr_eligible else '-'} "
+                            f"score={mr_eligible[0].score:+.1f}" if mr_eligible else "")
+
         # Publish scan results for GUI
         self._event_bus.publish(EventType.SCANNER_UPDATE, {
             "scan_count": self._scan_count,
             "total_symbols": len(symbols),
             "scored": len(results),
             "eligible": len(eligible),
+            "mr_scored": len(mr_results),
+            "mr_eligible": len([r for r in mr_results if r.eligible]) if mr_results else 0,
             "positions": self._position_mgr.position_count,
             "max_positions": self._position_mgr.max_positions,
             "top_5": [
@@ -363,6 +447,7 @@ class ScannerStateMachine:
                 for r in results[:5]
             ],
             "candidate": candidates[0].symbol if candidates else None,
+            "mr_candidate": mr_candidates[0].symbol if mr_candidates else None,
         })
 
         close_only = self._config.get("strategy.close_only", False)
@@ -425,6 +510,31 @@ class ScannerStateMachine:
                 else:
                     continue  # try next candidate (might be coin-specific issue)
 
+            # === MR BUYING (after trend, if capacity remains) ===
+            if mr_candidates and self._position_mgr.has_capacity:
+                mr_max_pos = self._config.get("strategy.mr_max_positions", 2)
+                for mr_cand in mr_candidates:
+                    total_occupied = self._position_mgr.position_count + len(self._pending_limits)
+                    if total_occupied >= self._position_mgr.max_positions:
+                        break
+                    if self._position_mgr.get_mr_position_count() >= mr_max_pos:
+                        break
+                    if not self._check_trade_frequency():
+                        break
+
+                    dir_ok, dir_reason = self._check_direction_balance(mr_cand.direction)
+                    if not dir_ok:
+                        logger.info(f"Skipping MR {mr_cand.symbol} ({dir_reason})")
+                        continue
+
+                    logger.info(f"[MR] Candidate: {mr_cand.symbol} "
+                                f"score={mr_cand.score:+.1f} dir={mr_cand.direction} "
+                                f"BB={mr_cand.bb_percent_b:.0%} RSI={mr_cand.rsi:.0f} "
+                                f"Vol={mr_cand.volume_ratio:.1f}x src={mr_cand.source}")
+                    self._last_candidate = mr_cand
+                    if self._do_mr_buying_inline(mr_cand):
+                        bought_any = True
+
             # Short wait then scan again if still have capacity
             if self._position_mgr.has_capacity and bought_any:
                 self._wait(5)
@@ -432,6 +542,42 @@ class ScannerStateMachine:
                 scan_interval = self._config.get("strategy.scan_interval_seconds", 30)
                 self._wait(scan_interval)
         else:
+            # Also try MR buying even without trend candidates
+            if mr_candidates and self._position_mgr.has_capacity:
+                # Check balance
+                real_balance = 0.0
+                if self._order_executor and hasattr(self._order_executor, "get_balance"):
+                    try:
+                        real_balance = self._order_executor.get_balance()
+                    except Exception:
+                        pass
+                if real_balance <= 0 or real_balance >= 0.30:
+                    mr_max_pos = self._config.get("strategy.mr_max_positions", 2)
+                    bought_any = False
+                    for mr_cand in mr_candidates:
+                        total_occupied = self._position_mgr.position_count + len(self._pending_limits)
+                        if total_occupied >= self._position_mgr.max_positions:
+                            break
+                        if self._position_mgr.get_mr_position_count() >= mr_max_pos:
+                            break
+                        if not self._check_trade_frequency():
+                            break
+
+                        dir_ok, dir_reason = self._check_direction_balance(mr_cand.direction)
+                        if not dir_ok:
+                            continue
+
+                        logger.info(f"[MR] Candidate: {mr_cand.symbol} "
+                                    f"score={mr_cand.score:+.1f} dir={mr_cand.direction} "
+                                    f"BB={mr_cand.bb_percent_b:.0%} RSI={mr_cand.rsi:.0f}")
+                        self._last_candidate = mr_cand
+                        if self._do_mr_buying_inline(mr_cand):
+                            bought_any = True
+
+                    if bought_any:
+                        self._wait(5)
+                        return
+
             if not self._position_mgr.has_capacity:
                 logger.info(f"Max positions reached ({self._position_mgr.position_count}/"
                             f"{self._position_mgr.max_positions}). Monitoring only.")
@@ -617,7 +763,7 @@ class ScannerStateMachine:
         """Fetch upper-timeframe indicators for top 5 results.
         Populates result.mtf_data = {tf: {indicators, confluence, signal}} for each."""
         mtf_engine = IndicatorEngine(self._config)
-        mtf_confluence = ConfluenceScorer(threshold=4.0)
+        mtf_confluence = ConfluenceScorer(threshold=4.0, config=self._config)
 
         for r in results[:5]:
             base_tf = getattr(r, 'timeframe', '1m')
@@ -785,19 +931,25 @@ class ScannerStateMachine:
             self._config.get("strategy", {}).get("dynamic_timeframe", True) else \
             self._config.get("indicators.kline_interval", "1m")
 
-        regime_info = candidate.regime or {}
+        regime_info = getattr(candidate, 'regime', {}) or {}
+        entry_mode = info.get("entry_mode", "TREND")
+        mr_tp = info.get("mr_tp_price", 0.0)
+        conf_score_val = (candidate.confluence.get("score", 0)
+                          if hasattr(candidate.confluence, 'get') else 0)
         self._position_mgr.open_position(
             symbol, info["side"], fill_price, info["size"], info["atr"],
             leverage=info["leverage"],
             margin_usdt=info["margin_usdt"],
             timeframe=pos_tf,
             entry_score=candidate.score,
-            entry_confluence=candidate.confluence.get("score", 0),
+            entry_confluence=conf_score_val,
             entry_adx=candidate.adx,
             entry_rsi=candidate.rsi,
-            entry_regime=regime_info.get("regime", ""),
-            entry_regime_confidence=regime_info.get("confidence", 0),
-            entry_bb_width=regime_info.get("bb_width", 0),
+            entry_regime=regime_info.get("regime", "") if hasattr(regime_info, 'get') else "",
+            entry_regime_confidence=regime_info.get("confidence", 0) if hasattr(regime_info, 'get') else 0,
+            entry_bb_width=regime_info.get("bb_width", 0) if hasattr(regime_info, 'get') else 0,
+            entry_mode=entry_mode,
+            mr_tp_price=mr_tp,
         )
 
         if self._risk_manager:
@@ -844,47 +996,97 @@ class ScannerStateMachine:
         except Exception as e:
             logger.warning(f"Cancel limit order failed for {symbol}: {e}")
 
-        # Market fallback: if signal still valid, enter with market order
+        # Market fallback: if FRESH signal still valid AND price hasn't drifted too far
         strat = self._config.get("strategy", {})
         fallback_enabled = strat.get("market_fallback_on_limit_timeout", True)
 
         if fallback_enabled and self._order_executor:
             candidate = info.get("candidate")
-            if candidate and candidate.eligible and abs(candidate.score) >= strat.get("min_buy_score", 70):
-                logger.info(f"Limit expired but signal still strong ({candidate.score:+.1f}), "
-                            f"falling back to MARKET order: {symbol}")
+            if not candidate:
+                logger.info(f"Market fallback skipped for {symbol}: no candidate info")
+            else:
+                # --- 1) Fresh signal check: recalculate score from live klines ---
+                fresh_score = None
                 try:
-                    success = self._order_executor.execute_order(
-                        symbol=symbol, side=info["side"],
-                        order_type=OrderType.MARKET,
-                        size=info["size"], tp_percent=0, sl_percent=0,
-                        leverage=info.get("leverage", 1),
-                        qty_precision=info.get("qty_precision", 3),
-                        ensure_isolated=(info.get("lev_enabled", False) and
-                                         self._config.get("leverage.mode", "isolated")
-                                         == "isolated"),
-                    )
-                    if success:
-                        # Re-use the filled handler logic to open position tracking
-                        # Put info back temporarily for _on_limit_filled to process
-                        info["market_fallback"] = True
-                        self._pending_limits[symbol] = info
-                        self._on_limit_filled(symbol)
-
-                        if self._order_logger:
-                            self._order_logger.log_order(
-                                symbol=symbol, side=info["side"].value,
-                                order_type="Market",
-                                price=candidate.price, size=info["size"],
-                                notional_usdt=info["size"] * candidate.price,
-                                status="filled",
-                                trigger_source="limit_market_fallback",
-                            )
-                        return  # Successfully fell back to market
-                    else:
-                        logger.warning(f"Market fallback failed for {symbol}")
+                    tf = info.get("timeframe",
+                                  self._config.get("indicators.kline_interval", "5m"))
+                    klines = self._rest.get_klines(symbol, tf, limit=200)
+                    if klines is not None and not klines.empty:
+                        result = self._scorer.score_symbol(symbol, klines)
+                        fresh_score = result.confluence.get("score", 0)
                 except Exception as e:
-                    logger.error(f"Market fallback error for {symbol}: {e}")
+                    logger.warning(f"Market fallback fresh signal check failed for {symbol}: {e}")
+
+                min_score = strat.get("min_buy_score", 70)
+                min_conf = strat.get("min_confluence", 4.0)
+
+                if fresh_score is None:
+                    logger.info(f"Market fallback skipped for {symbol}: "
+                                f"could not compute fresh signal")
+                elif info["direction"] == "LONG" and fresh_score < min_conf:
+                    logger.info(f"Market fallback skipped for {symbol}: "
+                                f"fresh confluence too weak for LONG "
+                                f"(conf={fresh_score:.1f} < {min_conf:.0f})")
+                elif info["direction"] == "SHORT" and fresh_score > -min_conf:
+                    logger.info(f"Market fallback skipped for {symbol}: "
+                                f"fresh confluence too weak for SHORT "
+                                f"(conf={fresh_score:.1f} > -{min_conf:.0f})")
+                else:
+                    # --- 2) Price drift check: don't market-enter if price moved > N×ATR ---
+                    max_drift_atr = strat.get("market_fallback_max_drift_atr", 1.5)
+                    atr = info.get("atr", 0)
+                    limit_price = info["limit_price"]
+                    try:
+                        ticker = self._rest.get_ticker_price(symbol)
+                        current_price = float(ticker.get("price", limit_price))
+                    except Exception:
+                        current_price = limit_price
+
+                    drift = abs(current_price - limit_price)
+                    max_drift = atr * max_drift_atr if atr > 0 else float("inf")
+
+                    if drift > max_drift:
+                        logger.info(
+                            f"Market fallback skipped for {symbol}: "
+                            f"price drifted too far from limit "
+                            f"(drift={drift:.6f} > {max_drift:.6f}, "
+                            f"{max_drift_atr:.1f}×ATR)")
+                    else:
+                        logger.info(
+                            f"Limit expired, fresh signal valid "
+                            f"(conf={fresh_score:.1f}) and price drift OK "
+                            f"(drift={drift:.6f} <= {max_drift:.6f}), "
+                            f"falling back to MARKET: {symbol}")
+                        try:
+                            success = self._order_executor.execute_order(
+                                symbol=symbol, side=info["side"],
+                                order_type=OrderType.MARKET,
+                                size=info["size"], tp_percent=0, sl_percent=0,
+                                leverage=info.get("leverage", 1),
+                                qty_precision=info.get("qty_precision", 3),
+                                ensure_isolated=(info.get("lev_enabled", False) and
+                                                 self._config.get("leverage.mode", "isolated")
+                                                 == "isolated"),
+                            )
+                            if success:
+                                info["market_fallback"] = True
+                                self._pending_limits[symbol] = info
+                                self._on_limit_filled(symbol)
+
+                                if self._order_logger:
+                                    self._order_logger.log_order(
+                                        symbol=symbol, side=info["side"].value,
+                                        order_type="Market",
+                                        price=current_price, size=info["size"],
+                                        notional_usdt=info["size"] * current_price,
+                                        status="filled",
+                                        trigger_source="limit_market_fallback",
+                                    )
+                                return  # Successfully fell back to market
+                            else:
+                                logger.warning(f"Market fallback failed for {symbol}")
+                        except Exception as e:
+                            logger.error(f"Market fallback error for {symbol}: {e}")
 
         # Log cancellation (no fallback or fallback failed)
         if self._order_logger:
@@ -923,6 +1125,9 @@ class ScannerStateMachine:
 
         # === Detect externally closed positions ===
         self._detect_external_closes()
+
+        # === Verify server orders (SL + trailing) for held positions ===
+        self._verify_server_orders()
 
         for symbol in list(self._position_mgr.get_held_symbols()):
             # Skip symbols currently being sold by monitor thread
@@ -1026,6 +1231,14 @@ class ScannerStateMachine:
                                f"(manuel/SL/TP/trailing) — dahili takipten siliniyor. "
                                f"Giris={pos.entry_price:.6f} Cikis={exit_price:.6f}")
 
+                # Cancel orphan server orders (SL + trailing) for closed position
+                if self._order_executor and hasattr(self._order_executor, '_rest'):
+                    try:
+                        cancel_result = self._order_executor._rest.cancel_all_orders(symbol)
+                        logger.info(f"[EXTERNAL CLOSE] {symbol}: orphan orders cancelled: {cancel_result}")
+                    except Exception as e:
+                        logger.warning(f"[EXTERNAL CLOSE] {symbol}: cancel orphan orders failed: {e}")
+
                 # Clean up internal state
                 self._held_indicators.pop(symbol, None)
                 self._server_trailing.pop(symbol, None)
@@ -1068,7 +1281,7 @@ class ScannerStateMachine:
                     )
                     # Log complete trade record
                     if result:
-                        fee_pct = 0.001
+                        fee_pct = self._config.get("strategy.fee_pct", 0.10) / 100.0
                         fee_usdt = result.get("notional_usdt", 0) * fee_pct
                         from datetime import datetime as dt
                         entry_t = result.get("entry_time", 0)
@@ -1110,6 +1323,153 @@ class ScannerStateMachine:
 
         except Exception as e:
             logger.debug(f"External close detection error: {e}")
+
+    def _verify_server_orders(self) -> None:
+        """Verify that all held positions have SL + trailing stop orders on Binance.
+        Only places MISSING orders — never cancels existing ones.
+        Uses 2 BULK API calls (not per-symbol) to minimize API usage.
+        Runs every 120 seconds to avoid API spam."""
+        now = time.time()
+        if now - self._last_order_verify_time < self._order_verify_interval:
+            return
+        self._last_order_verify_time = now
+
+        if not self._order_executor or not hasattr(self._order_executor, '_rest'):
+            return
+
+        rest = self._order_executor._rest
+        held_symbols = list(self._position_mgr.get_held_symbols())
+        if not held_symbols:
+            return
+
+        try:
+            # 2 BULK API calls for ALL symbols (not per-symbol!)
+            all_orders = rest.get_open_orders() or []  # no symbol = all
+            all_algo = rest.get_algo_open_orders() or []  # no symbol = all
+
+            # Build per-symbol order map
+            order_map = {}  # symbol -> {"has_sl": bool, "has_trailing": bool}
+            for o in all_orders:
+                sym = o.get("symbol", "")
+                if sym not in order_map:
+                    order_map[sym] = {"has_sl": False, "has_trailing": False}
+                otype = o.get("type", "")
+                if otype == "STOP_MARKET":
+                    order_map[sym]["has_sl"] = True
+                elif otype == "TRAILING_STOP_MARKET":
+                    order_map[sym]["has_trailing"] = True
+
+            for o in all_algo:
+                sym = o.get("symbol", "")
+                if sym not in order_map:
+                    order_map[sym] = {"has_sl": False, "has_trailing": False}
+                otype = o.get("type", "")
+                if otype == "STOP_MARKET":
+                    order_map[sym]["has_sl"] = True
+                elif otype == "TRAILING_STOP_MARKET":
+                    order_map[sym]["has_trailing"] = True
+
+        except Exception as e:
+            logger.debug(f"[ORDER VERIFY] Bulk order fetch failed: {e}")
+            return
+
+        strat = self._config.get("strategy", {})
+
+        for symbol in held_symbols:
+            pos = self._position_mgr.get_position(symbol)
+            if not pos or pos.leverage <= 1:
+                continue
+
+            info = order_map.get(symbol, {"has_sl": False, "has_trailing": False})
+            if info["has_sl"] and info["has_trailing"]:
+                continue  # All good
+
+            missing = []
+            if not info["has_sl"]:
+                missing.append("SL")
+            if not info["has_trailing"]:
+                missing.append("TRAILING")
+
+            atr = pos.atr if hasattr(pos, 'atr') else 0
+            if atr <= 0 or pos.entry_price <= 0:
+                logger.warning(f"[ORDER VERIFY] {symbol}: MISSING {', '.join(missing)} "
+                               f"but ATR={atr}, entry={pos.entry_price} — cannot place")
+                continue
+
+            logger.warning(f"[ORDER VERIFY] {symbol}: MISSING {', '.join(missing)}! "
+                           f"Placing missing orders...")
+
+            pp = self._order_executor._get_price_precision(symbol)
+            is_long = pos.side == OrderSide.BUY_LONG
+            close_side = "SELL" if is_long else "BUY"
+            entry_regime = getattr(pos, 'entry_regime', '')
+
+            # Place missing SL only
+            if not info["has_sl"]:
+                sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
+                if strat.get("adx_regime_enabled", False) and entry_regime in (
+                        "RANGING", "WEAK_TREND", "STRONG_TREND"):
+                    prefix = {"RANGING": "adx_regime_ranging",
+                              "WEAK_TREND": "adx_regime_weak",
+                              "STRONG_TREND": "adx_regime_strong"}[entry_regime]
+                    sl_atr_mult = strat.get(f"{prefix}_sl_atr", sl_atr_mult)
+
+                if is_long:
+                    sl_price = round(pos.entry_price - (atr * sl_atr_mult), pp)
+                else:
+                    sl_price = round(pos.entry_price + (atr * sl_atr_mult), pp)
+
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="STOP_MARKET",
+                        quantity=pos.size, stop_price=sl_price,
+                    )
+                    logger.info(f"[ORDER VERIFY] {symbol}: SL placed @ {sl_price} "
+                                f"({sl_atr_mult}xATR)")
+                except Exception as e:
+                    logger.error(f"[ORDER VERIFY] {symbol}: SL placement failed: {e}")
+
+            # Place missing trailing only
+            if not info["has_trailing"]:
+                activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
+                distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+                if strat.get("adx_regime_enabled", False) and entry_regime in (
+                        "RANGING", "WEAK_TREND", "STRONG_TREND"):
+                    prefix = {"RANGING": "adx_regime_ranging",
+                              "WEAK_TREND": "adx_regime_weak",
+                              "STRONG_TREND": "adx_regime_strong"}[entry_regime]
+                    activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
+                    distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
+
+                callback_pct = (atr * distance_mult) / pos.entry_price * 100
+                callback_pct = max(0.1, min(5.0, round(callback_pct, 1)))
+
+                if is_long:
+                    activation_price = round(pos.entry_price + (atr * activate_mult), pp)
+                else:
+                    activation_price = round(pos.entry_price - (atr * activate_mult), pp)
+
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="TRAILING_STOP_MARKET",
+                        quantity=pos.size,
+                        stop_price=activation_price,
+                        callback_rate=callback_pct,
+                    )
+                    self._server_trailing[symbol] = {
+                        "callback_pct": callback_pct,
+                        "activation_price": activation_price,
+                        "sl_price": 0,
+                        "timestamp": time.time(),
+                        "renewal_count": 0,
+                    }
+                    logger.info(f"[ORDER VERIFY] {symbol}: Trailing placed "
+                                f"activation={activation_price} callback={callback_pct}% "
+                                f"({activate_mult}/{distance_mult}xATR)")
+                except Exception as e:
+                    logger.error(f"[ORDER VERIFY] {symbol}: Trailing placement failed: {e}")
 
     def _execute_partial_tp(self, symbol: str, current_price: float) -> None:
         """Close a portion of the position at N×ATR profit, keep rest for trailing."""
@@ -1286,7 +1646,7 @@ class ScannerStateMachine:
                     trigger_source=f"exit:{reason}",
                 )
                 # Log complete trade record
-                fee_pct = 0.001  # 0.1% round-trip (maker+taker)
+                fee_pct = self._config.get("strategy.fee_pct", 0.10) / 100.0
                 fee_usdt = result.get("notional_usdt", 0) * fee_pct
                 from datetime import datetime
                 entry_t = result.get("entry_time", 0)
@@ -1454,6 +1814,24 @@ class ScannerStateMachine:
             return
         self._do_buying_inline()
         self._transition(ScannerState.SCANNING)
+
+    def _do_mr_buying_inline(self, mr_cand: MRScanResult) -> bool:
+        """Place MR order: limit entry at BB band with MR-specific params.
+        Reuses most of _do_buying_inline but with MR entry_mode and mr_tp_price."""
+        # Store original candidate, set MR candidate as current
+        original_candidate = self._last_candidate
+
+        # Create a synthetic ScanResult-like object for _do_buying_inline compatibility
+        # MR always uses limit entry at the band price
+        self._last_candidate = mr_cand
+        self._mr_buying_active = True
+        try:
+            success = self._do_buying_inline()
+        finally:
+            self._mr_buying_active = False
+            if not success:
+                self._last_candidate = original_candidate
+        return success
 
     def _do_buying_inline(self) -> bool:
         """Place order for self._last_candidate. Returns True on success."""
@@ -1638,24 +2016,27 @@ class ScannerStateMachine:
                 needed_notional = min_qty * price * 1.05
                 needed_margin = needed_notional / leverage
                 max_allowed = self._config.get("risk.max_single_order_usdt", 50.0)
-                # Don't let min_qty blow up position size beyond 2x target
+                # Cap total adjustment to 2x of ORIGINAL target (not current margin)
+                # This prevents min_notional + min_qty from stacking to 4x
                 if needed_margin > original_margin * 2.0:
                     logger.warning(f"{symbol} min qty {min_qty} needs "
                                    f"{needed_margin:.2f}$ margin (target was "
-                                   f"{original_margin:.2f}$, >2x), skipping")
+                                   f"{original_margin:.2f}$, >2x total), skipping")
                     self._failed_symbols[symbol] = time.time()
                     return False
-                if needed_margin <= max_allowed:
-                    logger.info(f"Adjusting margin for min qty: {margin_usdt}$ -> "
-                                f"{needed_margin:.2f}$ (min_qty={min_qty})")
-                    margin_usdt = round(needed_margin, 2)
-                    notional_usdt = margin_usdt * leverage
-                    size_qty = round(notional_usdt / price, qty_precision)
-                else:
-                    logger.warning(f"{symbol} min qty {min_qty} needs "
-                                   f"{needed_margin:.2f}$ margin, skipping")
-                    self._failed_symbols[symbol] = time.time()
-                    return False
+                # Only adjust if min_qty requires MORE than current margin
+                if needed_margin > margin_usdt:
+                    if needed_margin <= max_allowed:
+                        logger.info(f"Adjusting margin for min qty: {margin_usdt}$ -> "
+                                    f"{needed_margin:.2f}$ (min_qty={min_qty})")
+                        margin_usdt = round(needed_margin, 2)
+                        notional_usdt = margin_usdt * leverage
+                        size_qty = round(notional_usdt / price, qty_precision)
+                    else:
+                        logger.warning(f"{symbol} min qty {min_qty} needs "
+                                       f"{needed_margin:.2f}$ margin, skipping")
+                        self._failed_symbols[symbol] = time.time()
+                        return False
 
             # Dynamic SL/TP from leverage (dual-layer protection)
             # Katman 1: Server SL at 50% of liq distance (FEE + SLIPPAGE DAHIL)
@@ -1667,12 +2048,13 @@ class ScannerStateMachine:
             tp_liq_mult = strat.get("tp_liq_multiplier", 3.0)
 
             # Fee-aware SL: hedef kayıp = SL + fee + slippage
-            # Fee ROI = round-trip %0.1 × leverage
-            # Slippage tahmini = fee × 0.5
+            # Fee ROI = round-trip fee × leverage
+            # Slippage tahmini = fee × slippage_mult
             # SL ROI = hedef_ROI - fee_ROI - slippage_ROI
-            fee_pct = 0.001  # round-trip fee %0.1
+            fee_pct = strat.get("fee_pct", 0.10) / 100.0
             fee_roi = fee_pct * leverage * 100  # fee as % of margin
-            slippage_roi = fee_roi * 0.5  # estimated slippage
+            slippage_mult = strat.get("slippage_mult", 0.5)
+            slippage_roi = fee_roi * slippage_mult  # estimated slippage
             raw_sl_roi = liq_pct * sl_liq_pct * leverage * 100  # hedef toplam kayıp
             net_sl_roi = max(raw_sl_roi - fee_roi - slippage_roi, fee_roi)  # fee düşülmüş SL
             sl_price_pct = net_sl_roi / (leverage * 100)  # geri fiyat mesafesine çevir
@@ -1729,9 +2111,17 @@ class ScannerStateMachine:
         limit_atr_offset = strat.get("limit_atr_offset", 0.5) if strat else 0.5
         limit_timeout = strat.get("limit_timeout_seconds", 300) if strat else 300
 
+        # Mean Reversion override: always limit entry
+        is_mr = getattr(self, '_mr_buying_active', False)
+        if is_mr:
+            limit_enabled = True
+            limit_atr_offset = strat.get("limit_atr_offset", 0.5)
+            logger.info(f"[MR] {symbol}: limit entry {limit_atr_offset}xATR "
+                        f"(BB={getattr(candidate, 'bb_percent_b', 0):.0%})")
+
         # ADX regime override: entry type + ATR offset
         adx_regime = getattr(candidate, 'adx_regime', '') if candidate else ''
-        if adx_regime and strat.get("adx_regime_enabled", False):
+        if not is_mr and adx_regime and strat.get("adx_regime_enabled", False):
             if adx_regime == "RANGING":
                 limit_enabled = True
                 limit_atr_offset = strat.get("adx_regime_ranging_entry_atr", 2.0)
@@ -1791,6 +2181,8 @@ class ScannerStateMachine:
                 "timeout": limit_timeout,
                 "qty_precision": qty_precision,
                 "lev_enabled": lev_enabled,
+                "entry_mode": "MEAN_REVERSION" if getattr(self, '_mr_buying_active', False) else "TREND",
+                "mr_tp_price": getattr(candidate, 'mr_tp_target', 0.0) if getattr(self, '_mr_buying_active', False) else 0.0,
             }
 
             # Record trade timestamp for frequency limiter
@@ -1837,18 +2229,27 @@ class ScannerStateMachine:
         # Use ADX regime as entry_regime when enabled, fallback to market regime
         effective_regime = (adx_regime if adx_regime
                            else regime_info.get("regime", ""))
+        # Determine entry mode (MR or TREND)
+        is_mr = getattr(self, '_mr_buying_active', False)
+        entry_mode = "MEAN_REVERSION" if is_mr else "TREND"
+        mr_tp = 0.0
+        if is_mr and hasattr(candidate, 'mr_tp_target'):
+            mr_tp = candidate.mr_tp_target
+
         self._position_mgr.open_position(
             symbol, side, price, size_qty, atr,
             leverage=leverage if lev_enabled else 1,
             margin_usdt=margin_usdt if lev_enabled else 0.0,
             timeframe=pos_tf,
             entry_score=candidate.score,
-            entry_confluence=candidate.confluence.get("score", 0),
+            entry_confluence=candidate.confluence.get("score", 0) if hasattr(candidate.confluence, 'get') else 0,
             entry_adx=candidate.adx,
             entry_rsi=candidate.rsi,
             entry_regime=effective_regime,
             entry_regime_confidence=regime_info.get("confidence", 0),
             entry_bb_width=regime_info.get("bb_width", 0),
+            entry_mode=entry_mode,
+            mr_tp_price=mr_tp,
         )
 
         if self._risk_manager:
@@ -1906,10 +2307,11 @@ class ScannerStateMachine:
     # ──── Position Monitor (fast check thread) ────
 
     def _position_monitor_loop(self) -> None:
-        """Separate thread that checks positions every 1 second.
-        Critical for anti-liquidation: detects emergency close level
-        before Binance can liquidate."""
-        check_interval = 1  # 1 second — anti-liquidation speed
+        """Separate thread that checks positions every 2 seconds.
+        Uses single bulk API call for ALL prices instead of per-symbol calls.
+        Critical for anti-liquidation: server-side SL handles sub-second protection,
+        this loop handles trailing, signal exit, and emergency close."""
+        check_interval = 2  # 2 seconds — bulk fetch + check all positions
         logger.info("Position monitor thread started")
         while self._running:
             try:
@@ -1919,7 +2321,16 @@ class ScannerStateMachine:
 
                 # Don't interfere while buying/selling on UI
                 if self._state == ScannerState.BUYING:
-                    time.sleep(1)
+                    time.sleep(2)
+                    continue
+
+                # Single bulk API call: fetch ALL ticker prices at once
+                try:
+                    all_tickers = self._rest.get_all_ticker_prices()
+                    price_map = {t["symbol"]: float(t["price"])
+                                 for t in all_tickers if float(t.get("price", 0)) > 0}
+                except Exception:
+                    time.sleep(check_interval)
                     continue
 
                 for symbol in list(self._position_mgr.get_held_symbols()):
@@ -1927,12 +2338,8 @@ class ScannerStateMachine:
                     if symbol in self._selling_symbols:
                         continue
 
-                    try:
-                        ticker = self._rest.get_ticker_price(symbol)
-                        current_price = float(ticker.get("price", 0))
-                        if current_price <= 0:
-                            continue
-                    except Exception:
+                    current_price = price_map.get(symbol, 0)
+                    if current_price <= 0:
                         continue
 
                     exit_reason = self._position_mgr.check_position(
@@ -1948,14 +2355,9 @@ class ScannerStateMachine:
                         if retry_info and time.time() < retry_info.get("next_retry", 0):
                             continue  # Skip until backoff expires
 
-                        # === HYBRID TRAILING: Re-evaluate before closing ===
+                        # === HYBRID TRAILING: Renewal disabled ===
                         if exit_reason == self._position_mgr.EXIT_TRAILING_RENEW:
-                            should_renew = self._evaluate_trailing_renew(
-                                symbol, current_price)
-                            if should_renew:
-                                continue  # Trailing renewed, don't close
-                            else:
-                                exit_reason = self._position_mgr.EXIT_TRAILING
+                            exit_reason = self._position_mgr.EXIT_TRAILING
 
                         logger.warning(
                             f"[MONITOR] Exit signal for {symbol}: "
@@ -2124,13 +2526,81 @@ class ScannerStateMachine:
                             f"qty={size} entry={entry_price} lev={leverage}x "
                             f"margin={margin:.2f}")
 
+                # Place server-side trailing stop if not already present
+                if leverage > 1 and self._order_executor and hasattr(self._order_executor, '_rest'):
+                    pos_obj = self._position_mgr.get_position(symbol)
+                    if pos_obj and atr > 0:
+                        # Check if trailing already exists on server
+                        try:
+                            open_orders = self._order_executor._rest.get_open_orders(symbol)
+                            has_trailing = any(
+                                o.get("type") == "TRAILING_STOP_MARKET"
+                                for o in (open_orders or [])
+                            )
+                            if not has_trailing:
+                                logger.warning(f"[SYNC] {symbol}: No trailing stop on server, placing now!")
+                                self._place_initial_trailing(symbol, pos_obj, entry_price, atr)
+                            else:
+                                logger.info(f"[SYNC] {symbol}: Trailing stop already exists on server")
+                        except Exception as e:
+                            logger.warning(f"[SYNC] {symbol}: Failed to check/place trailing: {e}")
+
             logger.info(f"Synced {len(api_positions)} API position(s)")
 
-            # Update TP/SL for synced positions with fee-aware values
-            self._update_synced_tp_sl()
+            # Cancel orphan orders for symbols that have open orders but NO position
+            self._cleanup_orphan_orders(api_positions)
+
+            # NOTE: Do NOT call _update_synced_tp_sl here!
+            # It calls cancel_all_orders which destroys trailing stops.
+            # _sync_api_positions already places SL + trailing via _place_initial_trailing.
 
         except Exception as e:
             logger.error(f"Failed to sync API positions: {e}")
+
+    def _cleanup_orphan_orders(self, api_positions: list) -> None:
+        """Cancel open orders for symbols that have NO open position.
+        These are orphan SL/trailing stop orders left from previously closed positions."""
+        if not self._order_executor or not hasattr(self._order_executor, '_rest'):
+            return
+
+        rest = self._order_executor._rest
+        # Symbols that actually have open positions
+        position_symbols = set()
+        for p in api_positions:
+            amt = float(p.get("positionAmt", 0))
+            if amt != 0:
+                position_symbols.add(p.get("symbol", ""))
+
+        try:
+            # Get ALL open orders across all symbols
+            all_orders = rest.get_open_orders()  # no symbol = all
+            algo_orders = rest.get_algo_open_orders()  # algo/conditional orders
+
+            # Find symbols with orders but no position
+            order_symbols = set()
+            for o in (all_orders or []):
+                order_symbols.add(o.get("symbol", ""))
+            for o in (algo_orders or []):
+                order_symbols.add(o.get("symbol", ""))
+
+            orphan_symbols = order_symbols - position_symbols
+            if not orphan_symbols:
+                logger.info("[STARTUP] No orphan orders found")
+                return
+
+            for symbol in orphan_symbols:
+                try:
+                    result = rest.cancel_all_orders(symbol)
+                    logger.warning(f"[STARTUP] Cancelled orphan orders for {symbol} "
+                                   f"(no open position): {result}")
+                except Exception as e:
+                    logger.warning(f"[STARTUP] Failed to cancel orphan orders for {symbol}: {e}")
+
+            logger.info(f"[STARTUP] Cleaned up orphan orders for {len(orphan_symbols)} symbol(s): "
+                        f"{', '.join(orphan_symbols)}")
+
+        except Exception as e:
+            logger.warning(f"[STARTUP] Orphan order cleanup failed: {e}")
 
     def _update_synced_tp_sl(self) -> None:
         """Update TP/SL orders for synced positions using fee-aware calculations."""
@@ -2172,8 +2642,11 @@ class ScannerStateMachine:
                 except Exception as e:
                     logger.warning(f"Failed to update SL for {symbol}: {e}")
             else:
-                sl_price_pct = liq_pct * sl_liq_pct2
-                sl_roi = round(sl_price_pct * lev * 100, 1)
+                # SL only if sl_enabled
+                sl_roi = None
+                if strat_cfg.get("sl_enabled", True):
+                    sl_price_pct = liq_pct * sl_liq_pct2
+                    sl_roi = round(sl_price_pct * lev * 100, 1)
 
                 # Only send TP to Binance if tp_enabled in config
                 tp_roi = None
@@ -2181,20 +2654,29 @@ class ScannerStateMachine:
                     tp_price_pct = liq_pct * tp_liq_mult2
                     tp_roi = round(tp_price_pct * lev * 100, 1)
 
-                try:
-                    self._order_executor.update_tp_sl(
-                        symbol=symbol,
-                        entry_side=entry_side,
-                        qty=pos.size,
-                        entry_price=pos.entry_price,
-                        leverage=lev,
-                        tp_roi_pct=tp_roi,
-                        sl_roi_pct=sl_roi,
-                    )
-                    tp_str = f" TP_ROI={tp_roi}%" if tp_roi else " (no TP)"
-                    logger.info(f"Updated SL for {symbol}: SL_ROI={sl_roi}%{tp_str}")
-                except Exception as e:
-                    logger.warning(f"Failed to update TP/SL for {symbol}: {e}")
+                if sl_roi is not None or tp_roi is not None:
+                    try:
+                        self._order_executor.update_tp_sl(
+                            symbol=symbol,
+                            entry_side=entry_side,
+                            qty=pos.size,
+                            entry_price=pos.entry_price,
+                            leverage=lev,
+                            tp_roi_pct=tp_roi,
+                            sl_roi_pct=sl_roi,
+                        )
+                        sl_str = f"SL_ROI={sl_roi}%" if sl_roi else "no SL"
+                        tp_str = f" TP_ROI={tp_roi}%" if tp_roi else " (no TP)"
+                        logger.info(f"Updated {symbol}: {sl_str}{tp_str}")
+                    except Exception as e:
+                        logger.warning(f"Failed to update TP/SL for {symbol}: {e}")
+                else:
+                    # Cancel existing SL/TP orders since both are disabled
+                    try:
+                        self._order_executor._rest.cancel_all_orders(symbol)
+                        logger.info(f"[SL+TP DISABLED] {symbol}: mevcut SL/TP emirleri iptal edildi, sadece trailing korur")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel orders for {symbol}: {e}")
 
     # ──── Server-side Trailing Stop ────
     #
@@ -2246,7 +2728,8 @@ class ScannerStateMachine:
                             f"SL={strat.get(f'{prefix}_sl_atr', 2.0)}xATR, "
                             f"trail={activate_mult}/{distance_mult}xATR")
 
-            # === SERVER SL: 2×ATR STOP_MARKET (crash koruması) ===
+            # === SERVER SL: 2×ATR STOP_MARKET (crash koruması — HER ZAMAN aktif) ===
+            # Not: sl_enabled sadece software SL'yi kontrol eder, server SL her zaman gönderilir
             sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
             if strat.get("adx_regime_enabled", False) and entry_regime in (
                     "RANGING", "WEAK_TREND", "STRONG_TREND"):
@@ -2272,7 +2755,7 @@ class ScannerStateMachine:
             else:
                 logger.info(f"[NO SERVER SL] {symbol}: ATR=0, emergency exit korur")
 
-            # === TRAILING_STOP_MARKET: 4×ATR'de aktif, 1×ATR callback ===
+            # === TRAILING_STOP_MARKET: 3×ATR'de aktif, 0.5×ATR callback ===
             if atr > 0 and entry_price > 0:
                 callback_pct = (atr * distance_mult) / entry_price * 100
             else:
@@ -2312,7 +2795,51 @@ class ScannerStateMachine:
                         f"SL=YOK (emergency korur)")
 
         except Exception as e:
-            logger.warning(f"Initial server orders failed for {symbol}: {e}")
+            logger.error(f"CRITICAL: Initial server orders FAILED for {symbol}: {e}")
+            import traceback
+            logger.error(f"Server order traceback: {traceback.format_exc()}")
+            # Retry once after 2 seconds
+            try:
+                time.sleep(2)
+                logger.info(f"[RETRY] Retrying server orders for {symbol}...")
+                # Recalculate with fresh precision
+                pp = self._order_executor._get_price_precision(symbol)
+                if atr > 0 and entry_price > 0:
+                    sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
+                    if is_long:
+                        sl_price = round(entry_price - (atr * sl_atr_mult), pp)
+                    else:
+                        sl_price = round(entry_price + (atr * sl_atr_mult), pp)
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="STOP_MARKET",
+                        quantity=pos.size, stop_price=sl_price,
+                    )
+                    logger.info(f"[RETRY OK] SL placed for {symbol} @ {sl_price}")
+            except Exception as retry_err:
+                logger.critical(f"RETRY ALSO FAILED for {symbol}: {retry_err} "
+                                f"— closing unprotected position!")
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="MARKET",
+                        close_position=True,
+                    )
+                    logger.info(f"[EMERGENCY CLOSE] {symbol} closed — no SL protection")
+                    self._event_bus.publish(EventType.LOG_MESSAGE, {
+                        "level": "CRITICAL",
+                        "message": f"{symbol}: Server SL gonderilemedi, pozisyon KAPATILDI! Hata: {e}",
+                    })
+                    return
+                except Exception as close_err:
+                    logger.critical(f"EMERGENCY CLOSE FAILED for {symbol}: {close_err} "
+                                    f"— MANUAL ACTION REQUIRED!")
+            # Notify user via event bus
+            self._event_bus.publish(EventType.LOG_MESSAGE, {
+                "level": "CRITICAL",
+                "message": f"DIKKAT: {symbol} icin server SL/trailing gonderilemedi! "
+                           f"Pozisyon KORUMASIZ olabilir. Hata: {e}",
+            })
 
     def _calc_trailing_callback(self, pos, current_price: float,
                                  confluence: dict = None) -> float:
@@ -2472,9 +2999,10 @@ class ScannerStateMachine:
                 liq_factor = strat.get("liq_factor", 70) / 100.0
                 liq_pct = (1.0 / lev) * liq_factor
                 sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
-                fee_pct = 0.001
+                fee_pct = strat.get("fee_pct", 0.10) / 100.0
                 fee_roi = fee_pct * lev * 100
-                slippage_roi = fee_roi * 0.5
+                slippage_mult = strat.get("slippage_mult", 0.5)
+                slippage_roi = fee_roi * slippage_mult
                 raw_sl_roi = liq_pct * sl_liq_pct * lev * 100
                 net_sl_roi = max(raw_sl_roi - fee_roi - slippage_roi, fee_roi)
                 sl_price_pct = net_sl_roi / (lev * 100)
@@ -2518,6 +3046,10 @@ class ScannerStateMachine:
     def get_scan_results(self) -> list[ScanResult]:
         return self._last_scan_results
 
+    def get_mr_scan_results(self) -> list:
+        """Return last Mean Reversion scan results (for GUI)."""
+        return self._last_mr_results
+
     def get_candidate(self) -> ScanResult:
         return self._last_candidate
 
@@ -2545,6 +3077,42 @@ class ScannerStateMachine:
 
     def get_position_manager(self) -> PositionManager:
         return self._position_mgr
+
+    def get_banned_symbols(self) -> dict[str, dict]:
+        """Get all banned/cooldown symbols with remaining time.
+        Returns: {symbol: {"type": "cooldown"|"daily_ban", "remaining_s": float, "reason": str}}"""
+        now = time.time()
+        result = {}
+
+        # Loss cooldown symbols
+        for sym, ts in self._loss_cooldown_symbols.items():
+            remaining = self._loss_cooldown_seconds - (now - ts)
+            if remaining > 0:
+                result[sym] = {
+                    "type": "cooldown",
+                    "remaining_s": remaining,
+                    "reason": f"zarar cooldown ({remaining / 60:.0f}dk)",
+                }
+
+        # Daily ban symbols
+        strat = self._config.get("strategy", {})
+        limit = strat.get("coin_daily_loss_limit", 0)
+        ban_hours = strat.get("coin_daily_ban_hours", 24)
+        if limit > 0:
+            cutoff = now - (ban_hours * 3600)
+            for sym, timestamps in self._coin_loss_history.items():
+                recent = [t for t in timestamps if t > cutoff]
+                if len(recent) >= limit:
+                    remaining_h = ban_hours - (now - recent[0]) / 3600
+                    remaining_s = remaining_h * 3600
+                    if remaining_s > 0:
+                        result[sym] = {
+                            "type": "daily_ban",
+                            "remaining_s": remaining_s,
+                            "reason": f"{len(recent)} zarar/{ban_hours}s ban ({remaining_h:.1f}s kaldi)",
+                        }
+
+        return result
 
     @property
     def is_running(self) -> bool:

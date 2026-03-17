@@ -13,6 +13,9 @@ class ADX(Indicator):
         self.period = period
         self._plus_di = 0.0
         self._minus_di = 0.0
+        self._plus_di_series = None
+        self._minus_di_series = None
+        self._adx_series = None
 
     def compute(self, df: pd.DataFrame) -> None:
         self._prev_value = self._value
@@ -39,6 +42,9 @@ class ADX(Indicator):
         self._value = adx.iloc[-1] if not adx.empty else 0.0
         self._plus_di = plus_di.iloc[-1] if not plus_di.empty else 0.0
         self._minus_di = minus_di.iloc[-1] if not minus_di.empty else 0.0
+        self._plus_di_series = plus_di
+        self._minus_di_series = minus_di
+        self._adx_series = adx
 
     def get_values(self) -> dict:
         return {

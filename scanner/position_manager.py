@@ -45,6 +45,10 @@ class ActivePosition:
     # Partial take profit tracking
     partial_tp_taken: bool = False     # whether partial TP has been executed
     original_size: float = 0.0         # size before partial close
+    # Mean Reversion mode
+    entry_mode: str = "TREND"          # "TREND" or "MEAN_REVERSION"
+    regime_switched: bool = False       # MR->TREND transition happened
+    mr_tp_price: float = 0.0           # BB middle TP target (MR mode only)
 
 
 class PositionManager:
@@ -64,6 +68,8 @@ class PositionManager:
     EXIT_REGIME = "REGIME_DETERIORATION"
     EXIT_TIME = "TIME_LIMIT"
     EXIT_PARTIAL_TP = "PARTIAL_TP"
+    EXIT_MR_TP = "MR_BB_MIDDLE_TP"
+    EXIT_MR_REGIME_SWITCH = "MR_REGIME_SWITCH"  # informational, position stays open
 
     def __init__(self, config: ConfigManager, event_bus: EventBus):
         self._config = config
@@ -131,6 +137,12 @@ class PositionManager:
                          if p.side == OrderSide.SELL_SHORT)
             return longs, shorts
 
+    def get_mr_position_count(self) -> int:
+        """Return count of Mean Reversion positions (not yet switched to TREND)."""
+        with self._lock:
+            return sum(1 for p in self._positions.values()
+                       if p.entry_mode == "MEAN_REVERSION" and not p.regime_switched)
+
     def open_position(self, symbol: str, side: OrderSide, price: float,
                       size: float, atr: float,
                       leverage: int = 1,
@@ -142,13 +154,16 @@ class PositionManager:
                       entry_rsi: float = 50.0,
                       entry_regime: str = "",
                       entry_regime_confidence: float = 0.0,
-                      entry_bb_width: float = 0.0) -> ActivePosition:
+                      entry_bb_width: float = 0.0,
+                      entry_mode: str = "TREND",
+                      mr_tp_price: float = 0.0) -> ActivePosition:
         """Create and track a new position."""
         with self._lock:
             return self._open_position_locked(
                 symbol, side, price, size, atr, leverage, margin_usdt,
                 timeframe, entry_score, entry_confluence, entry_adx, entry_rsi,
-                entry_regime, entry_regime_confidence, entry_bb_width)
+                entry_regime, entry_regime_confidence, entry_bb_width,
+                entry_mode, mr_tp_price)
 
     def _open_position_locked(self, symbol: str, side: OrderSide, price: float,
                               size: float, atr: float,
@@ -161,7 +176,9 @@ class PositionManager:
                               entry_rsi: float = 50.0,
                               entry_regime: str = "",
                               entry_regime_confidence: float = 0.0,
-                              entry_bb_width: float = 0.0) -> ActivePosition:
+                              entry_bb_width: float = 0.0,
+                              entry_mode: str = "TREND",
+                              mr_tp_price: float = 0.0) -> ActivePosition:
         """Internal: create position (caller must hold lock)."""
         if symbol in self._positions:
             logger.warning(f"Already holding {symbol}, skipping duplicate")
@@ -169,13 +186,14 @@ class PositionManager:
 
         lev_enabled = leverage >= 1  # All leverages use fee-aware SL (including 1x)
 
-        # === DYNAMIC CALCULATION FROM LEVERAGE (FEE-AWARE) ===
-        fee_pct = 0.001  # 0.1% round-trip
-        fee_roi = fee_pct * leverage * 100  # fee as % of margin
-        slippage_roi = fee_roi * 0.5  # estimated slippage
-
         # Read from strategy config (with sensible defaults)
         strat = self._config.get("strategy", {})
+
+        # === DYNAMIC CALCULATION FROM LEVERAGE (FEE-AWARE) ===
+        fee_pct = strat.get("fee_pct", 0.10) / 100.0  # config: 0.10 = %0.10 round-trip
+        fee_roi = fee_pct * leverage * 100  # fee as % of margin
+        slippage_mult = strat.get("slippage_mult", 0.5)
+        slippage_roi = fee_roi * slippage_mult  # estimated slippage
 
         # Liquidation: (1/L) with practical factor (maintenance margin eats rest)
         liq_factor = strat.get("liq_factor", 70) / 100.0
@@ -191,7 +209,13 @@ class PositionManager:
         sl_pct = net_sl_roi / (leverage * 100)
 
         emergency_pct = liq_pct * emergency_liq_pct
-        tp_pct = liq_pct * tp_liq_mult
+
+        # TP: 3×ATR bazlı (config: tp_atr_mult, fallback: tp_liq_multiplier)
+        tp_atr_mult = strat.get("tp_atr_mult", 3.0)
+        if atr > 0 and price > 0:
+            tp_pct = (atr * tp_atr_mult) / price
+        else:
+            tp_pct = liq_pct * tp_liq_mult
 
         # ROI calculations for logging
         sl_roi = net_sl_roi
@@ -203,6 +227,7 @@ class PositionManager:
                     f"SL={sl_pct*100:.3f}%(ROI-{sl_roi:.0f}%) "
                     f"fee={fee_roi:.0f}%+slip={slippage_roi:.0f}% "
                     f"toplam_kayip={total_sl_roi:.0f}% "
+                    f"TP={tp_atr_mult}xATR({tp_pct*100:.3f}%, ROI={tp_roi:.0f}%) "
                     f"Emergency={emergency_pct*100:.3f}%(ROI-{emergency_roi:.0f}%)")
 
         if side == OrderSide.BUY_LONG:
@@ -243,6 +268,20 @@ class PositionManager:
         pos.entry_regime = entry_regime
         pos.entry_regime_confidence = entry_regime_confidence
         pos.entry_bb_width = entry_bb_width
+        pos.entry_mode = entry_mode
+        pos.mr_tp_price = mr_tp_price
+
+        # MR mode: override SL to tighter value (1.5×ATR instead of 2×ATR)
+        if entry_mode == "MEAN_REVERSION" and atr > 0 and price > 0:
+            mr_sl_mult = strat.get("mr_sl_atr_mult", 1.5)
+            mr_sl_pct = (atr * mr_sl_mult) / price
+            if side == OrderSide.BUY_LONG:
+                pos.initial_sl = price * (1 - mr_sl_pct)
+            else:
+                pos.initial_sl = price * (1 + mr_sl_pct)
+            pos.trailing_stop = pos.initial_sl
+            logger.info(f"  [MR] SL override: {mr_sl_mult}xATR = {pos.initial_sl:.6f} "
+                        f"| TP: BB middle = {mr_tp_price:.6f}")
 
         self._positions[symbol] = pos
 
@@ -331,6 +370,11 @@ class PositionManager:
         battle_mode = self._config.get("strategy.battle_mode", False)
         if battle_mode and pos.leverage > 1:
             return self._check_battle_mode(pos, current_price, confluence, divergences)
+
+        # === MEAN REVERSION MODE ===
+        if pos.entry_mode == "MEAN_REVERSION" and not pos.regime_switched:
+            return self._check_mean_reversion(pos, current_price, indicator_values,
+                                               confluence, divergences)
 
         strat = self._config.get("strategy", {})
 
@@ -433,7 +477,9 @@ class PositionManager:
         - NO SL exit (server SL handles that, we just track)
         """
         lev = pos.leverage
-        fee_roi = 0.001 * lev * 100  # fee as % of margin
+        strat = self._config.get("strategy", {})
+        fee_pct = strat.get("fee_pct", 0.10) / 100.0  # config: 0.10 = %0.10 round-trip
+        fee_roi = fee_pct * lev * 100  # fee as % of margin
 
         if pos.side == OrderSide.BUY_LONG:
             roi = (price - pos.entry_price) / pos.entry_price * lev * 100
@@ -578,6 +624,152 @@ class PositionManager:
             return price <= pos.trailing_stop
         else:
             return price >= pos.trailing_stop
+
+    # ──── MEAN REVERSION MODE ────
+
+    def _check_mean_reversion(self, pos: ActivePosition, price: float,
+                               indicator_values: dict, confluence: dict,
+                               divergences: list) -> str:
+        """Mean Reversion exit logic.
+
+        Priority:
+        0. Emergency anti-liquidation (always active)
+        1. Stop loss (tight: 1.5×ATR)
+        2. BB middle TP (primary MR target)
+        3. Regime switch detection (breakout → convert to TREND)
+        4. Signal reversal (confluence against us)
+        5. Time limit (MR-specific, shorter)
+
+        Returns 'HOLD' or exit reason string.
+        """
+        strat = self._config.get("strategy", {})
+
+        # === 0. EMERGENCY (always active) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        # === 1. STOP LOSS (tight MR SL) ===
+        if strat.get("sl_enabled", True):
+            if self._check_stop_loss(pos, price):
+                return self.EXIT_SL
+
+        # === 2. BB MIDDLE TP (primary MR target) ===
+        if pos.mr_tp_price > 0:
+            if pos.side == OrderSide.BUY_LONG and price >= pos.mr_tp_price:
+                logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
+                            f"(target={pos.mr_tp_price:.6f})")
+                return self.EXIT_MR_TP
+            elif pos.side == OrderSide.SELL_SHORT and price <= pos.mr_tp_price:
+                logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
+                            f"(target={pos.mr_tp_price:.6f})")
+                return self.EXIT_MR_TP
+
+        # === 3. REGIME SWITCH DETECTION (MR → TREND) ===
+        # If price breaks through opposite BB + volume surging + ADX rising
+        # → convert this position to TREND mode (remove TP, start trailing)
+        if strat.get("mr_breakout_to_trend", True) and indicator_values:
+            switched = self._check_mr_regime_switch(pos, price, indicator_values)
+            if switched:
+                # Position stays open but mode changes — return HOLD
+                return "HOLD"
+
+        # === 4. SIGNAL REVERSAL ===
+        if strat.get("signal_exit_enabled", True):
+            if self._check_confluence_reversal(pos, confluence, price):
+                return self.EXIT_CONFLUENCE
+
+        # === 5. TIME LIMIT (MR-specific, shorter) ===
+        if strat.get("time_limit_enabled", True):
+            mr_time_limit = strat.get("mr_time_limit_minutes", 240) * 60
+            hold_time = time.time() - pos.entry_time
+            if hold_time >= mr_time_limit:
+                logger.info(f"[MR] {pos.symbol} MR time limit reached "
+                            f"({hold_time/60:.0f}min >= {mr_time_limit/60:.0f}min)")
+                return self.EXIT_TIME
+
+        # Publish position update
+        self._event_bus.publish(EventType.POSITION_UPDATE, {
+            "symbol": pos.symbol,
+            "entry_price": pos.entry_price,
+            "current_price": price,
+            "pnl": self._get_pnl(pos, price),
+            "pnl_pct": self._get_pnl_pct(pos, price),
+            "trailing_stop": pos.trailing_stop,
+            "highest": pos.highest_price,
+            "hold_seconds": time.time() - pos.entry_time,
+        })
+
+        return "HOLD"
+
+    def _check_mr_regime_switch(self, pos: ActivePosition, price: float,
+                                 indicators: dict) -> bool:
+        """Detect breakout from MR range → switch to TREND mode.
+
+        Conditions (all must be true):
+        1. Price broke through opposite BB band
+        2. Volume ratio > breakout threshold
+        3. ADX is rising (trend forming)
+
+        Returns True if regime switch happened.
+        """
+        strat = self._config.get("strategy", {})
+        breakout_vol = strat.get("mr_breakout_volume_ratio", 1.5)
+
+        bb_upper = indicators.get("BB_Upper", 0)
+        bb_lower = indicators.get("BB_Lower", 0)
+        vol_ratio = indicators.get("Volume_ratio", 1.0)
+        adx_slope = indicators.get("ADX_slope", 0)
+
+        if bb_upper <= 0 or bb_lower <= 0:
+            return False
+
+        # Check breakout conditions
+        breakout = False
+        if pos.side == OrderSide.BUY_LONG:
+            # LONG from lower band: breakout if price > upper BB + volume + ADX rising
+            if price > bb_upper and vol_ratio >= breakout_vol and adx_slope > 0:
+                breakout = True
+        else:
+            # SHORT from upper band: breakout if price < lower BB + volume + ADX rising
+            if price < bb_lower and vol_ratio >= breakout_vol and adx_slope > 0:
+                breakout = True
+
+        if breakout:
+            logger.info(f"[MR→TREND] {pos.symbol} regime switch! "
+                        f"Price broke {'upper' if pos.side == OrderSide.BUY_LONG else 'lower'} BB "
+                        f"(vol={vol_ratio:.1f}x, ADX_slope={adx_slope:.1f})")
+            pos.entry_mode = "TREND"
+            pos.regime_switched = True
+            pos.mr_tp_price = 0.0  # Remove MR TP
+
+            # Activate trailing for trend mode
+            atr = pos.atr_at_entry
+            activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
+            distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+
+            if atr > 0:
+                ref_price = pos.entry_price
+                if pos.side == OrderSide.BUY_LONG:
+                    profit_atr = (price - ref_price) / atr
+                    trail_dist = atr * distance_mult
+                    new_trail = price - trail_dist
+                    if new_trail > pos.trailing_stop:
+                        pos.trailing_stop = new_trail
+                    if profit_atr >= activate_mult:
+                        pos.trailing_active = True
+                else:
+                    profit_atr = (ref_price - price) / atr
+                    trail_dist = atr * distance_mult
+                    new_trail = price + trail_dist
+                    if pos.trailing_stop <= 0 or new_trail < pos.trailing_stop:
+                        pos.trailing_stop = new_trail
+                    if profit_atr >= activate_mult:
+                        pos.trailing_active = True
+
+            return True
+
+        return False
 
     def close_position(self, symbol: str, exit_price: float, reason: str) -> dict:
         """Close a specific position and return trade result. Thread-safe."""
@@ -820,9 +1012,10 @@ class PositionManager:
             lev = pos.leverage
 
             # New SL from virtual entry (fee-aware, same formula as initial SL)
-            fee_pct = 0.001  # 0.1% round-trip
+            fee_pct = strat.get("fee_pct", 0.10) / 100.0
             fee_roi = fee_pct * lev * 100
-            slippage_roi = fee_roi * 0.5
+            slippage_mult = strat.get("slippage_mult", 0.5)
+            slippage_roi = fee_roi * slippage_mult
             liq_pct = (1.0 / lev) * liq_factor
             raw_sl_roi = liq_pct * sl_liq_pct * lev * 100
             net_sl_roi = max(raw_sl_roi - fee_roi - slippage_roi, fee_roi)
@@ -894,28 +1087,35 @@ class PositionManager:
                 roi = (pos.entry_price - current_price) / pos.entry_price * lev * 100
             in_profit = roi >= fee_roi
 
-        # Sadece kârda (fee dahil) ve sinyal ters pozisyon açacak kadar
-        # dönmüşse çık. Zararda sinyal çıkışı yapılmaz — server SL korur.
-        if not in_profit:
-            return False
-
-        # Sinyal, ters pozisyon açılacak kadar güçlü mü?
-        # min_buy_score seviyesinde ters sinyal = gerçek dönüş
+        # Sinyal eşikleri
         min_score = strat.get("min_buy_score", 70)
         threshold = strat.get("signal_exit_threshold", 4.0)
-        # Ters sinyal gücü: hem confluence threshold hem de min_buy_score
-        # seviyesinde olmalı (yani bu sinyal ile ters pozisyon açılabilir)
+        deep_threshold = strat.get("signal_deep_exit_threshold", 8.0)
+        only_in_profit = strat.get("signal_only_in_profit", True)
         abs_score = abs(score)
         reverse_worthy = abs_score >= min_score
 
-        if pos.side == OrderSide.BUY_LONG and signal == "SELL" and score <= -threshold and reverse_worthy:
-            logger.info(f"[SIGNAL EXIT] {pos.symbol} kârda sinyal çıkışı "
-                        f"(conf={score:.1f}, abs={abs_score:.1f} >= min_score={min_score}, ROI={roi:.1f}%)")
-            return True
-        if pos.side == OrderSide.SELL_SHORT and signal == "BUY" and score >= threshold and reverse_worthy:
-            logger.info(f"[SIGNAL EXIT] {pos.symbol} kârda sinyal çıkışı "
-                        f"(conf={score:.1f}, abs={abs_score:.1f} >= min_score={min_score}, ROI={roi:.1f}%)")
-            return True
+        # --- Kârda: normal eşik (conf threshold) ile çıkış ---
+        if in_profit:
+            if pos.side == OrderSide.BUY_LONG and signal == "SELL" and score <= -threshold and reverse_worthy:
+                logger.info(f"[SIGNAL EXIT] {pos.symbol} kârda sinyal çıkışı "
+                            f"(conf={score:.1f}, abs={abs_score:.1f} >= min_score={min_score}, ROI={roi:.1f}%)")
+                return True
+            if pos.side == OrderSide.SELL_SHORT and signal == "BUY" and score >= threshold and reverse_worthy:
+                logger.info(f"[SIGNAL EXIT] {pos.symbol} kârda sinyal çıkışı "
+                            f"(conf={score:.1f}, abs={abs_score:.1f} >= min_score={min_score}, ROI={roi:.1f}%)")
+                return True
+
+        # --- Zararda: derin reversal eşiği (signal_only_in_profit=false ise) ---
+        if not in_profit and not only_in_profit:
+            if pos.side == OrderSide.BUY_LONG and signal == "SELL" and score <= -deep_threshold and reverse_worthy:
+                logger.info(f"[SIGNAL EXIT] {pos.symbol} zararda derin reversal çıkışı "
+                            f"(conf={score:.1f} <= -{deep_threshold:.0f}, ROI={roi:.1f}%)")
+                return True
+            if pos.side == OrderSide.SELL_SHORT and signal == "BUY" and score >= deep_threshold and reverse_worthy:
+                logger.info(f"[SIGNAL EXIT] {pos.symbol} zararda derin reversal çıkışı "
+                            f"(conf={score:.1f} >= +{deep_threshold:.0f}, ROI={roi:.1f}%)")
+                return True
 
         return False
 

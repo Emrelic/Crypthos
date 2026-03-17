@@ -17,15 +17,20 @@ class BollingerBands(Indicator):
         self._lower = 0.0
         self._bandwidth = 0.0
         self._percent_b = 0.0
+        self._bandwidth_series = None
 
     def compute(self, df: pd.DataFrame) -> None:
         self._prev_value = self._value
         close = df["close"]
-        self._middle = close.rolling(self.period).mean().iloc[-1]
-        std = close.rolling(self.period).std().iloc[-1]
-        self._upper = self._middle + self.std_dev * std
-        self._lower = self._middle - self.std_dev * std
+        middle_s = close.rolling(self.period).mean()
+        std_s = close.rolling(self.period).std()
+        upper_s = middle_s + self.std_dev * std_s
+        lower_s = middle_s - self.std_dev * std_s
+        self._middle = middle_s.iloc[-1]
+        self._upper = upper_s.iloc[-1]
+        self._lower = lower_s.iloc[-1]
         self._bandwidth = (self._upper - self._lower) / (self._middle + 1e-10) * 100
+        self._bandwidth_series = (upper_s - lower_s) / (middle_s + 1e-10) * 100
         self._percent_b = (close.iloc[-1] - self._lower) / (self._upper - self._lower + 1e-10)
         self._value = close.iloc[-1]
 

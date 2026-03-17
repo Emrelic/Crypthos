@@ -116,15 +116,127 @@ class IndicatorEngine:
         # MACD special values
         macd = self._indicators.get("MACD")
         if macd:
+            cross_lookback = self._config.get("indicators.macd_cross_lookback", 3)
             results["MACD_line"] = macd.macd_line
             results["MACD_signal"] = macd.signal_line
             results["MACD_histogram"] = macd.histogram
-            results["MACD_bullish_cross"] = macd.bullish_crossover()
-            results["MACD_bearish_cross"] = macd.bearish_crossover()
+            results["MACD_bullish_cross"] = macd.bullish_crossover(lookback=cross_lookback)
+            results["MACD_bearish_cross"] = macd.bearish_crossover(lookback=cross_lookback)
 
         # Add price for reference
         if not df.empty:
             results["Price"] = df["close"].iloc[-1]
+
+        # SMA cross detection (price crossing SMA_slow)
+        sma_slow_ind = self._indicators.get("SMA_slow")
+        if sma_slow_ind and sma_slow_ind._series is not None and not df.empty:
+            sma_lookback = self._config.get("indicators.sma_cross_lookback", 3)
+            prices = df["close"]
+            sma_vals = sma_slow_ind._series
+            sma_fresh_cross = False
+            if len(prices) >= sma_lookback + 1 and len(sma_vals) >= sma_lookback + 1:
+                for i in range(1, sma_lookback + 1):
+                    idx = -i
+                    prev_idx = idx - 1
+                    if abs(prev_idx) > len(prices):
+                        break
+                    prev_price = prices.iloc[prev_idx]
+                    prev_sma = sma_vals.iloc[prev_idx]
+                    curr_price = prices.iloc[idx]
+                    curr_sma = sma_vals.iloc[idx]
+                    # Bullish or bearish cross
+                    if (prev_price <= prev_sma and curr_price > curr_sma) or \
+                       (prev_price >= prev_sma and curr_price < curr_sma):
+                        sma_fresh_cross = True
+                        break
+            results["SMA_fresh_cross"] = sma_fresh_cross
+
+        # EMA cross detection (EMA_fast crossing EMA50 — golden/death cross)
+        ema_fast_ind = self._indicators.get("EMA_fast")
+        ema50_ind = self._indicators.get("EMA50")
+        if ema_fast_ind and ema50_ind and \
+           ema_fast_ind._series is not None and ema50_ind._series is not None:
+            ema_lookback = self._config.get("indicators.ema_cross_lookback", 3)
+            ema_f = ema_fast_ind._series
+            ema_s = ema50_ind._series
+            ema_fresh_cross = False
+            if len(ema_f) >= ema_lookback + 1 and len(ema_s) >= ema_lookback + 1:
+                for i in range(1, ema_lookback + 1):
+                    idx = -i
+                    prev_idx = idx - 1
+                    if abs(prev_idx) > len(ema_f):
+                        break
+                    prev_f = ema_f.iloc[prev_idx]
+                    prev_s = ema_s.iloc[prev_idx]
+                    curr_f = ema_f.iloc[idx]
+                    curr_s = ema_s.iloc[idx]
+                    if (prev_f <= prev_s and curr_f > curr_s) or \
+                       (prev_f >= prev_s and curr_f < curr_s):
+                        ema_fresh_cross = True
+                        break
+            results["EMA_fresh_cross"] = ema_fresh_cross
+
+        # ADX DI momentum: DI farki son N mumda hizla aciliyor mu?
+        adx_ind = self._indicators.get("ADX")
+        if adx_ind and adx_ind._plus_di_series is not None:
+            di_lookback = self._config.get("indicators.adx_di_momentum_lookback", 3)
+            plus_s = adx_ind._plus_di_series
+            minus_s = adx_ind._minus_di_series
+            if len(plus_s) >= di_lookback + 1:
+                di_gap_now = abs(plus_s.iloc[-1] - minus_s.iloc[-1])
+                di_gap_prev = abs(plus_s.iloc[-(di_lookback + 1)] - minus_s.iloc[-(di_lookback + 1)])
+                results["DI_momentum"] = round(di_gap_now - di_gap_prev, 2)
+            else:
+                results["DI_momentum"] = 0.0
+
+        # ──── MEAN REVERSION DERIVATIVES ────
+
+        # 1. ADX_slope: ADX change over last 5 bars
+        adx_ind2 = self._indicators.get("ADX")
+        if adx_ind2 and adx_ind2._adx_series is not None and len(adx_ind2._adx_series) >= 6:
+            results["ADX_slope"] = round(
+                adx_ind2._adx_series.iloc[-1] - adx_ind2._adx_series.iloc[-6], 2)
+        else:
+            results["ADX_slope"] = 0.0
+
+        # 2. BB_Width_slope: BB Width change over last 10 bars
+        bb_ind = self._indicators.get("BB")
+        if bb_ind and bb_ind._bandwidth_series is not None and len(bb_ind._bandwidth_series) >= 11:
+            results["BB_Width_slope"] = round(
+                bb_ind._bandwidth_series.iloc[-1] - bb_ind._bandwidth_series.iloc[-11], 4)
+        else:
+            results["BB_Width_slope"] = 0.0
+
+        # 3. Volume_ratio: current volume vs 20-bar average
+        if not df.empty and "volume" in df.columns and len(df) >= 20:
+            vol_avg = df["volume"].iloc[-20:].mean()
+            cur_vol = df["volume"].iloc[-1]
+            results["Volume_ratio"] = round(cur_vol / vol_avg, 2) if vol_avg > 0 else 1.0
+        else:
+            results["Volume_ratio"] = 1.0
+
+        # 4. EMA_gap_expanding: is |EMA_fast - SMA_slow| gap increasing?
+        ema_f_ind = self._indicators.get("EMA_fast")
+        sma_s_ind = self._indicators.get("SMA_slow")
+        if (ema_f_ind and sma_s_ind and
+                ema_f_ind._series is not None and sma_s_ind._series is not None and
+                len(ema_f_ind._series) >= 6 and len(sma_s_ind._series) >= 6):
+            gap_now = abs(ema_f_ind._series.iloc[-1] - sma_s_ind._series.iloc[-1])
+            gap_prev = abs(ema_f_ind._series.iloc[-6] - sma_s_ind._series.iloc[-6])
+            results["EMA_gap_expanding"] = gap_now > gap_prev
+        else:
+            results["EMA_gap_expanding"] = False
+
+        # 5. MACD_histogram_prev: previous bar histogram for MR turn detection
+        macd_ind2 = self._indicators.get("MACD")
+        if macd_ind2 and macd_ind2._macd_series is not None and macd_ind2._signal_series is not None:
+            ms, ss = macd_ind2._macd_series, macd_ind2._signal_series
+            if len(ms) >= 2 and len(ss) >= 2:
+                results["MACD_histogram_prev"] = ms.iloc[-2] - ss.iloc[-2]
+            else:
+                results["MACD_histogram_prev"] = 0.0
+        else:
+            results["MACD_histogram_prev"] = 0.0
 
         self._last_results = results
         return results

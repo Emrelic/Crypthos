@@ -230,6 +230,12 @@ class AppController:
             return self.scanner.get_scan_results()
         return []
 
+    def get_mr_scan_results(self) -> list:
+        """Return Mean Reversion scan results."""
+        if self.scanner:
+            return self.scanner.get_mr_scan_results()
+        return []
+
     def get_scanner_candidate(self):
         if self.scanner:
             return self.scanner.get_candidate()
@@ -259,6 +265,73 @@ class AppController:
         if self.scanner:
             return self.scanner.scan_count
         return 0
+
+    def get_banned_symbols(self) -> dict[str, dict]:
+        if self.scanner:
+            return self.scanner.get_banned_symbols()
+        return {}
+
+    def get_system_alerts(self) -> list[dict]:
+        """Get active system alerts (pauses, limits, bans).
+        Returns: [{"level": "error"|"warning"|"info", "message": str}]"""
+        alerts = []
+        if self.risk_manager:
+            stats = self.risk_manager.get_risk_stats()
+            max_consec = self.risk_manager._max_consecutive_before_pause
+            consec = stats.get("consecutive_losses", 0)
+            if consec >= max_consec:
+                alerts.append({
+                    "level": "error",
+                    "message": f"DURDURULDU: {consec} ardisik zarar (limit: {max_consec})",
+                })
+            elif consec >= max_consec - 2:
+                alerts.append({
+                    "level": "warning",
+                    "message": f"DIKKAT: {consec}/{max_consec} ardisik zarar",
+                })
+
+            daily_loss = stats.get("daily_loss", 0)
+            daily_limit = self.config.get("risk.daily_loss_limit_usdt", 5.0)
+            if daily_loss >= daily_limit:
+                alerts.append({
+                    "level": "error",
+                    "message": f"Gunluk zarar limiti: {daily_loss:.2f}/{daily_limit:.2f} USDT",
+                })
+
+            dd = stats.get("drawdown_pct", 0)
+            max_dd = self.config.get("risk.max_drawdown_percent", 30.0)
+            if dd >= max_dd:
+                alerts.append({
+                    "level": "error",
+                    "message": f"Max drawdown: %{dd:.1f} (limit: %{max_dd:.0f})",
+                })
+
+            if stats.get("killed", False):
+                alerts.append({
+                    "level": "error",
+                    "message": "KILL SWITCH AKTIF — tum emirler engellendi",
+                })
+
+        # Banned symbol count
+        bans = self.get_banned_symbols()
+        if bans:
+            cooldowns = sum(1 for v in bans.values() if v["type"] == "cooldown")
+            daily_bans = sum(1 for v in bans.values() if v["type"] == "daily_ban")
+            parts = []
+            if cooldowns:
+                parts.append(f"{cooldowns} cooldown")
+            if daily_bans:
+                parts.append(f"{daily_bans} ban")
+            alerts.append({
+                "level": "info",
+                "message": f"Banli coin: {', '.join(parts)} ({len(bans)} toplam)",
+            })
+
+        return alerts
+
+    def reset_consecutive_losses(self) -> None:
+        if self.risk_manager:
+            self.risk_manager.reset_consecutive_losses()
 
     # ──── Safety ────
 

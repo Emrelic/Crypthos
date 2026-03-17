@@ -59,7 +59,7 @@ class ScannerScorer:
         self._config = config
         # Dedicated indicator engine for scanning (not shared with main engine)
         self._engine = IndicatorEngine(config)
-        self._confluence = ConfluenceScorer(threshold=4.0)
+        self._confluence = ConfluenceScorer(threshold=4.0, config=config)
         self._regime = MarketRegimeDetector()
         self._divergence = DivergenceDetector(lookback=20)
 
@@ -281,6 +281,9 @@ class ScannerScorer:
             checks["ADX"] = (False, f"{r.adx:.0f}", f">={strat.get('adx_regime_no_trade', 18)}")
             if not first_fail:
                 first_fail = f"adx_no_trade_zone ({r.adx:.0f} < {strat.get('adx_regime_no_trade', 18)})"
+            # NO_TRADE is final — skip zone detection entirely
+            r.filter_checks = checks
+            return False, first_fail
 
         # === ADX ZONE DETECTION ===
         ranging_cfg = strat.get("ranging_mode", {})
@@ -291,7 +294,7 @@ class ScannerScorer:
         if r.adx <= ranging_cfg.get("max_adx", 18):
             zone = "RANGING"
             min_conf = ranging_cfg.get("min_confluence", 4.0)
-            min_adx = 0  # No ADX minimum for ranging
+            min_adx = strat.get("min_adx", 25)  # Same ADX minimum for all zones
             if ranging_cfg.get("enabled", True):
                 max_rsi_long = ranging_cfg.get("max_rsi_buy", 35)
                 min_rsi_short = ranging_cfg.get("min_rsi_sell", 65)
@@ -723,7 +726,7 @@ class ScannerScorer:
         return max(0, min(score, 100))
 
     def _score_sentiment(self, r: ScanResult) -> float:
-        """Score bonus/penalty from funding rate + open interest + order book (max +/-12 pts).
+        """Score bonus/penalty from funding rate + open interest + order book (max +/-14 pts).
 
         Funding Rate Logic:
           - High positive funding → longs are crowded → favors SHORT
@@ -796,11 +799,19 @@ class ScannerScorer:
                 # Negative imbalance = more asks = selling pressure = good for short
                 bonus += -ob_imb * 5.0
 
+        # --- Wall Bonus: wall blocking the OTHER direction favors us ---
+        # UP_BLOCKED = big sell wall above → price can't go up → good for SHORT
+        # DOWN_BLOCKED = big buy wall below → price can't go down → good for LONG
+        if r.ob_wall_signal == "UP_BLOCKED" and r.direction == "SHORT":
+            bonus += 2.0
+        elif r.ob_wall_signal == "DOWN_BLOCKED" and r.direction == "LONG":
+            bonus += 2.0
+
         # Liquidity quality bonus: high liquidity = safer trade
         if r.ob_liquidity >= 70:
             bonus += 2.0
         elif r.ob_liquidity < 30 and r.ob_liquidity > 0:
             bonus -= 2.0
 
-        # Clamp total sentiment to +-12
-        return max(-12.0, min(12.0, bonus))
+        # Clamp total sentiment to +-14
+        return max(-14.0, min(14.0, bonus))
