@@ -388,8 +388,11 @@ class ScannerPanel(ctk.CTkFrame):
 
     def _update_row(self, rows_list, cache_list, idx, vals, bg=None):
         """Update a single row if vals changed."""
-        if idx >= len(cache_list) or cache_list[idx] == vals:
+        if idx >= len(cache_list):
             return
+        # Force update for now - cache issue
+        # if cache_list[idx] == vals:
+        #     return
         cache_list[idx] = vals
         frame, labels = rows_list[idx]
         if bg is not None and frame.cget("fg_color") != bg:
@@ -405,6 +408,8 @@ class ScannerPanel(ctk.CTkFrame):
             return
         banned_symbols = self.controller.get_banned_symbols()
         n = min(len(results), 80)
+        from loguru import logger
+        logger.info(f"Trend ensure_rows: n={n}, results={len(results)}")
 
         self._ensure_rows(self._results_scroll, self._result_rows,
                           self._result_cache, SHARED_WIDTHS, n)
@@ -414,8 +419,13 @@ class ScannerPanel(ctk.CTkFrame):
                 vals = self._build_scan_row_vals(i, r, banned_symbols)
                 bg = "#1e3355" if i % 2 == 0 else "#172540"
                 self._update_row(self._result_rows, self._result_cache, i, vals, bg)
-            except Exception:
-                pass
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"Trend row {i} exception: {e}")
+                continue
+        
+        # Force GUI refresh
+        self.update_idletasks()
 
         candidate = self.controller.get_scanner_candidate()
         sb = self._get_status_bar()
@@ -515,7 +525,7 @@ class ScannerPanel(ctk.CTkFrame):
         else:
             ban_str, ban_color = "", "gray"
 
-        return [
+        result = [
             (f"{i+1}", "gray"), sys_signal,
             (f"{r.symbol}{eligible_marker}", row_color),
             (f"{r.score:+.0f}", score_color),
@@ -531,6 +541,7 @@ class ScannerPanel(ctk.CTkFrame):
             (ban_str, ban_color),
             (reject_short, "#FF5252" if reject_short else "gray"),
         ]
+        return result
 
     def _build_mtf_sub_row_vals(self, tf, mtf_entry, symbol):
         indicators = mtf_entry.get("indicators", {})
@@ -569,19 +580,32 @@ class ScannerPanel(ctk.CTkFrame):
 
     def _update_mr_results(self):
         results = self.controller.get_mr_scan_results()
+        from loguru import logger
+        logger.info(f"MR _update_mr_results: {len(results)} results")
         if not results:
             self._ensure_rows(self._mr_scroll, self._mr_rows,
                               self._mr_cache, SHARED_WIDTHS, 0)
             return
 
         n = min(len(results), 50)
+        logger.info(f"MR ensure_rows: n={n}, results={len(results)}")
         self._ensure_rows(self._mr_scroll, self._mr_rows,
                           self._mr_cache, SHARED_WIDTHS, n)
 
         for i, r in enumerate(results[:n]):
-            vals = self._build_mr_row_vals(i, r)
-            bg = "#1c2d4d" if i % 2 == 0 else "transparent"
-            self._update_row(self._mr_rows, self._mr_cache, i, vals, bg)
+            try:
+                vals = self._build_mr_row_vals(i, r)
+                bg = "#1c2d4d" if i % 2 == 0 else "transparent"
+                if i == 0:  # Debug first MR row
+                    logger.info(f"MR row 0: symbol={r.symbol}, score={r.score}, vals[0:3]={vals[:3]}")
+                self._update_row(self._mr_rows, self._mr_cache, i, vals, bg)
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"MR row {i} exception: {e}")
+                continue
+        
+        # Force GUI refresh
+        self.update_idletasks()
 
     def _build_mr_row_vals(self, i, r):
         """Build row values for MR scan result using shared column layout."""

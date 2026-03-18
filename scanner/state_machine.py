@@ -298,14 +298,15 @@ class ScannerStateMachine:
         except Exception as e:
             logger.debug(f"MTF analysis failed: {e}")
 
-        self._last_scan_results = results
         logger.info(f"Scan results: {len(results)} total, "
                     f"{len([r for r in results if r.eligible])} eligible, "
                     f"{len([r for r in results if r.score != 0])} scored")
 
-        # === MEAN REVERSION POOL ===
+        # === SEPARATE INTO POOLS BASED ON ADX ===
         mr_enabled = self._config.get("strategy.mean_reversion_enabled", False)
         mr_results = []
+        trend_results = []
+        
         if mr_enabled:
             mr_max_adx = self._config.get("strategy.mr_max_adx", 18)
             gray_low = mr_max_adx      # 18
@@ -313,10 +314,12 @@ class ScannerStateMachine:
 
             # Separate coins into pools based on ADX from trend scoring
             mr_symbols = {}  # symbol -> source ("R" or "G->R")
+            trend_symbols = set()
+            
             for r in results:
                 adx = r.adx if hasattr(r, 'adx') else 0
                 if adx < gray_low:
-                    # Net range: ADX < 18
+                    # Net range: ADX < 18 -> MR pool
                     mr_symbols[r.symbol] = "R"
                 elif adx < gray_high:
                     # Gray zone: ADX 18-25 — classify via voting
@@ -324,6 +327,14 @@ class ScannerStateMachine:
                     zone = self._mr_scorer.classify_gray_zone(indicators)
                     if zone == "RANGE":
                         mr_symbols[r.symbol] = "G->R"
+                    else:
+                        trend_symbols.add(r.symbol)
+                else:
+                    # Strong trend: ADX >= 25 -> Trend pool
+                    trend_symbols.add(r.symbol)
+            
+            # Filter trend results for trend pool only
+            trend_results = [r for r in results if r.symbol in trend_symbols]
 
             if mr_symbols:
                 mr_klines = {s: klines_map[s] for s in mr_symbols if s in klines_map}
@@ -343,8 +354,15 @@ class ScannerStateMachine:
 
                 logger.info(f"MR pool: {len(mr_symbols)} coins, "
                             f"{sum(1 for r in mr_results if r.eligible)} eligible")
+        else:
+            # MR disabled - all results go to trend pool
+            trend_results = results
 
-        self._last_mr_results = mr_results
+        # Set pools
+        self._last_scan_results = trend_results  # Trend pool (ADX >= 18 filtered)
+        self._last_mr_results = mr_results       # MR pool
+        
+        logger.info(f"Pool distribution: Trend={len(trend_results)}, MR={len(mr_results)}")
 
         # 5. Find best eligible candidate
         now = time.time()
