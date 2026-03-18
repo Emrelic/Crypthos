@@ -118,9 +118,10 @@ class ScannerStateMachine:
         # Per-coin daily loss ban: symbol -> [loss_timestamp, ...]
         self._coin_loss_history: dict[str, list[float]] = {}
 
-        # Server order verification: last check time
+        # Server order verification: last check time (interval from config)
         self._last_order_verify_time: float = 0.0
-        self._order_verify_interval: float = 120.0  # check every 120 seconds
+        self._order_verify_interval: float = config.get(
+            "strategy.order_verify_interval", 60.0)
 
     # ──── Setters ────
 
@@ -298,6 +299,9 @@ class ScannerStateMachine:
             logger.debug(f"MTF analysis failed: {e}")
 
         self._last_scan_results = results
+        logger.info(f"Scan results: {len(results)} total, "
+                    f"{len([r for r in results if r.eligible])} eligible, "
+                    f"{len([r for r in results if r.score != 0])} scored")
 
         # === MEAN REVERSION POOL ===
         mr_enabled = self._config.get("strategy.mean_reversion_enabled", False)
@@ -1353,8 +1357,10 @@ class ScannerStateMachine:
             logger.debug(f"External close detection error: {e}")
 
     def _verify_server_orders(self) -> None:
-        """Verify that all held positions have SL + trailing stop orders on Binance.
-        Only places MISSING orders — never cancels existing ones.
+        """Verify that all held positions have EXACTLY 1 SL + 1 trailing stop on Binance.
+        - Places MISSING orders
+        - Cleans up EXCESS orders (cancel all + re-place correct pair)
+        - For in-profit positions with missing orders: uses current price as reference
         Uses 2 BULK API calls (not per-symbol) to minimize API usage.
         Runs every 120 seconds to avoid API spam."""
         now = time.time()
@@ -1375,27 +1381,18 @@ class ScannerStateMachine:
             all_orders = rest.get_open_orders() or []  # no symbol = all
             all_algo = rest.get_algo_open_orders() or []  # no symbol = all
 
-            # Build per-symbol order map
-            order_map = {}  # symbol -> {"has_sl": bool, "has_trailing": bool}
-            for o in all_orders:
+            # Build per-symbol order count map
+            order_map = {}  # symbol -> {"sl_count": int, "trailing_count": int, "total": int}
+            for o in all_orders + all_algo:
                 sym = o.get("symbol", "")
                 if sym not in order_map:
-                    order_map[sym] = {"has_sl": False, "has_trailing": False}
+                    order_map[sym] = {"sl_count": 0, "trailing_count": 0, "total": 0}
+                order_map[sym]["total"] += 1
                 otype = o.get("type", "")
                 if otype == "STOP_MARKET":
-                    order_map[sym]["has_sl"] = True
+                    order_map[sym]["sl_count"] += 1
                 elif otype == "TRAILING_STOP_MARKET":
-                    order_map[sym]["has_trailing"] = True
-
-            for o in all_algo:
-                sym = o.get("symbol", "")
-                if sym not in order_map:
-                    order_map[sym] = {"has_sl": False, "has_trailing": False}
-                otype = o.get("type", "")
-                if otype == "STOP_MARKET":
-                    order_map[sym]["has_sl"] = True
-                elif otype == "TRAILING_STOP_MARKET":
-                    order_map[sym]["has_trailing"] = True
+                    order_map[sym]["trailing_count"] += 1
 
         except Exception as e:
             logger.debug(f"[ORDER VERIFY] Bulk order fetch failed: {e}")
@@ -1403,101 +1400,215 @@ class ScannerStateMachine:
 
         strat = self._config.get("strategy", {})
 
+        # Fetch current prices for profit calculation
+        price_map = {}
+        try:
+            all_tickers = rest.get_all_ticker_prices()
+            price_map = {t["symbol"]: float(t["price"])
+                         for t in all_tickers if float(t.get("price", 0)) > 0}
+        except Exception:
+            pass
+
         for symbol in held_symbols:
             pos = self._position_mgr.get_position(symbol)
             if not pos or pos.leverage <= 1:
                 continue
 
-            info = order_map.get(symbol, {"has_sl": False, "has_trailing": False})
-            if info["has_sl"] and info["has_trailing"]:
+            info = order_map.get(symbol, {"sl_count": 0, "trailing_count": 0, "total": 0})
+
+            # === EXCESS ORDER CLEANUP: >1 SL or >1 trailing or >max_orders total ===
+            max_orders = int(strat.get("order_verify_max_orders", 2))
+            if info["sl_count"] > 1 or info["trailing_count"] > 1 or info["total"] > max_orders:
+                logger.warning(f"[ORDER VERIFY] {symbol}: EXCESS ORDERS detected! "
+                               f"SL={info['sl_count']} trailing={info['trailing_count']} "
+                               f"total={info['total']} — cleaning up and re-placing")
+                self._repair_server_orders(symbol, pos, strat, price_map)
+                continue
+
+            # === MISSING ORDER CHECK ===
+            if info["sl_count"] >= 1 and info["trailing_count"] >= 1:
                 continue  # All good
 
             missing = []
-            if not info["has_sl"]:
+            if info["sl_count"] == 0:
                 missing.append("SL")
-            if not info["has_trailing"]:
+            if info["trailing_count"] == 0:
                 missing.append("TRAILING")
 
-            atr = pos.atr if hasattr(pos, 'atr') else 0
+            atr = pos.atr_at_entry if hasattr(pos, 'atr_at_entry') else 0
             if atr <= 0 or pos.entry_price <= 0:
                 logger.warning(f"[ORDER VERIFY] {symbol}: MISSING {', '.join(missing)} "
                                f"but ATR={atr}, entry={pos.entry_price} — cannot place")
                 continue
 
             logger.warning(f"[ORDER VERIFY] {symbol}: MISSING {', '.join(missing)}! "
-                           f"Placing missing orders...")
+                           f"Re-placing all orders (clean slate)...")
 
+            # Any missing = clean slate re-place (prevents orphan states)
+            self._repair_server_orders(symbol, pos, strat, price_map)
+
+    def _repair_server_orders(self, symbol: str, pos, strat: dict,
+                               price_map: dict) -> None:
+        """Eksik/fazla emirleri temizleyip doğru SL + trailing koyar.
+
+        3 DURUM:
+        ─────────────────────────────────────────────────────
+        A) Zararda veya sıfırda:
+           SL  = entry - N×ATR  (orijinal plan)
+           Trail = entry + M×ATR tetik, K×ATR geri çekilme (orijinal plan)
+
+        B) Kârda AMA tetik fiyatına ulaşmamış:
+           SL  = entry - N×ATR  (orijinal plan)
+           Trail = entry + M×ATR tetik, K×ATR geri çekilme (orijinal plan)
+
+        C) Kârda VE tetik fiyatını geçmiş:
+           SL  = current - N×ATR  (kâr koruması)
+           Trail = şu an tetikli (activation=current), K×ATR geri çekilme
+        ─────────────────────────────────────────────────────
+        N, M, K = config'den (server_sl_atr_mult, trailing_atr_activate_mult,
+                              trailing_atr_distance_mult veya ADX regime override)
+        """
+        try:
+            rest = self._order_executor._rest
             pp = self._order_executor._get_price_precision(symbol)
             is_long = pos.side == OrderSide.BUY_LONG
             close_side = "SELL" if is_long else "BUY"
             entry_regime = getattr(pos, 'entry_regime', '')
+            entry_price = pos.entry_price
 
-            # Place missing SL only
-            if not info["has_sl"]:
-                sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
-                if strat.get("adx_regime_enabled", False) and entry_regime in (
-                        "RANGING", "WEAK_TREND", "STRONG_TREND"):
-                    prefix = {"RANGING": "adx_regime_ranging",
-                              "WEAK_TREND": "adx_regime_weak",
-                              "STRONG_TREND": "adx_regime_strong"}[entry_regime]
-                    sl_atr_mult = strat.get(f"{prefix}_sl_atr", sl_atr_mult)
+            atr = pos.atr_at_entry if hasattr(pos, 'atr_at_entry') else 0
+            if atr <= 0 or entry_price <= 0:
+                logger.warning(f"[ORDER REPAIR] {symbol}: ATR={atr}, entry={entry_price}"
+                               f" — cannot repair")
+                return
 
+            current_price = price_map.get(symbol, 0)
+
+            # ── Config multiplier'ları ──
+            sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
+            activate_mult = strat.get("trailing_atr_activate_mult", 3.0)
+            distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+
+            if strat.get("adx_regime_enabled", False) and entry_regime in (
+                    "RANGING", "WEAK_TREND", "STRONG_TREND"):
+                prefix = {"RANGING": "adx_regime_ranging",
+                          "WEAK_TREND": "adx_regime_weak",
+                          "STRONG_TREND": "adx_regime_strong"}[entry_regime]
+                sl_atr_mult = strat.get(f"{prefix}_sl_atr", sl_atr_mult)
+                activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
+                distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
+
+            # ── Orijinal tetik fiyatı (pozisyon açılışındaki plan) ──
+            if is_long:
+                original_activation = entry_price + (atr * activate_mult)
+            else:
+                original_activation = entry_price - (atr * activate_mult)
+
+            # ── 3 Durum Tespiti ──
+            past_activation = False
+            in_profit = False
+            if current_price > 0:
                 if is_long:
-                    sl_price = round(pos.entry_price - (atr * sl_atr_mult), pp)
+                    in_profit = current_price > entry_price
+                    past_activation = current_price > original_activation
                 else:
-                    sl_price = round(pos.entry_price + (atr * sl_atr_mult), pp)
+                    in_profit = current_price < entry_price
+                    past_activation = current_price < original_activation
 
-                try:
-                    rest.place_order(
-                        symbol=symbol, side=close_side,
-                        order_type="STOP_MARKET",
-                        quantity=pos.size, stop_price=sl_price,
-                    )
-                    logger.info(f"[ORDER VERIFY] {symbol}: SL placed @ {sl_price} "
-                                f"({sl_atr_mult}xATR)")
-                except Exception as e:
-                    logger.error(f"[ORDER VERIFY] {symbol}: SL placement failed: {e}")
+            # ── Durum belirleme ──
+            if past_activation:
+                # DURUM C: Kârda ve tetik fiyatını geçmiş
+                # SL = current - N×ATR (kâr koruması)
+                # Trailing = hemen tetikli (activation = current), K×ATR geri çekilme
+                case = "C"
+                sl_ref = current_price
+                trail_activation_ref = current_price  # zaten tetiklenmiş
+                trail_activate_mult = 0  # activation = current (offset yok)
+            elif in_profit:
+                # DURUM B: Kârda ama tetik fiyatına ulaşmamış → orijinal plan
+                case = "B"
+                sl_ref = entry_price
+                trail_activation_ref = entry_price
+                trail_activate_mult = activate_mult
+            else:
+                # DURUM A: Zararda veya sıfırda → orijinal plan
+                case = "A"
+                sl_ref = entry_price
+                trail_activation_ref = entry_price
+                trail_activate_mult = activate_mult
 
-            # Place missing trailing only
-            if not info["has_trailing"]:
-                activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
-                distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
-                if strat.get("adx_regime_enabled", False) and entry_regime in (
-                        "RANGING", "WEAK_TREND", "STRONG_TREND"):
-                    prefix = {"RANGING": "adx_regime_ranging",
-                              "WEAK_TREND": "adx_regime_weak",
-                              "STRONG_TREND": "adx_regime_strong"}[entry_regime]
-                    activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
-                    distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
+            # ── Cancel ALL existing orders ──
+            try:
+                cancel_result = rest.cancel_all_orders(symbol)
+                if cancel_result.get("errors"):
+                    logger.warning(f"[ORDER REPAIR] {symbol}: cancel issues: "
+                                   f"{cancel_result['errors']}")
+            except Exception as e:
+                logger.error(f"[ORDER REPAIR] {symbol}: cancel failed: {e}")
+                return
 
-                callback_pct = (atr * distance_mult) / pos.entry_price * 100
-                callback_pct = max(0.1, min(5.0, round(callback_pct, 1)))
+            # ── 1. Place SL ──
+            if is_long:
+                sl_price = round(sl_ref - (atr * sl_atr_mult), pp)
+            else:
+                sl_price = round(sl_ref + (atr * sl_atr_mult), pp)
 
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=pos.size, stop_price=sl_price,
+                )
+                logger.info(f"[ORDER REPAIR] {symbol} durum={case}: "
+                            f"SL @ {sl_price} ({sl_atr_mult}xATR from {sl_ref:.{pp}f})")
+            except Exception as e:
+                logger.error(f"[ORDER REPAIR] {symbol}: SL placement failed: {e}")
+
+            # ── 2. Place TRAILING_STOP_MARKET ──
+            callback_pct = (atr * distance_mult) / (trail_activation_ref if trail_activation_ref > 0 else entry_price) * 100
+            callback_pct = max(0.1, min(5.0, round(callback_pct, 1)))
+
+            if case == "C":
+                # Tetiklenmiş: activation = current price (hemen aktif olsun)
+                activation_price = round(current_price, pp)
+            else:
+                # Orijinal plan: activation = entry ± M×ATR
                 if is_long:
-                    activation_price = round(pos.entry_price + (atr * activate_mult), pp)
+                    activation_price = round(trail_activation_ref + (atr * trail_activate_mult), pp)
                 else:
-                    activation_price = round(pos.entry_price - (atr * activate_mult), pp)
+                    activation_price = round(trail_activation_ref - (atr * trail_activate_mult), pp)
 
-                try:
-                    rest.place_order(
-                        symbol=symbol, side=close_side,
-                        order_type="TRAILING_STOP_MARKET",
-                        quantity=pos.size,
-                        stop_price=activation_price,
-                        callback_rate=callback_pct,
-                    )
-                    self._server_trailing[symbol] = {
-                        "callback_pct": callback_pct,
-                        "activation_price": activation_price,
-                        "sl_price": 0,
-                        "timestamp": time.time(),
-                        "renewal_count": 0,
-                    }
-                    logger.info(f"[ORDER VERIFY] {symbol}: Trailing placed "
-                                f"activation={activation_price} callback={callback_pct}% "
-                                f"({activate_mult}/{distance_mult}xATR)")
-                except Exception as e:
-                    logger.error(f"[ORDER VERIFY] {symbol}: Trailing placement failed: {e}")
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=pos.size,
+                    stop_price=activation_price,
+                    callback_rate=callback_pct,
+                )
+                self._server_trailing[symbol] = {
+                    "callback_pct": callback_pct,
+                    "activation_price": activation_price,
+                    "sl_price": sl_price,
+                    "timestamp": time.time(),
+                    "renewal_count": getattr(pos, 'trailing_renewal_count', 0),
+                }
+                case_desc = {
+                    "A": "zararda, orijinal plan",
+                    "B": "kârda, tetik altı, orijinal plan",
+                    "C": f"kârda, tetik üstü, SL={sl_ref:.{pp}f}, trail hemen aktif",
+                }[case]
+                logger.info(f"[ORDER REPAIR] {symbol} durum={case}: "
+                            f"Trailing activation={activation_price} "
+                            f"callback={callback_pct}% ({distance_mult}xATR) "
+                            f"[{case_desc}]")
+            except Exception as e:
+                logger.error(f"[ORDER REPAIR] {symbol}: Trailing placement failed: {e}")
+
+        except Exception as e:
+            logger.error(f"[ORDER REPAIR] {symbol}: repair failed: {e}")
+            import traceback
+            logger.error(f"[ORDER REPAIR] traceback: {traceback.format_exc()}")
 
     def _execute_partial_tp(self, symbol: str, current_price: float) -> None:
         """Close a portion of the position at N×ATR profit, keep rest for trailing."""
@@ -1743,7 +1854,7 @@ class ScannerStateMachine:
         # Cap list size as safety measure
         if len(self._trade_timestamps) > 100:
             self._trade_timestamps = self._trade_timestamps[-100:]
-        if len(self._trade_timestamps) >= self._max_trades_per_hour:
+        if self._max_trades_per_hour and len(self._trade_timestamps) >= self._max_trades_per_hour:
             logger.info(f"Trade frequency limit reached: "
                         f"{len(self._trade_timestamps)}/{self._max_trades_per_hour} "
                         f"trades in last hour. Waiting...")
@@ -1915,9 +2026,10 @@ class ScannerStateMachine:
             if sizing_mode == "percentage":
                 # Emre Ortalama: portfolio_divider (1/N of REALIZED portfolio)
                 # Portfolio = free cash + sum of entry margins (NOT unrealized PnL)
-                # Unrealized profits don't count until position is closed.
-                # Example: 9$ free + 3 positions × 1$ margin = 12$ portfolio
-                # When one closes at +1$ profit: 11$ free + 2×1$ = 13$
+                # Kurallar:
+                #   wallet >= 12$: margin = wallet / 12
+                #   4$ <= wallet < 12$: margin = 1$ (sabit)
+                #   wallet < 4$: margin = wallet / 4
                 divider = self._config.get("strategy.portfolio_divider", 0)
                 if divider > 0:
                     locked_margin = self._position_mgr.get_total_margin()
@@ -1928,13 +2040,28 @@ class ScannerStateMachine:
                             balance = self._risk_manager._current_balance
                         wallet = balance
 
-                    if wallet < 12.0:
-                        divider = max(1, int(wallet))
-                    margin_usdt = round(wallet / divider, 2)
-                    sizing_label = f"1/{divider} of {wallet:.2f}$"
+                    # GUI'den ayarlanabilir parametreler
+                    min_wallet = self._config.get("strategy.portfolio_min_wallet", 12.0)
+                    fixed_margin = self._config.get("strategy.portfolio_fixed_margin", 1.0)
+                    micro_divider = self._config.get("strategy.portfolio_micro_divider", 4)
+
+                    if wallet >= min_wallet:
+                        # Normal: 1/N of portfolio (ornek: 1/12)
+                        margin_usdt = round(wallet / divider, 2)
+                        sizing_label = f"1/{divider} of {wallet:.2f}$"
+                    elif wallet >= 4.0:
+                        # Küçük portföy: sabit margin (varsayilan 1$)
+                        margin_usdt = fixed_margin
+                        sizing_label = f"{fixed_margin}$ sabit ({wallet:.2f}$ portföy)"
+                    else:
+                        # Mikro portföy: 1/N of portfolio (varsayilan 1/4)
+                        micro_div = max(2, micro_divider)
+                        margin_usdt = round(wallet / micro_div, 2)
+                        sizing_label = f"1/{micro_div} of {wallet:.2f}$"
 
                     logger.info(f"Portfolio: {wallet:.2f}$ "
-                                f"(free={real_balance:.2f}$ + locked={locked_margin:.2f}$)")
+                                f"(free={real_balance:.2f}$ + locked={locked_margin:.2f}$) "
+                                f"→ margin={margin_usdt}$ ({sizing_label})")
                 else:
                     available = real_balance if real_balance > 0 else (
                         self._config.get("risk.initial_balance", 5.0))
@@ -2557,24 +2684,42 @@ class ScannerStateMachine:
                             f"qty={size} entry={entry_price} lev={leverage}x "
                             f"margin={margin:.2f}")
 
-                # Place server-side trailing stop if not already present
+                # Check & repair server orders (SL + trailing)
                 if leverage > 1 and self._order_executor and hasattr(self._order_executor, '_rest'):
                     pos_obj = self._position_mgr.get_position(symbol)
                     if pos_obj and atr > 0:
-                        # Check if trailing already exists on server
                         try:
                             open_orders = self._order_executor._rest.get_open_orders(symbol)
-                            has_trailing = any(
-                                o.get("type") == "TRAILING_STOP_MARKET"
-                                for o in (open_orders or [])
-                            )
-                            if not has_trailing:
-                                logger.warning(f"[SYNC] {symbol}: No trailing stop on server, placing now!")
-                                self._place_initial_trailing(symbol, pos_obj, entry_price, atr)
+                            algo_orders = self._order_executor._rest.get_algo_open_orders(symbol)
+                            all_server = (open_orders or []) + (algo_orders or [])
+                            sl_count = sum(1 for o in all_server
+                                           if o.get("type") == "STOP_MARKET")
+                            trailing_count = sum(1 for o in all_server
+                                                 if o.get("type") == "TRAILING_STOP_MARKET")
+                            total = len(all_server)
+
+                            if sl_count == 1 and trailing_count == 1 and total <= 4:
+                                logger.info(f"[SYNC] {symbol}: Server orders OK "
+                                            f"(SL={sl_count}, trailing={trailing_count})")
                             else:
-                                logger.info(f"[SYNC] {symbol}: Trailing stop already exists on server")
+                                logger.warning(f"[SYNC] {symbol}: Server orders NEED REPAIR "
+                                               f"(SL={sl_count}, trailing={trailing_count}, "
+                                               f"total={total}) — repairing now!")
+                                # Get current price for profit-aware repair
+                                price_map = {}
+                                try:
+                                    ticker = self._rest.get_ticker_price(symbol)
+                                    price_map[symbol] = float(ticker.get("price", 0))
+                                except Exception:
+                                    pass
+                                strat = self._config.get("strategy", {})
+                                self._repair_server_orders(
+                                    symbol, pos_obj, strat, price_map)
                         except Exception as e:
-                            logger.warning(f"[SYNC] {symbol}: Failed to check/place trailing: {e}")
+                            logger.warning(f"[SYNC] {symbol}: Failed to check/repair: {e}")
+                            # Fallback: just place initial trailing
+                            self._place_initial_trailing(
+                                symbol, pos_obj, entry_price, atr)
 
             logger.info(f"Synced {len(api_positions)} API position(s)")
 
@@ -2731,10 +2876,21 @@ class ScannerStateMachine:
 
         Katman 1: 2×ATR STOP_MARKET (crash koruması — server SL)
         Katman 2: TRAILING_STOP_MARKET: 4×ATR'de aktif, 1×ATR geri gelme (kar alma).
+
+        ÖNEMLİ: Önce mevcut emirleri temizler (duplikasyon önleme).
         """
         try:
             rest = self._order_executor._rest
             pp = self._order_executor._get_price_precision(symbol)
+
+            # Mevcut emirleri temizle — duplikasyon önleme
+            try:
+                cancel_result = rest.cancel_all_orders(symbol)
+                if cancel_result.get("errors"):
+                    logger.warning(f"[INITIAL TRAILING] {symbol}: cancel issues: "
+                                   f"{cancel_result['errors']}")
+            except Exception as cancel_err:
+                logger.warning(f"[INITIAL TRAILING] {symbol}: cancel failed: {cancel_err}")
             strat = self._config.get("strategy", {})
             activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
             distance_mult = strat.get("trailing_atr_distance_mult", 1.0)

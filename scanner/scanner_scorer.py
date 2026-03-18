@@ -141,14 +141,13 @@ class ScannerScorer:
             # ADX regime classification
             result.adx_regime = self._classify_adx_regime(result)
 
+            # Compute composite score (HER ZAMAN — eligible olmasa bile GUI'de görünsün)
+            result.score = self._compute_score(result)
+
             # Check eligibility (hard filters)
             eligible, reason = self._check_eligibility(result)
             result.eligible = eligible
             result.reject_reason = reason
-
-            # Compute composite score
-            if eligible:
-                result.score = self._compute_score(result)
 
         except Exception as e:
             logger.debug(f"Scoring error for {symbol}: {e}")

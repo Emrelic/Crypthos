@@ -20,7 +20,9 @@ PRESETS = {
             "min_timeframe": "5m",
             # Leverage
             "min_leverage": 10, "max_leverage": 25,
-            "max_positions": 2, "portfolio_percent": 30,
+            "max_positions": 2, "portfolio_percent": 30, "portfolio_divider": 0,
+            "portfolio_min_wallet": 12, "portfolio_fixed_margin": 1.0, "portfolio_micro_divider": 4,
+            "order_verify_interval": 60, "order_verify_max_orders": 2,
             # SL
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 40,
             "server_sl_atr_mult": 2.0,
@@ -77,7 +79,9 @@ PRESETS = {
             "scan_interval_seconds": 30, "kline_interval": "1m", "kline_limit": 200,
             "min_timeframe": "5m",
             "min_leverage": 25, "max_leverage": 50,
-            "max_positions": 4, "portfolio_percent": 25,
+            "max_positions": 4, "portfolio_percent": 25, "portfolio_divider": 0,
+            "portfolio_min_wallet": 12, "portfolio_fixed_margin": 1.0, "portfolio_micro_divider": 4,
+            "order_verify_interval": 60, "order_verify_max_orders": 2,
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "server_sl_atr_mult": 2.0,
             "emergency_enabled": True, "emergency_liq_percent": 80,
@@ -127,6 +131,8 @@ PRESETS = {
             "min_timeframe": "3m",
             "min_leverage": 50, "max_leverage": 100,
             "max_positions": 6, "portfolio_percent": 25, "portfolio_divider": 0,
+            "portfolio_min_wallet": 12, "portfolio_fixed_margin": 1.0, "portfolio_micro_divider": 4,
+            "order_verify_interval": 60, "order_verify_max_orders": 2,
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "server_sl_atr_mult": 2.0,
             "emergency_enabled": True, "emergency_liq_percent": 80,
@@ -181,6 +187,8 @@ PRESETS = {
             "min_leverage": 1, "max_leverage": 20,
             # Pozisyon: 4 cephede, 1/12 portfoy
             "max_positions": 4, "portfolio_percent": 8, "portfolio_divider": 12,
+            "portfolio_min_wallet": 12, "portfolio_fixed_margin": 1.0, "portfolio_micro_divider": 4,
+            "order_verify_interval": 60, "order_verify_max_orders": 2,
             # SL: pratik liq %70, SL %50 (= %0.35 at 100x)
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "server_sl_atr_mult": 2.0,
@@ -829,15 +837,100 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "────────────────────────────\n"
                         "0 = yuzde modu (portfolio_percent kullan)\n"
                         "12 = Emre Ortalama sistemi\n\n"
-                        "Bakiye <= 12$: bolen = floor(bakiye)\n"
-                        "  3$ → 3 poz x 1$ = tam cephe\n"
-                        "  5$ → 4 poz x 1$ + 1$ yedek\n"
-                        "  12$ → 4 poz x 1$ + 4$ yedek + 4$\n\n"
-                        "Bakiye > 12$: bolen = 12\n"
-                        "  18$ → 4 poz x 1.5$ = olceklenen\n"
-                        "  24$ → 4 poz x 2.0$\n"
-                        "  36$ → 4 poz x 3.0$\n\n"
-                        "Min margin: 1.0 USDT (bu kural sabit)"))
+                        "3 KATMANLI BOYUTLANDIRMA:\n"
+                        "  Bakiye >= esik: 1/N (ornek: 1/12)\n"
+                        "  Bakiye 4$-esik arasi: sabit margin\n"
+                        "  Bakiye < 4$: 1/4 (mikro mod)\n\n"
+                        "ORNEK (divider=12, esik=12$):\n"
+                        "  20$ → 20/12 = 1.67$ margin\n"
+                        "  8$  → 1.00$ sabit margin\n"
+                        "  3$  → 3/4  = 0.75$ margin"))
+        self._field(g,"portfolio_min_wallet", "Bolen Esigi ($)", "12",
+                    tip="Bu tutarin altinda sabit margin kullanilir",
+                    help_text=(
+                        "PORTFOY BOLEN ESIGI\n"
+                        "────────────────────\n"
+                        "Toplam portfoy bu tutarin USTUNDE ise\n"
+                        "portfolio_divider (1/N) kullanilir.\n\n"
+                        "ALTINDA ise sabit margin (1$) kullanilir\n"
+                        "ta ki portfoy 4$'in altina dusene kadar.\n\n"
+                        "  12 = Standart (onerilen)\n"
+                        "  20 = Daha buyuk portfoyler icin\n"
+                        "   8 = Daha kucuk portfoyler icin\n\n"
+                        "ORNEK (esik=12):\n"
+                        "  15$ portfoy → 1/12 = 1.25$ (bolen)\n"
+                        "  10$ portfoy → 1.00$ (sabit)\n"
+                        "   3$ portfoy → 3/4 = 0.75$ (mikro)"))
+        self._field(g,"portfolio_fixed_margin", "Sabit Margin ($)", "1.0",
+                    tip="Esik altinda her pozisyon icin sabit margin",
+                    help_text=(
+                        "SABIT MARGIN TUTARI\n"
+                        "────────────────────\n"
+                        "Portfoy bolen esiginin altinda ama 4$\n"
+                        "ustunde iken her pozisyon bu kadar\n"
+                        "margin ile acilir.\n\n"
+                        "  1.0 = Standart (onerilen)\n"
+                        "  0.5 = Cok kucuk hesaplar icin\n"
+                        "  2.0 = Orta hesaplar icin\n\n"
+                        "ORNEK (sabit=1$):\n"
+                        "  8$ portfoy → 1$ margin (max 8 poz)\n"
+                        "  5$ portfoy → 1$ margin (max 5 poz)"))
+        self._field(g,"portfolio_micro_divider", "Mikro Bolen (1/N)", "4",
+                    tip="4$ altinda portfoyun 1/N'i ile islem acilir",
+                    help_text=(
+                        "MIKRO PORTFOY BOLENI\n"
+                        "─────────────────────\n"
+                        "Portfoy 4$'in altina dustugunde\n"
+                        "sabit 1$ bile cok fazla olabilir.\n"
+                        "Bu durumda portfoyun 1/N'i kullanilir.\n\n"
+                        "  4 = 1/4 (onerilen)\n"
+                        "  3 = 1/3 (daha agresif)\n"
+                        "  5 = 1/5 (daha konservatif)\n\n"
+                        "ORNEK (mikro_bolen=4):\n"
+                        "  3.0$ → 3.0/4 = 0.75$ margin\n"
+                        "  2.0$ → 2.0/4 = 0.50$ margin\n"
+                        "  1.0$ → 1.0/4 = 0.25$ margin"))
+
+        # ──────────────── EMIR DOGRULAMA (GUVENLIK) ────────────────
+        g = self._section(s, "Emir Dogrulama (Guvenlik)")
+        ctk.CTkLabel(g, text="Periyodik kontrol: eksik emir koyar, fazla emir temizler. Trailing guncelleme YAPMAZ.",
+                     text_color="gray50", font=ctk.CTkFont(size=10, slant="italic"),
+                     wraplength=350).pack(anchor="w", padx=8, pady=(0, 3))
+        self._field(g,"order_verify_interval", "Kontrol Araligi (sn)", "60",
+                    tip="Kac saniyede bir server emirleri kontrol edilir",
+                    help_text=(
+                        "EMIR DOGRULAMA ARALIGI\n"
+                        "───────────────────────\n"
+                        "Sistem her N saniyede bir Binance'deki\n"
+                        "emirleri kontrol eder.\n\n"
+                        "KONTROL: Her pozisyonda tam olarak\n"
+                        "1 SL + 1 trailing var mi?\n\n"
+                        "EMIRLER TAMAM ISE: Hicbir sey yapmaz.\n"
+                        "Trailing guncelleme YAPMAZ!\n\n"
+                        "EKSIK EMIR VARSA: 3 duruma gore koyar:\n"
+                        "  A) Zararda → orijinal plan (entry'den)\n"
+                        "  B) Karda, tetik altinda → orijinal plan\n"
+                        "  C) Karda, tetik ustunde →\n"
+                        "     SL = current - NxATR (kar koruma)\n"
+                        "     Trail = hemen tetikli, KxATR geri\n\n"
+                        "FAZLA EMIR VARSA: Temizle + dogru 2 koy\n\n"
+                        "  30 = Sik kontrol (guvenli, API yuku)\n"
+                        "  60 = Standart (onerilen)\n"
+                        " 120 = Seyrek (az API, gecikme riski)"))
+        self._field(g,"order_verify_max_orders", "Max Emir / Pozisyon", "2",
+                    tip="Pozisyon basina max emir sayisi (1 SL + 1 trailing = 2)",
+                    help_text=(
+                        "MAX EMIR SAYISI\n"
+                        "────────────────\n"
+                        "Her pozisyon icin Binance'de olmasi\n"
+                        "gereken maksimum emir sayisi.\n\n"
+                        "Normal: 1 STOP_MARKET + 1 TRAILING = 2\n\n"
+                        "Bu sayidan fazla emir tespit edilirse\n"
+                        "sistem tum emirleri iptal edip dogru\n"
+                        "2 emri yeniden koyar (3 durum mantigi).\n\n"
+                        "  2 = Standart (1 SL + 1 trailing)\n"
+                        "  3 = TP emri de varsa\n\n"
+                        "DIKKAT: 2'den asagi indirmeyin!"))
 
         # ════════════════ COLUMN 2: SL + Trailing + TP + Sinyal + Zaman + Risk ════════════════
         s = c2  # switch to column 2

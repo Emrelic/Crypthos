@@ -294,11 +294,16 @@ class ScannerPanel(ctk.CTkFrame):
         try:
             self._update_state()
             self._update_alerts()
+        except Exception:
+            pass
+        try:
             self._update_results()
+        except Exception:
+            pass
+        try:
             self._update_mr_results()
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"Refresh scan error: {e}")
+        except Exception:
+            pass
         try:
             self._update_position()
         except Exception as e:
@@ -401,34 +406,16 @@ class ScannerPanel(ctk.CTkFrame):
         banned_symbols = self.controller.get_banned_symbols()
         n = min(len(results), 80)
 
-        total_rows = 0
-        row_plan = []
-        for i, r in enumerate(results[:n]):
-            row_plan.append((i, "main", None))
-            total_rows += 1
-            mtf_data = getattr(r, 'mtf_data', {}) or {}
-            if mtf_data:
-                base_tf = getattr(r, 'timeframe', '1m')
-                tf_2up, tf_5up = _get_upper_tfs(base_tf)
-                for sub_tf in (tf_2up, tf_5up):
-                    if sub_tf in mtf_data and sub_tf != base_tf:
-                        row_plan.append((i, "sub", sub_tf))
-                        total_rows += 1
-
         self._ensure_rows(self._results_scroll, self._result_rows,
-                          self._result_cache, SHARED_WIDTHS, total_rows)
+                          self._result_cache, SHARED_WIDTHS, n)
 
-        for row_idx, (res_i, row_type, sub_tf) in enumerate(row_plan):
-            r = results[res_i]
-            if row_type == "main":
-                vals = self._build_scan_row_vals(res_i, r, banned_symbols)
-                # Main rows: base timeframe — brighter bg to distinguish from sub rows
-                bg = "#1e3355" if res_i % 2 == 0 else "#172540"
-            else:
-                mtf_entry = r.mtf_data[sub_tf]
-                vals = self._build_mtf_sub_row_vals(sub_tf, mtf_entry, r.symbol)
-                bg = _SUB_ROW_BG  # darker bg for sub rows
-            self._update_row(self._result_rows, self._result_cache, row_idx, vals, bg)
+        for i, r in enumerate(results[:n]):
+            try:
+                vals = self._build_scan_row_vals(i, r, banned_symbols)
+                bg = "#1e3355" if i % 2 == 0 else "#172540"
+                self._update_row(self._result_rows, self._result_cache, i, vals, bg)
+            except Exception:
+                pass
 
         candidate = self.controller.get_scanner_candidate()
         sb = self._get_status_bar()
@@ -451,9 +438,13 @@ class ScannerPanel(ctk.CTkFrame):
         eligible_marker = "*" if r.eligible else ""
         lev_str = f"{r.leverage}x" if r.leverage > 0 else "--"
         tf_str = getattr(r, 'timeframe', '1m')
-        # Mark base TF with diamond to distinguish from MTF sub-rows
         mtf_data = getattr(r, 'mtf_data', {}) or {}
-        tf_display = f"\u25C6{tf_str}" if mtf_data else tf_str
+        if mtf_data:
+            mtf_tfs = sorted(mtf_data.keys(),
+                             key=lambda t: TF_LADDER.index(t) if t in TF_LADDER else 99)
+            tf_display = tf_str + "".join(f"\u2191{t}" for t in mtf_tfs)
+        else:
+            tf_display = tf_str
         reject_short = r.reject_reason[:12] if r.reject_reason else ""
         row_color = score_color if r.eligible else "gray"
         sys_signal = _system_signal_candidate(r)

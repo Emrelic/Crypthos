@@ -79,6 +79,11 @@
     "max_positions": 12,
     "portfolio_percent": 8,
     "portfolio_divider": 12,
+    "portfolio_min_wallet": 12,
+    "portfolio_fixed_margin": 1.0,
+    "portfolio_micro_divider": 4,
+    "order_verify_interval": 60,
+    "order_verify_max_orders": 2,
     "liq_factor": 70,
     "fee_pct": 0.1,
     "slippage_mult": 0.5,
@@ -171,7 +176,7 @@
     "min_volume_24h_usdt": 5000000,
     "fetch_workers": 10,
     "requests_per_second": 3.5,
-    "max_trades_per_hour": 12
+    "max_trades_per_hour": 0
   },
   "adaptive_regime": {
     "enabled": true,

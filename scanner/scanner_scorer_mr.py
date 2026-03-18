@@ -180,14 +180,13 @@ class MRScannerScorer:
             if result.volume_ratio > 1.5 and result.bb_proximity_pct < 15:
                 result.breakout_risk = True
 
+            # Compute MR score (HER ZAMAN — eligible olmasa bile GUI'de görünsün)
+            result.score = self._compute_mr_score(result)
+
             # Check eligibility
             eligible, reason = self._check_mr_eligibility(result)
             result.eligible = eligible
             result.reject_reason = reason
-
-            # Compute score if eligible
-            if eligible:
-                result.score = self._compute_mr_score(result)
 
         except Exception as e:
             logger.debug(f"MR scoring error for {symbol}: {e}")
