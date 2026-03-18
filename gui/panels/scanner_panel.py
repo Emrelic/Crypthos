@@ -427,6 +427,8 @@ class ScannerPanel(ctk.CTkFrame):
             try:
                 vals = self._build_scan_row_vals(i, r, banned_symbols)
                 bg = "#1e3355" if i % 2 == 0 else "#172540"
+                if i < 5 or i % 10 == 0:  # Debug first 5 rows and every 10th row
+                    logger.info(f"Trend row {i}: symbol={r.symbol}, score={r.score}")
                 self._update_row(self._result_rows, self._result_cache, i, vals, bg)
             except Exception as e:
                 from loguru import logger
@@ -605,8 +607,8 @@ class ScannerPanel(ctk.CTkFrame):
             try:
                 vals = self._build_mr_row_vals(i, r)
                 bg = "#1c2d4d" if i % 2 == 0 else "transparent"
-                if i == 0:  # Debug first MR row
-                    logger.info(f"MR row 0: symbol={r.symbol}, score={r.score}, vals[0:3]={vals[:3]}")
+                if i < 5 or i % 10 == 0:  # Debug first 5 rows and every 10th row
+                    logger.info(f"MR row {i}: symbol={r.symbol}, score={r.score}")
                 self._update_row(self._mr_rows, self._mr_cache, i, vals, bg)
             except Exception as e:
                 from loguru import logger

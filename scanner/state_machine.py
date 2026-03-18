@@ -364,7 +364,7 @@ class ScannerStateMachine:
         self._last_mr_results = mr_results       # MR pool
         logger.info(f"DEBUG: Pools set successfully")
         
-        logger.info(f"Pool distribution: Trend={len(trend_results)}, MR={len(mr_results)}")
+        logger.info(f"POOL SETUP COMPLETE: Trend={len(trend_results)}, MR={len(mr_results)}")
         logger.info(f"DEBUG: Setting _last_scan_results to {len(trend_results)} items")
         logger.info(f"DEBUG: Setting _last_mr_results to {len(mr_results)} items")
 
