@@ -359,10 +359,14 @@ class ScannerStateMachine:
             trend_results = results
 
         # Set pools
+        logger.info(f"DEBUG: About to set pools")
         self._last_scan_results = trend_results  # Trend pool (ADX >= 18 filtered)
         self._last_mr_results = mr_results       # MR pool
+        logger.info(f"DEBUG: Pools set successfully")
         
         logger.info(f"Pool distribution: Trend={len(trend_results)}, MR={len(mr_results)}")
+        logger.info(f"DEBUG: Setting _last_scan_results to {len(trend_results)} items")
+        logger.info(f"DEBUG: Setting _last_mr_results to {len(mr_results)} items")
 
         # 5. Find best eligible candidate
         now = time.time()
@@ -3247,6 +3251,8 @@ class ScannerStateMachine:
         return self._scan_count
 
     def get_scan_results(self) -> list[ScanResult]:
+        from loguru import logger
+        logger.info(f"DEBUG: get_scan_results() returning {len(self._last_scan_results)} items")
         return self._last_scan_results
 
     def get_mr_scan_results(self) -> list:

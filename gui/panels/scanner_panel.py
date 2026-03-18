@@ -298,12 +298,18 @@ class ScannerPanel(ctk.CTkFrame):
             pass
         try:
             self._update_results()
-        except Exception:
-            pass
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Trend _update_results exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
         try:
             self._update_mr_results()
-        except Exception:
-            pass
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"MR _update_mr_results exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
         try:
             self._update_position()
         except Exception as e:
@@ -404,7 +410,10 @@ class ScannerPanel(ctk.CTkFrame):
 
     def _update_results(self):
         results = self.controller.get_scan_results()
+        from loguru import logger
+        logger.info(f"Trend _update_results: {len(results)} results")
         if not results:
+            logger.info("Trend _update_results: Early return - no results")
             return
         banned_symbols = self.controller.get_banned_symbols()
         n = min(len(results), 80)
