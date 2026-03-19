@@ -306,15 +306,19 @@ class ApiOrderExecutor:
             logger.error(f"get_total_balance failed: {e}")
             return 0.0
 
-    def get_open_positions(self) -> list[dict]:
-        """Get all open positions from API."""
+    def get_open_positions(self):
+        """Get all open positions from API.
+        Returns list on success, None on error (güvenlik — boş liste ile hata ayırt edilmeli)."""
         try:
             positions = self._rest.get_positions()
+            if not isinstance(positions, list):
+                logger.error(f"get_positions unexpected response: {type(positions)}")
+                return None
             return [p for p in positions
                     if float(p.get("positionAmt", 0)) != 0]
         except Exception as e:
             logger.error(f"get_positions failed: {e}")
-            return []
+            return None  # None = hata, [] = gerçekten pozisyon yok
 
     def test_connection(self) -> bool:
         """Test API connection by fetching account info."""

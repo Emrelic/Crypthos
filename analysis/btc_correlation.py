@@ -26,13 +26,14 @@ class BTCCorrelationEngine:
         self._rest = rest_client
         self._config = config
         self._btc_returns: np.ndarray = None
-        self._beta_cache: dict[str, float] = {}  # symbol -> beta
+        self._beta_cache: dict[str, tuple[float, float]] = {}  # symbol -> (timestamp, beta)
+        self._beta_cache_ttl: float = 600  # 10 minutes per symbol
         self._last_refresh: float = 0
         self._refresh_interval: float = 300  # 5 minutes
         self._btc_klines: pd.DataFrame = None
 
     def refresh(self) -> None:
-        """Refresh BTC price data and clear stale cache entries."""
+        """Refresh BTC price data. Individual betas expire by TTL."""
         now = time.time()
         if now - self._last_refresh < self._refresh_interval:
             return
@@ -43,9 +44,14 @@ class BTCCorrelationEngine:
                 self._btc_klines = btc_df
                 btc_close = btc_df["close"].values
                 self._btc_returns = np.diff(np.log(btc_close))
-                self._beta_cache.clear()  # Force recalculation
                 self._last_refresh = now
-                logger.debug(f"BTC correlation engine refreshed ({len(btc_close)} candles)")
+                # Evict expired entries instead of clearing all
+                expired = [s for s, (ts, _) in self._beta_cache.items()
+                           if now - ts > self._beta_cache_ttl]
+                for s in expired:
+                    del self._beta_cache[s]
+                logger.debug(f"BTC correlation refreshed ({len(btc_close)} candles, "
+                             f"evicted {len(expired)} stale betas)")
         except Exception as e:
             logger.debug(f"BTC correlation refresh failed: {e}")
 
@@ -61,8 +67,10 @@ class BTCCorrelationEngine:
         if symbol == "BTCUSDT":
             return 1.0
 
-        if symbol in self._beta_cache:
-            return self._beta_cache[symbol]
+        now = time.time()
+        cached = self._beta_cache.get(symbol)
+        if cached and (now - cached[0]) < self._beta_cache_ttl:
+            return cached[1]
 
         if self._btc_returns is None or len(self._btc_returns) < 20:
             return 0.8  # Default assumption: most altcoins correlate with BTC
@@ -88,9 +96,9 @@ class BTCCorrelationEngine:
                 beta = np.cov(alt_r, btc_r)[0][1] / btc_var
 
             # Clamp to reasonable range
-            beta = max(-2.0, min(3.0, beta))
-            self._beta_cache[symbol] = round(beta, 3)
-            return self._beta_cache[symbol]
+            beta = max(-2.0, min(3.0, round(beta, 3)))
+            self._beta_cache[symbol] = (now, beta)
+            return beta
 
         except Exception as e:
             logger.debug(f"Beta calculation failed for {symbol}: {e}")

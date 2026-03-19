@@ -654,16 +654,56 @@ class PositionManager:
             if self._check_stop_loss(pos, price):
                 return self.EXIT_SL
 
-        # === 2. BB MIDDLE TP (primary MR target) ===
-        if pos.mr_tp_price > 0:
-            if pos.side == OrderSide.BUY_LONG and price >= pos.mr_tp_price:
-                logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
-                            f"(target={pos.mr_tp_price:.6f})")
-                return self.EXIT_MR_TP
-            elif pos.side == OrderSide.SELL_SHORT and price <= pos.mr_tp_price:
-                logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
-                            f"(target={pos.mr_tp_price:.6f})")
-                return self.EXIT_MR_TP
+        # === 2. MR TRAILING STOP (or BB middle TP fallback) ===
+        if strat.get("mr_trailing_enabled", True):
+            # Software trailing: activate at N×ATR profit, callback M×ATR
+            atr = pos.atr_at_entry
+            if atr > 0:
+                mr_activate_mult = strat.get("mr_trailing_activate_atr", 1.5)
+                mr_callback_mult = strat.get("mr_trailing_callback_atr", 0.5)
+                activate_dist = atr * mr_activate_mult
+                callback_dist = atr * mr_callback_mult
+
+                # Update highest/lowest tracking
+                if pos.side == OrderSide.BUY_LONG:
+                    profit_move = price - pos.entry_price
+                    if profit_move >= activate_dist:
+                        # Trailing activated — update trailing stop
+                        new_trail = price - callback_dist
+                        if new_trail > pos.trailing_stop:
+                            if pos.trailing_stop == 0:
+                                logger.info(f"[MR TRAIL] {pos.symbol} trailing activated @ {price:.6f} "
+                                            f"(profit={profit_move/atr:.1f}xATR >= {mr_activate_mult}xATR)")
+                            pos.trailing_stop = new_trail
+                        # Check trailing stop hit
+                        if pos.trailing_stop > 0 and price <= pos.trailing_stop:
+                            logger.info(f"[MR TRAIL] {pos.symbol} trailing stop hit @ {price:.6f} "
+                                        f"(trail={pos.trailing_stop:.6f})")
+                            return self.EXIT_TRAILING
+                else:  # SHORT
+                    profit_move = pos.entry_price - price
+                    if profit_move >= activate_dist:
+                        new_trail = price + callback_dist
+                        if pos.trailing_stop == 0 or new_trail < pos.trailing_stop:
+                            if pos.trailing_stop == 0:
+                                logger.info(f"[MR TRAIL] {pos.symbol} trailing activated @ {price:.6f} "
+                                            f"(profit={profit_move/atr:.1f}xATR >= {mr_activate_mult}xATR)")
+                            pos.trailing_stop = new_trail
+                        if pos.trailing_stop > 0 and price >= pos.trailing_stop:
+                            logger.info(f"[MR TRAIL] {pos.symbol} trailing stop hit @ {price:.6f} "
+                                        f"(trail={pos.trailing_stop:.6f})")
+                            return self.EXIT_TRAILING
+        else:
+            # Fallback: BB middle TP (eski sistem)
+            if pos.mr_tp_price > 0:
+                if pos.side == OrderSide.BUY_LONG and price >= pos.mr_tp_price:
+                    logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
+                                f"(target={pos.mr_tp_price:.6f})")
+                    return self.EXIT_MR_TP
+                elif pos.side == OrderSide.SELL_SHORT and price <= pos.mr_tp_price:
+                    logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
+                                f"(target={pos.mr_tp_price:.6f})")
+                    return self.EXIT_MR_TP
 
         # === 3. REGIME SWITCH DETECTION (MR → TREND) ===
         # If price breaks through opposite BB + volume surging + ADX rising

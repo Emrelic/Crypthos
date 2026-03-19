@@ -288,7 +288,7 @@ class MRScannerScorer:
         range_ok = half_range_roi >= min_range
         checks["Fee"] = (range_ok, f"{half_range_roi:.0f}%", f">={min_range:.0f}%")
         if not range_ok and not first_fail:
-            first_fail = f"bb_range_narrow (ROI {half_range_pct:.0f}% < {min_range:.0f}% fee×{mr_fee_mult})"
+            first_fail = f"bb_range_narrow (ROI {half_range_roi:.0f}% < {min_range:.0f}% fee×{mr_fee_mult})"
 
         # 6. Breakout risk (high volume = not MR, potential breakout)
         breakout_ok = not r.breakout_risk

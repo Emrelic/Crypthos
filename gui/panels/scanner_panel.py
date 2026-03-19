@@ -45,7 +45,7 @@ _NORMAL_HDR_BG = "transparent"
 
 # ═══ Shared column layout (all 3 tables use this) ═══
 _IND_W = [52, 50, 52, 50, 50, 52, 50, 52, 50, 50, 50]  # 11 indicators
-_SHARED_MID = [50, 40, 34, 34, 34, 34]  # ATR% Lev TF Fnd OI% OB
+_SHARED_MID = [50, 40, 38, 38, 34, 34]  # ATR% Lev TF Fnd OI% OB
 _CONF_W = [46, 28, 28]  # Conf AL SAT
 _FLT_W = [44] * len(FILTER_COLS)
 _PREFIX_W = [22, 54, 90, 44]  # # Sinyal Sembol Skor/ROI
@@ -242,7 +242,7 @@ class ScannerPanel(ctk.CTkFrame):
 
         _build_table_header(trend_frame, SHARED_HEADERS, SHARED_WIDTHS, _TREND_IMP)
 
-        self._results_scroll = ctk.CTkScrollableFrame(trend_frame, height=200)
+        self._results_scroll = ctk.CTkScrollableFrame(trend_frame, height=300)
         self._results_scroll.pack(fill="both", expand=True, padx=2)
         self._result_rows = []
         self._result_cache = []
@@ -261,7 +261,7 @@ class ScannerPanel(ctk.CTkFrame):
             mr_headers[_FLT_START + i] = fc if fc else "--"
         _build_table_header(mr_frame, mr_headers, SHARED_WIDTHS, _MR_IMP)
 
-        self._mr_scroll = ctk.CTkScrollableFrame(mr_frame, height=150)
+        self._mr_scroll = ctk.CTkScrollableFrame(mr_frame, height=250)
         self._mr_scroll.pack(fill="both", expand=True, padx=2)
         self._mr_rows = []
         self._mr_cache = []
@@ -404,7 +404,7 @@ class ScannerPanel(ctk.CTkFrame):
         if not results:
             return
         banned_symbols = self.controller.get_banned_symbols()
-        n = min(len(results), 80)
+        n = min(len(results), 30)
 
         self._ensure_rows(self._results_scroll, self._result_rows,
                           self._result_cache, SHARED_WIDTHS, n)
@@ -414,8 +414,11 @@ class ScannerPanel(ctk.CTkFrame):
                 vals = self._build_scan_row_vals(i, r, banned_symbols)
                 bg = "#1e3355" if i % 2 == 0 else "#172540"
                 self._update_row(self._result_rows, self._result_cache, i, vals, bg)
-            except Exception:
-                pass
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"TREND row {i} ({getattr(r, 'symbol', '?')}): {e}")
+                import traceback
+                logger.error(traceback.format_exc())
 
         candidate = self.controller.get_scanner_candidate()
         sb = self._get_status_bar()
@@ -440,9 +443,8 @@ class ScannerPanel(ctk.CTkFrame):
         tf_str = getattr(r, 'timeframe', '1m')
         mtf_data = getattr(r, 'mtf_data', {}) or {}
         if mtf_data:
-            mtf_tfs = sorted(mtf_data.keys(),
-                             key=lambda t: TF_LADDER.index(t) if t in TF_LADDER else 99)
-            tf_display = tf_str + "".join(f"\u2191{t}" for t in mtf_tfs)
+            # MTF sayısını göster (ör: "5m+3") — tam liste sığmaz
+            tf_display = f"{tf_str}+{len(mtf_data)}"
         else:
             tf_display = tf_str
         reject_short = r.reject_reason[:12] if r.reject_reason else ""
@@ -569,19 +571,29 @@ class ScannerPanel(ctk.CTkFrame):
 
     def _update_mr_results(self):
         results = self.controller.get_mr_scan_results()
+        from loguru import logger
+        logger.debug(f"[GUI-MR] results type={type(results).__name__}, "
+                     f"len={len(results) if results else 0}, "
+                     f"bool={bool(results)}")
         if not results:
             self._ensure_rows(self._mr_scroll, self._mr_rows,
                               self._mr_cache, SHARED_WIDTHS, 0)
             return
 
-        n = min(len(results), 50)
+        n = min(len(results), 20)
         self._ensure_rows(self._mr_scroll, self._mr_rows,
                           self._mr_cache, SHARED_WIDTHS, n)
 
         for i, r in enumerate(results[:n]):
-            vals = self._build_mr_row_vals(i, r)
-            bg = "#1c2d4d" if i % 2 == 0 else "transparent"
-            self._update_row(self._mr_rows, self._mr_cache, i, vals, bg)
+            try:
+                vals = self._build_mr_row_vals(i, r)
+                bg = "#1c2d4d" if i % 2 == 0 else "transparent"
+                self._update_row(self._mr_rows, self._mr_cache, i, vals, bg)
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"MR row {i} ({getattr(r, 'symbol', '?')}): {e}")
+                import traceback
+                logger.error(traceback.format_exc())
 
     def _build_mr_row_vals(self, i, r):
         """Build row values for MR scan result using shared column layout."""

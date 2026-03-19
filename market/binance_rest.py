@@ -25,6 +25,9 @@ class BinanceRestClient:
         self._api_secret = api_secret
         if api_key:
             self._session.headers["X-MBX-APIKEY"] = api_key
+        # Kline cache: {cache_key: (timestamp, DataFrame)}
+        self._kline_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+        self._kline_cache_ttl = 30.0  # seconds
 
     # ─── public (unauthenticated) ─────────────────────────────
 
@@ -45,6 +48,13 @@ class BinanceRestClient:
         return self._get("/fapi/v1/premiumIndex", {"symbol": symbol})
 
     def get_klines(self, symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
+        # Check cache first
+        cache_key = f"{symbol}_{interval}_{limit}"
+        now = time.time()
+        cached = self._kline_cache.get(cache_key)
+        if cached and (now - cached[0]) < self._kline_cache_ttl:
+            return cached[1]
+
         data = self._get("/fapi/v1/klines", {
             "symbol": symbol,
             "interval": interval,
@@ -58,6 +68,15 @@ class BinanceRestClient:
         for col in ["open", "high", "low", "close", "volume", "taker_buy_volume"]:
             df[col] = df[col].astype(float)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+
+        # Store in cache and evict expired entries
+        self._kline_cache[cache_key] = (now, df)
+        if len(self._kline_cache) > 200:
+            expired = [k for k, (ts, _) in self._kline_cache.items()
+                       if now - ts > self._kline_cache_ttl * 2]
+            for k in expired:
+                del self._kline_cache[k]
+
         return df
 
     def get_funding_rate(self, symbol: str, limit: int = 10) -> list:
@@ -399,23 +418,99 @@ class BinanceRestClient:
             logger.error(f"cancel_all_orders({symbol}) partial failure: {errors}")
         return {"msg": "ok" if not errors else "partial_failure", "errors": errors}
 
-    def get_open_orders(self, symbol: str = None) -> list:
-        """GET /fapi/v1/openOrders — regular orders."""
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-        return self._signed_get("/fapi/v1/openOrders", params)
+    def get_all_open_orders_combined(self, symbol: str = None):
+        """Tüm açık emirleri tek listede döndürür (regular + algo/conditional).
+        Her emir dict'inde en az 'symbol', 'type', 'orderId' veya 'algoId' bulunur.
+        Returns list on success, None on ANY error (güvenlik — hata varsa boş dönmez).
+        """
+        combined = []
 
-    def get_algo_open_orders(self, symbol: str = None) -> list:
-        """GET /fapi/v1/openAlgoOrders — active conditional orders (SL/TP)."""
+        # 1. Regular orders: GET /fapi/v1/openOrders
         try:
             params = {}
             if symbol:
                 params["symbol"] = symbol
-            data = self._signed_get("/fapi/v1/openAlgoOrders", params)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+            regular = self._signed_get("/fapi/v1/openOrders", params)
+            if isinstance(regular, list):
+                for o in regular:
+                    o["_source"] = "regular"
+                combined.extend(regular)
+        except Exception as e:
+            logger.warning(f"get_open_orders (regular) failed: {e}")
+            return None  # Okuma başarısız → None
+
+        # 2. Algo/conditional orders: birden fazla endpoint dene
+        algo_ok = False
+        for endpoint in ["/fapi/v1/algo/openOrders",
+                         "/fapi/v1/openAlgoOrders",
+                         "/fapi/v1/conditional/openOrders"]:
+            try:
+                params = {}
+                if symbol:
+                    params["symbol"] = symbol
+                data = self._signed_get(endpoint, params)
+                algo_list = []
+                if isinstance(data, list):
+                    algo_list = data
+                elif isinstance(data, dict):
+                    # Binance: {"total": N, "orders": [...]} veya {"total": N, "dataList": [...]}
+                    algo_list = (data.get("orders") or data.get("dataList")
+                                 or data.get("rows") or [])
+                    if not isinstance(algo_list, list):
+                        algo_list = []
+
+                for o in algo_list:
+                    o["_source"] = "algo"
+                combined.extend(algo_list)
+                algo_ok = True
+                logger.debug(f"Algo orders from {endpoint}: {len(algo_list)} orders")
+                break  # İlk başarılı endpoint yeterli
+            except Exception as e:
+                logger.debug(f"Algo endpoint {endpoint} failed: {e}")
+                continue
+
+        if not algo_ok:
+            logger.warning("Tüm algo order endpoint'leri başarısız — "
+                           "sadece regular orders okundu. "
+                           "Emir KONMAYACAK (güvenlik).")
+            return None  # Algo okunamadı → None (güvenlik)
+
+        return combined
+
+    def get_open_orders(self, symbol: str = None):
+        """GET /fapi/v1/openOrders — regular orders only.
+        Returns list on success, None on error."""
+        try:
+            params = {}
+            if symbol:
+                params["symbol"] = symbol
+            result = self._signed_get("/fapi/v1/openOrders", params)
+            return result if isinstance(result, list) else []
+        except Exception as e:
+            logger.warning(f"get_open_orders failed: {e}")
+            return None
+
+    def get_algo_open_orders(self, symbol: str = None):
+        """Algo/conditional open orders. Birden fazla endpoint dener.
+        Returns list on success, None on error."""
+        for endpoint in ["/fapi/v1/algo/openOrders",
+                         "/fapi/v1/openAlgoOrders",
+                         "/fapi/v1/conditional/openOrders"]:
+            try:
+                params = {}
+                if symbol:
+                    params["symbol"] = symbol
+                data = self._signed_get(endpoint, params)
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict):
+                    result = (data.get("orders") or data.get("dataList")
+                              or data.get("rows") or [])
+                    return result if isinstance(result, list) else []
+            except Exception:
+                continue
+        logger.warning("get_algo_open_orders: tüm endpoint'ler başarısız")
+        return None
 
     def cancel_algo_order(self, algo_id: int) -> dict:
         """DELETE /fapi/v1/algoOrder — cancel a single algo order."""

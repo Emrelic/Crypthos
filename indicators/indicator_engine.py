@@ -8,28 +8,22 @@ from indicators.rsi import RSI
 from indicators.moving_average import SMA, EMA
 from indicators.macd import MACD
 
-# Momentum
-from indicators.stochastic import StochasticOscillator, StochasticRSI
-from indicators.momentum import CCI, WilliamsR, MFI, ROC, UltimateOscillator
-
 # Trend
-from indicators.trend import ADX, ParabolicSAR, Supertrend, IchimokuCloud, Aroon
+from indicators.trend import ADX
 
 # Volatility
-from indicators.volatility import BollingerBands, KeltnerChannels, DonchianChannels, ATR
+from indicators.volatility import BollingerBands, DonchianChannels, ATR
 from indicators.support_resistance import SupportResistance
 
 # Volume
-from indicators.volume import OBV, CVD, VWAP, CMF, ADLine, ElderForceIndex
-
-# Advanced MAs
-from indicators.advanced_ma import HullMA, DEMA, TEMA, VWMA
+from indicators.volume import OBV, CVD, VWAP, CMF
 
 
 class IndicatorEngine:
-    """Manages all indicators. Recomputes when new kline data arrives.
+    """Manages all active indicators. Recomputes when new kline data arrives.
 
-    Total indicators: 30+
+    Active indicators: 15 (RSI, MACD, ADX, SMA x2, EMA x2, BB, Donchian,
+    ATR, SR, OBV, CVD, VWAP, CMF)
     Categories: Momentum, Trend, Volatility, Volume, Moving Averages
     """
 
@@ -54,26 +48,12 @@ class IndicatorEngine:
             cfg.get("macd_signal", 9),
         )
 
-        # === MOMENTUM ===
-        # self._indicators["Stochastic"] = StochasticOscillator(14, 3, 3)  # DEVRE DISI: skorlanmiyor
-        # self._indicators["StochRSI"] = StochasticRSI(14, 14, 3, 3)  # DEVRE DISI: RSI turevi, redundant (orthogonality audit)
-        # self._indicators["CCI"] = CCI(20)  # DEVRE DISI: RSI turevi, redundant (orthogonality audit)
-        # self._indicators["WilliamsR"] = WilliamsR(14)  # DEVRE DISI: skorlanmiyor
-        # self._indicators["MFI"] = MFI(14)  # DEVRE DISI: RSI+volume, OBV/CMF yeterli (orthogonality audit)
-        # self._indicators["ROC"] = ROC(12)  # DEVRE DISI: skorlanmiyor
-        # self._indicators["UltOsc"] = UltimateOscillator(7, 14, 28)  # DEVRE DISI: skorlanmiyor
-
         # === TREND ===
         self._indicators["ADX"] = ADX(14)
         self._indicators["SR"] = SupportResistance(50, 5)
-        # self._indicators["PSAR"] = ParabolicSAR()  # DEVRE DISI: whipsaw, MACD+ADX yeterli (orthogonality audit)
-        # self._indicators["Supertrend"] = Supertrend(10, 3.0)  # DEVRE DISI: ATR+MA turevi, redundant (orthogonality audit)
-        # self._indicators["Ichimoku"] = IchimokuCloud(9, 26, 52)  # DEVRE DISI: trend overlap (orthogonality audit)
-        # self._indicators["Aroon"] = Aroon(25)  # DEVRE DISI: skorlanmiyor
 
         # === VOLATILITY ===
         self._indicators["BB"] = BollingerBands(20, 2.0)
-        # self._indicators["KC"] = KeltnerChannels(20, 14, 2.0)  # DEVRE DISI: skorlanmiyor
         self._indicators["Donchian"] = DonchianChannels(20)
         self._indicators["ATR"] = ATR(14)
 
@@ -82,14 +62,6 @@ class IndicatorEngine:
         self._indicators["CVD"] = CVD()
         self._indicators["VWAP"] = VWAP()
         self._indicators["CMF"] = CMF(20)
-        # self._indicators["ADLine"] = ADLine()  # DEVRE DISI: skorlanmiyor
-        # self._indicators["ElderForce"] = ElderForceIndex(13)  # DEVRE DISI: skorlanmiyor
-
-        # === ADVANCED MAs === (hicbiri skorlanmiyor, tamami devre disi)
-        # self._indicators["HMA"] = HullMA(20)
-        # self._indicators["DEMA"] = DEMA(20)
-        # self._indicators["TEMA"] = TEMA(20)
-        # self._indicators["VWMA"] = VWMA(20)
 
         logger.info(f"Initialized {len(self._indicators)} indicators")
 
@@ -125,26 +97,21 @@ class IndicatorEngine:
 
         # Add price for reference
         if not df.empty:
-            results["Price"] = df["close"].iloc[-1]
+            results["Price"] = df["close"].values[-1]
 
         # SMA cross detection (price crossing SMA_slow)
         sma_slow_ind = self._indicators.get("SMA_slow")
         if sma_slow_ind and sma_slow_ind._series is not None and not df.empty:
             sma_lookback = self._config.get("indicators.sma_cross_lookback", 3)
-            prices = df["close"]
-            sma_vals = sma_slow_ind._series
+            prices = df["close"].values
+            sma_vals = sma_slow_ind._series.values
             sma_fresh_cross = False
             if len(prices) >= sma_lookback + 1 and len(sma_vals) >= sma_lookback + 1:
                 for i in range(1, sma_lookback + 1):
-                    idx = -i
-                    prev_idx = idx - 1
-                    if abs(prev_idx) > len(prices):
-                        break
-                    prev_price = prices.iloc[prev_idx]
-                    prev_sma = sma_vals.iloc[prev_idx]
-                    curr_price = prices.iloc[idx]
-                    curr_sma = sma_vals.iloc[idx]
-                    # Bullish or bearish cross
+                    prev_price = prices[-i - 1]
+                    prev_sma = sma_vals[-i - 1]
+                    curr_price = prices[-i]
+                    curr_sma = sma_vals[-i]
                     if (prev_price <= prev_sma and curr_price > curr_sma) or \
                        (prev_price >= prev_sma and curr_price < curr_sma):
                         sma_fresh_cross = True
@@ -157,19 +124,15 @@ class IndicatorEngine:
         if ema_fast_ind and ema50_ind and \
            ema_fast_ind._series is not None and ema50_ind._series is not None:
             ema_lookback = self._config.get("indicators.ema_cross_lookback", 3)
-            ema_f = ema_fast_ind._series
-            ema_s = ema50_ind._series
+            ema_f = ema_fast_ind._series.values
+            ema_s = ema50_ind._series.values
             ema_fresh_cross = False
             if len(ema_f) >= ema_lookback + 1 and len(ema_s) >= ema_lookback + 1:
                 for i in range(1, ema_lookback + 1):
-                    idx = -i
-                    prev_idx = idx - 1
-                    if abs(prev_idx) > len(ema_f):
-                        break
-                    prev_f = ema_f.iloc[prev_idx]
-                    prev_s = ema_s.iloc[prev_idx]
-                    curr_f = ema_f.iloc[idx]
-                    curr_s = ema_s.iloc[idx]
+                    prev_f = ema_f[-i - 1]
+                    prev_s = ema_s[-i - 1]
+                    curr_f = ema_f[-i]
+                    curr_s = ema_s[-i]
                     if (prev_f <= prev_s and curr_f > curr_s) or \
                        (prev_f >= prev_s and curr_f < curr_s):
                         ema_fresh_cross = True
@@ -180,11 +143,11 @@ class IndicatorEngine:
         adx_ind = self._indicators.get("ADX")
         if adx_ind and adx_ind._plus_di_series is not None:
             di_lookback = self._config.get("indicators.adx_di_momentum_lookback", 3)
-            plus_s = adx_ind._plus_di_series
-            minus_s = adx_ind._minus_di_series
-            if len(plus_s) >= di_lookback + 1:
-                di_gap_now = abs(plus_s.iloc[-1] - minus_s.iloc[-1])
-                di_gap_prev = abs(plus_s.iloc[-(di_lookback + 1)] - minus_s.iloc[-(di_lookback + 1)])
+            plus_v = adx_ind._plus_di_series.values
+            minus_v = adx_ind._minus_di_series.values
+            if len(plus_v) >= di_lookback + 1:
+                di_gap_now = abs(plus_v[-1] - minus_v[-1])
+                di_gap_prev = abs(plus_v[-(di_lookback + 1)] - minus_v[-(di_lookback + 1)])
                 results["DI_momentum"] = round(di_gap_now - di_gap_prev, 2)
             else:
                 results["DI_momentum"] = 0.0
@@ -192,25 +155,25 @@ class IndicatorEngine:
         # ──── MEAN REVERSION DERIVATIVES ────
 
         # 1. ADX_slope: ADX change over last 5 bars
-        adx_ind2 = self._indicators.get("ADX")
-        if adx_ind2 and adx_ind2._adx_series is not None and len(adx_ind2._adx_series) >= 6:
-            results["ADX_slope"] = round(
-                adx_ind2._adx_series.iloc[-1] - adx_ind2._adx_series.iloc[-6], 2)
+        if adx_ind and adx_ind._adx_series is not None and len(adx_ind._adx_series) >= 6:
+            adx_v = adx_ind._adx_series.values
+            results["ADX_slope"] = round(adx_v[-1] - adx_v[-6], 2)
         else:
             results["ADX_slope"] = 0.0
 
         # 2. BB_Width_slope: BB Width change over last 10 bars
         bb_ind = self._indicators.get("BB")
         if bb_ind and bb_ind._bandwidth_series is not None and len(bb_ind._bandwidth_series) >= 11:
-            results["BB_Width_slope"] = round(
-                bb_ind._bandwidth_series.iloc[-1] - bb_ind._bandwidth_series.iloc[-11], 4)
+            bb_v = bb_ind._bandwidth_series.values
+            results["BB_Width_slope"] = round(bb_v[-1] - bb_v[-11], 4)
         else:
             results["BB_Width_slope"] = 0.0
 
         # 3. Volume_ratio: current volume vs 20-bar average
         if not df.empty and "volume" in df.columns and len(df) >= 20:
-            vol_avg = df["volume"].iloc[-20:].mean()
-            cur_vol = df["volume"].iloc[-1]
+            vol_vals = df["volume"].values
+            vol_avg = vol_vals[-20:].mean()
+            cur_vol = vol_vals[-1]
             results["Volume_ratio"] = round(cur_vol / vol_avg, 2) if vol_avg > 0 else 1.0
         else:
             results["Volume_ratio"] = 1.0
@@ -221,8 +184,10 @@ class IndicatorEngine:
         if (ema_f_ind and sma_s_ind and
                 ema_f_ind._series is not None and sma_s_ind._series is not None and
                 len(ema_f_ind._series) >= 6 and len(sma_s_ind._series) >= 6):
-            gap_now = abs(ema_f_ind._series.iloc[-1] - sma_s_ind._series.iloc[-1])
-            gap_prev = abs(ema_f_ind._series.iloc[-6] - sma_s_ind._series.iloc[-6])
+            ef_v = ema_f_ind._series.values
+            ss_v = sma_s_ind._series.values
+            gap_now = abs(ef_v[-1] - ss_v[-1])
+            gap_prev = abs(ef_v[-6] - ss_v[-6])
             results["EMA_gap_expanding"] = gap_now > gap_prev
         else:
             results["EMA_gap_expanding"] = False
@@ -230,9 +195,10 @@ class IndicatorEngine:
         # 5. MACD_histogram_prev: previous bar histogram for MR turn detection
         macd_ind2 = self._indicators.get("MACD")
         if macd_ind2 and macd_ind2._macd_series is not None and macd_ind2._signal_series is not None:
-            ms, ss = macd_ind2._macd_series, macd_ind2._signal_series
-            if len(ms) >= 2 and len(ss) >= 2:
-                results["MACD_histogram_prev"] = ms.iloc[-2] - ss.iloc[-2]
+            ms_v = macd_ind2._macd_series.values
+            ss_v = macd_ind2._signal_series.values
+            if len(ms_v) >= 2 and len(ss_v) >= 2:
+                results["MACD_histogram_prev"] = ms_v[-2] - ss_v[-2]
             else:
                 results["MACD_histogram_prev"] = 0.0
         else:

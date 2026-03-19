@@ -64,6 +64,7 @@ PRESETS = {
             "mr_sl_atr_mult": 1.5, "mr_bb_proximity_pct": 20.0,
             "mr_volume_exhaustion_max": 0.8, "mr_min_bb_range_fee_mult": 3.0,
             "mr_time_limit_minutes": 240,
+            "mr_trailing_enabled": True, "mr_trailing_activate_atr": 1.5, "mr_trailing_callback_atr": 0.5,
             "mr_breakout_to_trend": True, "mr_stop_flip_enabled": True,
         },
     },
@@ -115,6 +116,7 @@ PRESETS = {
             "mr_sl_atr_mult": 1.5, "mr_bb_proximity_pct": 20.0,
             "mr_volume_exhaustion_max": 0.8, "mr_min_bb_range_fee_mult": 3.0,
             "mr_time_limit_minutes": 240,
+            "mr_trailing_enabled": True, "mr_trailing_activate_atr": 1.5, "mr_trailing_callback_atr": 0.5,
             "mr_breakout_to_trend": True, "mr_stop_flip_enabled": True,
         },
     },
@@ -168,6 +170,7 @@ PRESETS = {
             "mr_sl_atr_mult": 1.5, "mr_bb_proximity_pct": 20.0,
             "mr_volume_exhaustion_max": 0.8, "mr_min_bb_range_fee_mult": 3.0,
             "mr_time_limit_minutes": 240,
+            "mr_trailing_enabled": True, "mr_trailing_activate_atr": 1.5, "mr_trailing_callback_atr": 0.5,
             "mr_breakout_to_trend": True, "mr_stop_flip_enabled": True,
         },
     },
@@ -250,6 +253,7 @@ PRESETS = {
             "mr_sl_atr_mult": 1.5, "mr_bb_proximity_pct": 20.0,
             "mr_volume_exhaustion_max": 0.8, "mr_min_bb_range_fee_mult": 3.0,
             "mr_time_limit_minutes": 240,
+            "mr_trailing_enabled": True, "mr_trailing_activate_atr": 1.5, "mr_trailing_callback_atr": 0.5,
             "mr_breakout_to_trend": True, "mr_stop_flip_enabled": True,
         },
     },
@@ -1742,6 +1746,21 @@ class StrategySettingsPanel(ctk.CTkFrame):
         self._field(g,"mr_min_bb_range_fee_mult", "Min BB Range (Fee Carpani)", "3.0",
                     tip="BB bant genisligi en az fee'nin kac kati olmali (karlilik filtresi)",
                     help_text="BB araligi cok darsa kar fee'yi karsilamaz.\n3.0 = BB range en az 3x fee olmali.")
+        self._checkbox(g,"mr_trailing_enabled", "MR Trailing Stop",
+                       default=True,
+                       help_text=(
+                           "MR TRAILING STOP\n"
+                           "────────────────\n"
+                           "BB middle TP yerine trailing stop kullanir.\n\n"
+                           "Avantaj: Breakout'larda kar kilitlenir,\n"
+                           "sabit TP ile sinirlanmaz.\n\n"
+                           "Kapali = eski BB middle TP sistemi."))
+        self._field(g,"mr_trailing_activate_atr", "MR Trail Aktif (ATR)", "1.5",
+                    tip="Trailing stop kac ATR karda aktif olur",
+                    help_text="MR trailing aktivasyonu.\n1.5 ATR ≈ BB middle mesafesi.\nRanging piyasada ulasilabilir hedef.")
+        self._field(g,"mr_trailing_callback_atr", "MR Trail Callback (ATR)", "0.5",
+                    tip="Trailing aktifken kac ATR geri cekilmede kapanir",
+                    help_text="Siki callback = kar korunur.\n0.5 ATR ranging piyasada uygun.\nTrend'deki 1.0 ATR'den daha siki.")
         self._field(g,"mr_time_limit_minutes", "MR Zaman Limiti (dk)", "240",
                     tip="MR pozisyon max ne kadar acik kalabilir",
                     help_text="MR pozisyonlari trend'den kisa tutulur.\n240dk = 4 saat (trend 8 saat).")
