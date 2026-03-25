@@ -23,6 +23,8 @@ class AppController:
         self.binance_app = None
         self.pair_switcher = None
         self.scanner = None
+        self.rest_client = None
+        self._system_c_analyzer = None
 
         self._current_price: dict[str, float] = {}
         self._current_symbol = config.get("active_symbol", "DOGEUSDT")
@@ -63,6 +65,9 @@ class AppController:
 
     def set_scanner(self, scanner) -> None:
         self.scanner = scanner
+
+    def set_rest_client(self, client) -> None:
+        self.rest_client = client
 
     # ──── Market Data ────
 
@@ -235,6 +240,59 @@ class AppController:
         if self.scanner:
             return self.scanner.get_mr_scan_results()
         return []
+
+    def get_system_b_results(self) -> list:
+        """Return System B scan results."""
+        if self.scanner:
+            return self.scanner.get_system_b_results()
+        return []
+
+    def get_system_d_results(self) -> list:
+        """Return System D scan results."""
+        if self.scanner:
+            return self.scanner.get_system_d_results()
+        return []
+
+    def get_system_e_results(self) -> list:
+        """Return System E scan results."""
+        if self.scanner:
+            return self.scanner.get_system_e_results()
+        return []
+
+    def get_system_f_results(self) -> list:
+        """Return System F (Son Kursun) scan results."""
+        if self.scanner:
+            return self.scanner.get_system_f_results()
+        return []
+
+    def get_system_g_results(self) -> list:
+        """Return System G scan results."""
+        if self.scanner:
+            return getattr(self.scanner, '_last_system_g_results', [])
+        return []
+
+    def get_system_h_results(self) -> list:
+        """Return System H (Hibrit) scan results."""
+        if self.scanner:
+            return self.scanner.get_system_h_results()
+        return []
+
+    def place_breakeven_tp_all(self) -> list[dict]:
+        """Tüm pozisyonlara breakeven TP emri gönder (SL'ye dokunmaz)."""
+        if self.scanner:
+            return self.scanner.place_breakeven_tp_all()
+        return [{"error": "Scanner yok"}]
+
+    def get_system_c_analyzer(self):
+        """Return (or create) System C analyzer instance.
+        Ayri REST client kullanir (scanner ile rate limit catismasi onlenir)."""
+        if self._system_c_analyzer is None:
+            from scanner.system_c_analyzer import SystemCAnalyzer
+            from market.binance_rest import BinanceRestClient
+            # System C icin ayri REST client (ayri session, rate limit paylasimi yok)
+            sc_rest = BinanceRestClient()
+            self._system_c_analyzer = SystemCAnalyzer(self.config, sc_rest)
+        return self._system_c_analyzer
 
     def get_scanner_candidate(self):
         if self.scanner:

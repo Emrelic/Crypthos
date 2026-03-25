@@ -53,6 +53,8 @@ class MRScanResult:
     ob_liquidity: float = 0.0
     # Source tracking
     source: str = ""                  # "R" (ADX<18), "G->R" (gray->range)
+    # Efficiency ratio (low = ranging, high = trending)
+    efficiency_ratio: float = 0.5    # 0-1, < 0.3 = mean reverting, > 0.5 = trending
     # Breakout warning
     breakout_risk: bool = False       # volume surge detected (potential breakout, not MR)
 
@@ -67,50 +69,39 @@ class MRScannerScorer:
 
     def classify_gray_zone(self, indicators: dict) -> str:
         """Classify gray zone coin (ADX 18-25) as TREND or RANGE.
-        5-signal voting: ADX slope, DI separation, BB width slope,
-        volume trend, EMA gap. Returns 'TREND' or 'RANGE'."""
+        3-group voting with correlated signals grouped together:
+          Group 1 (ADX): ADX_slope + DI separation → 1 oy (korelasyonlu)
+          Group 2 (Volatility): BB_Width_slope + EMA_gap → 1 oy (korelasyonlu)
+          Group 3 (Volume): Volume_ratio → 1 oy (bağımsız)
+        Returns 'TREND' or 'RANGE'."""
         trend_votes = 0
-        range_votes = 0
 
-        # 1. ADX direction (weight: 1 vote — equal to other signals)
+        # Group 1: ADX momentum (ADX_slope ve DI separation korelasyonlu → tek oy)
         adx_slope = indicators.get("ADX_slope", 0)
-        if adx_slope > 0.3:
-            trend_votes += 1
-        else:
-            range_votes += 1
-
-        # 2. DI separation (weight: 1 vote)
         plus_di = indicators.get("ADX_plus_DI", 0)
         minus_di = indicators.get("ADX_minus_DI", 0)
         di_diff = abs(plus_di - minus_di)
-        if di_diff > 8:
-            trend_votes += 1
-        else:
-            range_votes += 1
+        # Grubun TREND sayılması: en az bir sinyal güçlü VEYA ikisi de zayıf ama olumlu
+        if adx_slope > 0.3 and di_diff > 8:
+            trend_votes += 1  # ikisi de trend → güçlü oy
+        elif adx_slope > 0.5 or di_diff > 12:
+            trend_votes += 1  # biri çok güçlü → yeterli
 
-        # 3. BB Width direction (weight: 1 vote)
+        # Group 2: Volatility expansion (BB_Width_slope ve EMA_gap korelasyonlu → tek oy)
         bb_slope = indicators.get("BB_Width_slope", 0)
-        if bb_slope > 0:
-            trend_votes += 1
-        else:
-            range_votes += 1
+        ema_expanding = indicators.get("EMA_gap_expanding", False)
+        if bb_slope > 0 and ema_expanding:
+            trend_votes += 1  # ikisi de genişliyor → güçlü oy
+        elif bb_slope > 0.5:
+            trend_votes += 1  # BB çok hızlı genişliyor → yeterli
 
-        # 4. Volume trend (weight: 1 vote)
+        # Group 3: Volume (bağımsız sinyal → tek oy)
         vol_ratio = indicators.get("Volume_ratio", 1.0)
         if vol_ratio > 1.2:
             trend_votes += 1
-        else:
-            range_votes += 1
 
-        # 5. EMA gap expanding (weight: 1 vote)
-        ema_expanding = indicators.get("EMA_gap_expanding", False)
-        if ema_expanding:
-            trend_votes += 1
-        else:
-            range_votes += 1
-
-        # Total: 5 votes (1 each). Need >= 3 for TREND (majority)
-        return "TREND" if trend_votes >= 3 else "RANGE"
+        # Total: 3 groups. Need >= 2 for TREND (majority of independent signals)
+        return "TREND" if trend_votes >= 2 else "RANGE"
 
     def score_symbol(self, symbol: str, klines: pd.DataFrame,
                      market_context: dict = None,
@@ -160,6 +151,11 @@ class MRScannerScorer:
                 dist_to_lower = (result.price - bb_lower) / bb_range * 100
                 dist_to_upper = (bb_upper - result.price) / bb_range * 100
                 result.bb_proximity_pct = min(dist_to_lower, dist_to_upper)
+
+            # Efficiency Ratio: ADX<18 = "trend yok" ama random walk olabilir.
+            # ER < 0.3 → fiyat gerçekten salınıyor (MR uygun)
+            # ER >= 0.3 → fiyat bir yöne gidiyor veya rastgele (MR riskli)
+            result.efficiency_ratio = self._compute_efficiency_ratio(klines)
 
             # Confluence (for reference, not primary scoring)
             confluence = self._confluence.score(indicators)
@@ -229,15 +225,40 @@ class MRScannerScorer:
         elif direction == "SHORT" and rsi > 65 and rsi < indicators.get("RSI_prev", rsi):
             signals.append("RSI_turn")
 
-        # 3. OBV divergence (price falling but OBV flat/rising for LONG)
+        # 3. OBV divergence (price falling but OBV rising for LONG, or vice versa)
+        # Requires meaningful positive/negative slope, not just zero (which triggers always)
         obv_slope = indicators.get("OBV_slope", 0)
-        price_change = indicators.get("Price", 0)
-        if direction == "LONG" and obv_slope >= 0:
+        if direction == "LONG" and obv_slope > 0:
             signals.append("OBV_support")
-        elif direction == "SHORT" and obv_slope <= 0:
+        elif direction == "SHORT" and obv_slope < 0:
             signals.append("OBV_support")
 
         return signals
+
+    def _compute_efficiency_ratio(self, klines: pd.DataFrame) -> float:
+        """Efficiency Ratio: fiyatın ne kadar yönlü hareket ettiğini ölçer.
+        ER = |son_kapanış - ilk_kapanış| / Σ|close(i) - close(i-1)|
+        ER < 0.2 → güçlü mean reversion (salınım)
+        ER 0.2-0.3 → zayıf mean reversion
+        ER >= 0.3 → yönlü hareket veya random walk → MR uygun değil"""
+        try:
+            closes = klines["close"].values
+            if len(closes) < 20:
+                return 0.5  # yetersiz veri → nötr
+
+            # Son 100 mum (veya mevcut mum sayısı) üzerinde hesapla
+            period = min(100, len(closes))
+            recent = closes[-period:]
+
+            net_move = abs(recent[-1] - recent[0])
+            total_path = sum(abs(recent[i] - recent[i - 1]) for i in range(1, len(recent)))
+
+            if total_path == 0:
+                return 0.5  # fiyat hiç hareket etmemiş → nötr
+
+            return net_move / total_path
+        except Exception:
+            return 0.5  # hata durumunda nötr (filtreden geçsin, skora kalsın)
 
     def _check_mr_eligibility(self, r: MRScanResult) -> tuple[bool, str]:
         """Check MR-specific hard filters. Returns (eligible, reject_reason)."""
@@ -312,28 +333,38 @@ class MRScannerScorer:
         if not fr_ok and not first_fail:
             first_fail = f"extreme_funding ({fr_pct:.3f}%)"
 
+        # 9. Efficiency Ratio: ADX<18 ≠ mean reversion, random walk olabilir
+        # ER < 0.3 → fiyat salınıyor (MR uygun), ER >= 0.3 → yönlü hareket veya random walk
+        mr_max_er = strat.get("mr_max_efficiency_ratio", 0.3)
+        er_ok = r.efficiency_ratio < mr_max_er
+        checks["ER"] = (er_ok, f"{r.efficiency_ratio:.2f}", f"<{mr_max_er}")
+        if not er_ok and not first_fail:
+            first_fail = f"not_mean_reverting (ER={r.efficiency_ratio:.2f} >= {mr_max_er})"
+
         r.filter_checks = checks
         all_passed = not first_fail
         return all_passed, first_fail
 
     def _compute_mr_score(self, r: MRScanResult) -> float:
-        """Compute MR composite score (0-100, negative for SHORT)."""
-        # 25% BB proximity
+        """Compute MR composite score (0-100, negative for SHORT).
+        Ağırlıklar: BB+RSI korelasyonlu olduğu için toplam %35'e düşürüldü.
+        Volume+Momentum bağımsız MR teyit sinyalleri → toplam %50'ye çıkarıldı."""
+        # 20% BB proximity (fiyat banda ne kadar yakın)
         bb_score = self._score_bb_proximity(r)
-        # 25% RSI extreme
+        # 15% RSI extreme (BB ile korelasyonlu → ağırlığı azaltıldı)
         rsi_score = self._score_rsi_extreme(r)
-        # 20% Volume exhaustion
+        # 25% Volume exhaustion (bağımsız MR teyidi → ağırlığı artırıldı)
         vol_score = self._score_volume_exhaustion(r)
         # 15% BB width quality
         width_score = self._score_bb_width(r)
-        # 15% Momentum turn
+        # 25% Momentum turn (bağımsız dönüş teyidi → ağırlığı artırıldı)
         momentum_score = self._score_momentum(r)
 
-        raw = (0.25 * bb_score +
-               0.25 * rsi_score +
-               0.20 * vol_score +
+        raw = (0.20 * bb_score +
+               0.15 * rsi_score +
+               0.25 * vol_score +
                0.15 * width_score +
-               0.15 * momentum_score)
+               0.25 * momentum_score)
 
         # Sentiment adjustment (max ±8 for MR, less than trend's ±12)
         sentiment = self._score_mr_sentiment(r)
@@ -363,18 +394,21 @@ class MRScannerScorer:
             return 10.0
 
     def _score_rsi_extreme(self, r: MRScanResult) -> float:
-        """0-100: how extreme the RSI is."""
+        """0-100: how extreme the RSI is.
+        Scoring aligned with mr_rsi_oversold/overbought filter thresholds:
+        RSI at filter boundary (35/65) gets 50pts so filtered-in coins
+        can realistically reach mr_min_score(65)."""
         if r.direction == "LONG":
             if r.rsi <= 15:
                 return 100.0
             elif r.rsi <= 20:
                 return 90.0
             elif r.rsi <= 25:
-                return 75.0
+                return 80.0
             elif r.rsi <= 30:
-                return 60.0
+                return 65.0
             elif r.rsi <= 35:
-                return 30.0
+                return 50.0
             else:
                 return 0.0
         else:  # SHORT
@@ -383,11 +417,11 @@ class MRScannerScorer:
             elif r.rsi >= 80:
                 return 90.0
             elif r.rsi >= 75:
-                return 75.0
+                return 80.0
             elif r.rsi >= 70:
-                return 60.0
+                return 65.0
             elif r.rsi >= 65:
-                return 30.0
+                return 50.0
             else:
                 return 0.0
 

@@ -103,6 +103,7 @@ def main():
         scanner.set_risk_manager(risk_manager)
         scanner.set_order_logger(order_logger)
         controller.set_scanner(scanner)
+        controller.set_rest_client(rest_client)
 
         # In API mode, skip Binance Desktop entirely — no window needed
         logger.info("Binance Desktop not needed in API mode, skipping UI automation")
@@ -130,6 +131,7 @@ def main():
         scanner.set_binance_app(binance_app)
         scanner.set_order_logger(order_logger)
         controller.set_scanner(scanner)
+        controller.set_rest_client(rest_client)
 
     # Start services
     controller.start()

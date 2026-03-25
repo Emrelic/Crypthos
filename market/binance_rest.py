@@ -164,15 +164,19 @@ class BinanceRestClient:
     def _signed_post(self, endpoint: str, params: dict = None) -> dict | list:
         params = self._sign(params or {})
         url = f"{self.BASE_URL}{endpoint}"
-        resp = self._session.post(url, params=params, timeout=10)
-        if resp.status_code >= 400:
-            try:
-                err_body = resp.json()
-                logger.error(f"API error {resp.status_code}: {err_body}")
-            except Exception:
-                logger.error(f"API error {resp.status_code}: {resp.text}")
-            resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = self._session.post(url, params=params, timeout=10)
+            if resp.status_code >= 400:
+                try:
+                    err_body = resp.json()
+                    logger.error(f"API error {resp.status_code} [{endpoint}]: {err_body}")
+                except Exception:
+                    logger.error(f"API error {resp.status_code} [{endpoint}]: {resp.text}")
+                resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logger.error(f"Signed POST error [{endpoint}]: {e}")
+            raise
 
     def _signed_delete(self, endpoint: str, params: dict = None) -> dict | list:
         params = self._sign(params or {})
@@ -340,7 +344,8 @@ class BinanceRestClient:
         if order_type in self._ALGO_TYPES:
             return self._place_algo_order(
                 symbol, side, order_type, quantity, price,
-                stop_price, close_position, callback_rate=callback_rate)
+                stop_price, close_position, callback_rate=callback_rate,
+                reduce_only=reduce_only)
 
         params = {
             "symbol": symbol,
@@ -365,18 +370,24 @@ class BinanceRestClient:
                           quantity: float = None, price: float = None,
                           trigger_price: float = None,
                           close_position: bool = False,
-                          callback_rate: float = None) -> dict:
+                          callback_rate: float = None,
+                          reduce_only: bool = False) -> dict:
         """POST /fapi/v1/algoOrder — conditional orders (SL/TP/TRAILING).
         Binance migrated these from /fapi/v1/order on 2025-12-09.
-        callback_rate: for TRAILING_STOP_MARKET, callback % (0.1 to 5.0)."""
+        callback_rate: for TRAILING_STOP_MARKET, callback % (0.1 to 5.0).
+        reduce_only: True → emir sadece mevcut pozisyonu kapatır, yeni açmaz."""
         params = {
             "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": side,
             "type": order_type,
         }
+        # TRAILING_STOP_MARKET uses activationPrice, others use triggerPrice
         if trigger_price is not None:
-            params["triggerPrice"] = _fmt(trigger_price)
+            if order_type == "TRAILING_STOP_MARKET":
+                params["activationPrice"] = _fmt(trigger_price)
+            else:
+                params["triggerPrice"] = _fmt(trigger_price)
         if quantity is not None:
             params["quantity"] = _fmt(quantity)
         if price is not None:
@@ -386,6 +397,8 @@ class BinanceRestClient:
             params["closePosition"] = "true"
         if callback_rate is not None:
             params["callbackRate"] = _fmt(callback_rate)
+        if reduce_only:
+            params["reduceOnly"] = "true"
 
         return self._signed_post("/fapi/v1/algoOrder", params)
 
@@ -489,6 +502,51 @@ class BinanceRestClient:
         except Exception as e:
             logger.warning(f"get_open_orders failed: {e}")
             return None
+
+    def get_symbol_open_orders_combined(self, symbol: str):
+        """Get all open orders (regular + algo) for a SINGLE symbol.
+        Fallback method when bulk read fails.
+        Returns list on success, None on ALL errors."""
+        combined = []
+        regular_ok = False
+        algo_ok = False
+
+        # 1. Regular orders for this symbol
+        try:
+            regular = self._signed_get("/fapi/v1/openOrders", {"symbol": symbol})
+            if isinstance(regular, list):
+                for o in regular:
+                    o["_source"] = "regular"
+                combined.extend(regular)
+            regular_ok = True
+        except Exception as e:
+            logger.debug(f"get_symbol_orders({symbol}) regular failed: {e}")
+
+        # 2. Algo orders for this symbol
+        for endpoint in ["/fapi/v1/algo/openOrders",
+                         "/fapi/v1/openAlgoOrders",
+                         "/fapi/v1/conditional/openOrders"]:
+            try:
+                data = self._signed_get(endpoint, {"symbol": symbol})
+                algo_list = []
+                if isinstance(data, list):
+                    algo_list = data
+                elif isinstance(data, dict):
+                    algo_list = (data.get("orders") or data.get("dataList")
+                                 or data.get("rows") or [])
+                    if not isinstance(algo_list, list):
+                        algo_list = []
+                for o in algo_list:
+                    o["_source"] = "algo"
+                combined.extend(algo_list)
+                algo_ok = True
+                break
+            except Exception:
+                continue
+
+        if not regular_ok and not algo_ok:
+            return None  # Both failed — cannot trust result
+        return combined
 
     def get_algo_open_orders(self, symbol: str = None):
         """Algo/conditional open orders. Birden fazla endpoint dener.

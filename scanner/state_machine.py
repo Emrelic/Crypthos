@@ -13,6 +13,12 @@ from scanner.symbol_universe import SymbolUniverse
 from scanner.batch_fetcher import BatchKlineFetcher
 from scanner.scanner_scorer import ScannerScorer, ScanResult
 from scanner.scanner_scorer_mr import MRScannerScorer, MRScanResult
+from scanner.system_b_scanner import SystemBScanner, SystemBScanResult
+from scanner.system_d_scanner import SystemDScanner, SystemDScanResult
+from scanner.system_e_scanner import SystemEScanner, SystemEScanResult
+from scanner.system_f_scanner import SystemFScanner, SystemFScanResult
+from scanner.system_g_scanner import SystemGScanner, SystemGScanResult
+from scanner.system_h_scanner import SystemHScanner, SystemHScanResult
 from scanner.position_manager import PositionManager
 from scanner.timeframe_selector import TimeframeSelector
 from indicators.indicator_engine import IndicatorEngine
@@ -118,10 +124,53 @@ class ScannerStateMachine:
         # Per-coin daily loss ban: symbol -> [loss_timestamp, ...]
         self._coin_loss_history: dict[str, list[float]] = {}
 
+        # ── System B (Wave Analysis) ──
+        self._system_b_scanner = SystemBScanner(config)
+        self._last_system_b_results: list[SystemBScanResult] = []
+        self._system_b_regime_history: dict[str, list[str]] = {}  # symbol -> [regime, ...] (hysteresis)
+
+        # ── System D (Sıralı Coin Analiz) ──
+        self._system_d_scanner = SystemDScanner(config)
+        self._last_system_d_results: list[SystemDScanResult] = []
+
+        # ── System E (Yüksek Kaldıraç Yön Kesinliği) ──
+        self._system_e_scanner = SystemEScanner(config)
+        self._last_system_e_results: list[SystemEScanResult] = []
+
+        # ── System F (Son Kursun) ──
+        self._system_f_scanner = SystemFScanner(config)
+        self._last_system_f_results: list[SystemFScanResult] = []
+
+        # ── System G (Per-Coin Optimized) ──
+        self._system_g_scanner = SystemGScanner(config)
+        self._last_system_g_results: list[SystemGScanResult] = []
+
+        # ── System H (Hibrit: A+B+D+F) ──
+        self._system_h_scanner = SystemHScanner(config)
+        self._last_system_h_results: list[SystemHScanResult] = []
+        self._sg_last_full_scan_time = 0.0
+        self._sg_shortlist: list[str] = []
+        self._sg_cached_symbols: list[str] = []
+        self._sg_cached_klines: dict[str, dict[str, list]] = {}
+        self._sg_cached_volume_map: dict[str, float] = {}
+        self._sg_cached_ob_map: dict[str, dict] = {}
+        self._sg_cached_btc_direction: str = "FLAT"
+        # İki katmanlı tarama state
+        self._sf_last_full_scan_time: float = 0.0
+        self._sf_shortlist: list[str] = []
+        self._sf_last_full_results: list[SystemFScanResult] = []
+        self._sf_cached_klines: dict[str, dict[str, list]] = {}
+        self._sf_cached_market_ctx: dict = {}
+        self._sf_cached_ob_map: dict = {}
+        self._sf_cached_beta_map: dict = {}
+        self._sf_cached_btc_direction: str = "FLAT"
+        self._sf_cached_volume_map: dict = {}
+        self._sf_cached_symbols: list[str] = []
+
         # Server order verification: last check time (interval from config)
         self._last_order_verify_time: float = 0.0
         self._order_verify_interval: float = config.get(
-            "strategy.order_verify_interval", 60.0)
+            "strategy.order_verify_interval", 30.0)
 
     # ──── Setters ────
 
@@ -188,7 +237,20 @@ class ScannerStateMachine:
         while self._running:
             try:
                 if self._state == ScannerState.SCANNING:
-                    self._do_scanning()
+                    if self._config.get("system_h.enabled", False):
+                        self._do_scanning_system_h()
+                    elif self._config.get("system_g.enabled", False):
+                        self._do_scanning_system_g()
+                    elif self._config.get("system_f.enabled", False):
+                        self._do_scanning_system_f()
+                    elif self._config.get("system_e.enabled", False):
+                        self._do_scanning_system_e()
+                    elif self._config.get("system_d.enabled", False):
+                        self._do_scanning_system_d()
+                    elif self._config.get("system_b.enabled", False):
+                        self._do_scanning_system_b()
+                    else:
+                        self._do_scanning()
                 elif self._state == ScannerState.BUYING:
                     self._do_buying()
                 elif self._state == ScannerState.HOLDING:
@@ -388,7 +450,7 @@ class ScannerStateMachine:
                 self._held_indicators.pop(sym, None)
 
         eligible = [r for r in results if r.eligible]
-        min_score = self._config.get("strategy.min_buy_score", 65)
+        min_score = self._config.get("strategy.min_buy_score", 55)
 
         # Log top 5 scores for debugging (eligible or not)
         for i, r in enumerate(results[:5]):
@@ -680,7 +742,11 @@ class ScannerStateMachine:
             # İlk konulan SL + trailing pozisyon kapanana kadar durur.
 
             if exit_reason == self._position_mgr.EXIT_PARTIAL_TP:
-                self._execute_partial_tp(symbol, current_price)
+                pos_obj = self._position_mgr.get_position(symbol)
+                if pos_obj and pos_obj.entry_mode == "SYSTEM_F":
+                    self._execute_partial_tp_system_f(symbol, current_price)
+                else:
+                    self._execute_partial_tp(symbol, current_price)
                 continue  # Don't full-close, position stays open
 
             if exit_reason != "HOLD":
@@ -949,6 +1015,21 @@ class ScannerStateMachine:
 
         logger.info(f"Limit order FILLED: {symbol} @ ~{fill_price:.6f}")
 
+        # System E: skip signal recheck, directly open position
+        if info.get("entry_mode") == "SYSTEM_E":
+            self._on_limit_filled_system_e(symbol, info, fill_price)
+            return
+
+        # System H: skip signal recheck, directly open position
+        if info.get("entry_mode") == "SYSTEM_H":
+            self._on_limit_filled_system_h(symbol, info, fill_price)
+            return
+
+        # System D: skip signal recheck, directly open position
+        if info.get("entry_mode") == "SYSTEM_D":
+            self._on_limit_filled_system_d(symbol, info, fill_price)
+            return
+
         # Signal recheck: only close if STRONG REVERSAL (opposite direction signal)
         # LONG pozisyonda iken → sadece SHORT sinyali (conf < -threshold) gelirse kapat
         # Nötr veya zayıf sinyal → devam et (fee kaybını önle)
@@ -1050,6 +1131,11 @@ class ScannerStateMachine:
             self._rest.cancel_all_orders(symbol)
         except Exception as e:
             logger.warning(f"Cancel limit order failed for {symbol}: {e}")
+
+        # System D: no market fallback, just cancel and move on
+        if info.get("entry_mode") == "SYSTEM_D":
+            logger.info(f"[SysD] Limit expired for {symbol}, no fallback (next scan will re-evaluate)")
+            return
 
         # Market fallback: if FRESH signal still valid AND price hasn't drifted too far
         strat = self._config.get("strategy", {})
@@ -1240,7 +1326,11 @@ class ScannerStateMachine:
             # KIRMIZI KURAL 3: Server emirleri pozisyon açıkken DEĞİŞTİRİLMEZ.
 
             if exit_reason == self._position_mgr.EXIT_PARTIAL_TP:
-                self._execute_partial_tp(symbol, current_price)
+                pos = self._position_mgr.get_position(symbol)
+                if pos and pos.entry_mode == "SYSTEM_F":
+                    self._execute_partial_tp_system_f(symbol, current_price)
+                else:
+                    self._execute_partial_tp(symbol, current_price)
                 continue  # Don't full-close, position stays open
 
             if exit_reason != "HOLD":
@@ -1267,10 +1357,37 @@ class ScannerStateMachine:
                 logger.debug("[EXTERNAL CLOSE] API okuma başarısız — kontrol atlanıyor")
                 return
 
-            api_symbols = {p.get("symbol", "") for p in api_positions}
+            # Build map: symbol → positionAmt (signed: positive=LONG, negative=SHORT)
+            api_pos_map = {}
+            for p in api_positions:
+                sym = p.get("symbol", "")
+                amt = float(p.get("positionAmt", 0))
+                api_pos_map[sym] = amt
 
-            # Find positions we think are open but Binance says closed
+            api_symbols = set(api_pos_map.keys())
+
+            # Check 1: symbol completely gone from API
             closed_externally = held_symbols - api_symbols
+
+            # Check 2: symbol exists but DIRECTION FLIPPED (SL/trailing açtı ters pozisyon)
+            for symbol in held_symbols & api_symbols:
+                pos = self._position_mgr.get_position(symbol)
+                if not pos:
+                    continue
+                api_amt = api_pos_map.get(symbol, 0)
+                sys_is_long = pos.side == OrderSide.BUY_LONG
+                api_is_long = api_amt > 0
+                if api_amt != 0 and sys_is_long != api_is_long:
+                    logger.critical(
+                        f"[DIRECTION FLIP] {symbol}: Sistem={'LONG' if sys_is_long else 'SHORT'} "
+                        f"API={'LONG' if api_is_long else 'SHORT'} (amt={api_amt}) "
+                        f"— YÖN DEĞİŞMİŞ, pozisyon takipten siliniyor + emirler iptal")
+                    # Orphan emirleri temizle (ters yöndeki SL/trailing)
+                    try:
+                        self._order_executor._rest.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+                    closed_externally.add(symbol)
 
             for symbol in closed_externally:
                 pos = self._position_mgr.get_position(symbol)
@@ -1318,10 +1435,21 @@ class ScannerStateMachine:
                 if result:
                     pnl_usdt = result.get("pnl_usdt", 0)
                     if pnl_usdt < 0:
-                        self._loss_cooldown_symbols[symbol] = time.time()
+                        # System D kendi cooldown ayarını kullanır
+                        entry_mode = getattr(pos, 'entry_mode', '') if pos else ''
+                        if entry_mode == "SYSTEM_D":
+                            sd = self._config.get("system_d", {})
+                            if sd.get("cooldown_enabled", False):
+                                cooldown_s = sd.get("cooldown_seconds", 600)
+                                self._loss_cooldown_symbols[symbol] = time.time()
+                                logger.info(f"[SysD COOLDOWN] {symbol}: {cooldown_s}s re-entry yasagi "
+                                            f"(PnL={pnl_usdt:+.4f} USDT)")
+                            # cooldown kapalıysa kaydetme
+                        else:
+                            self._loss_cooldown_symbols[symbol] = time.time()
+                            logger.info(f"[LOSS COOLDOWN] {symbol}: {self._loss_cooldown_seconds}s re-entry yasagi "
+                                        f"(PnL={pnl_usdt:+.4f} USDT, external_close)")
                         self._record_coin_loss(symbol)
-                        logger.info(f"[LOSS COOLDOWN+BAN] {symbol}: {self._loss_cooldown_seconds}s re-entry yasagi "
-                                    f"(PnL={pnl_usdt:+.4f} USDT, external_close)")
 
                 self._event_bus.publish(EventType.TRADE_RESULT, result or {})
 
@@ -1381,6 +1509,36 @@ class ScannerStateMachine:
         except Exception as e:
             logger.debug(f"External close detection error: {e}")
 
+    @staticmethod
+    def _classify_order_type(order: dict) -> str:
+        """Binance order dict'inden emir tipini belirle.
+        Algo API, regular API ve farklı response formatlarını destekler."""
+        _KNOWN = {"STOP_MARKET", "TRAILING_STOP_MARKET", "TAKE_PROFIT_MARKET",
+                  "STOP", "TAKE_PROFIT", "MARKET", "LIMIT"}
+        for field in ("orderType", "type", "origType", "algoOrderType"):
+            candidate = order.get(field, "")
+            if candidate in _KNOWN:
+                return candidate
+        # Fallback: bilinen bir tip bulunamadı
+        return order.get("type", "") or order.get("orderType", "")
+
+    def _build_order_map(self, orders: list) -> dict:
+        """Order listesinden per-symbol emir sayımı oluştur."""
+        order_map = {}
+        for o in orders:
+            sym = o.get("symbol", "")
+            if sym not in order_map:
+                order_map[sym] = {"sl": 0, "trail": 0, "other": 0, "total": 0}
+            order_map[sym]["total"] += 1
+            otype = self._classify_order_type(o)
+            if otype == "STOP_MARKET":
+                order_map[sym]["sl"] += 1
+            elif otype == "TRAILING_STOP_MARKET":
+                order_map[sym]["trail"] += 1
+            else:
+                order_map[sym]["other"] += 1
+        return order_map
+
     def _verify_server_orders(self) -> None:
         """GÜVENLİK TARAMASI — 4 KURAL:
         ─────────────────────────────────────────────────────
@@ -1403,38 +1561,30 @@ class ScannerStateMachine:
         rest = self._order_executor._rest
         held_symbols = set(self._position_mgr.get_held_symbols())
 
-        # ── 1. Tüm emirleri tek çağrıda oku ──
-        all_combined = rest.get_all_open_orders_combined()
-
-        # GÜVENLİK: API okuma başarısız → HİÇBİR ŞEY YAPMA
-        if all_combined is None:
-            logger.warning("[ORDER VERIFY] API okuma BAŞARISIZ — hiçbir işlem yapılmıyor")
+        if not held_symbols:
             return
 
-        # ── 2. Per-symbol emir sayımı ──
-        # order_map[symbol] = {"sl": count, "trail": count, "other": count, "total": count}
-        order_map = {}
-        for o in all_combined:
-            sym = o.get("symbol", "")
-            if sym not in order_map:
-                order_map[sym] = {"sl": 0, "trail": 0, "other": 0, "total": 0}
-            order_map[sym]["total"] += 1
-            # Type key: regular="type", algo="type" veya "algoOrderType" veya "orderType"
-            otype = (o.get("type", "") or o.get("algoOrderType", "")
-                     or o.get("orderType", ""))
-            if otype == "STOP_MARKET":
-                order_map[sym]["sl"] += 1
-            elif otype == "TRAILING_STOP_MARKET":
-                order_map[sym]["trail"] += 1
-            else:
-                order_map[sym]["other"] += 1
+        # ── 1. Tüm emirleri tek çağrıda oku (bulk) ──
+        all_combined = rest.get_all_open_orders_combined()
+
+        # Bulk başarısız → per-symbol fallback
+        if all_combined is None:
+            logger.warning("[ORDER VERIFY] Bulk API okuma başarısız — "
+                           "per-symbol fallback deneniyor")
+            self._verify_server_orders_per_symbol(rest, held_symbols)
+            return
+
+        # ── 2. Per-symbol emir sayımı (düzeltilmiş type parsing) ──
+        order_map = self._build_order_map(all_combined)
 
         # ── 3. Durum logu ──
         total_orders = sum(v["total"] for v in order_map.values())
         total_sl = sum(v["sl"] for v in order_map.values())
         total_trail = sum(v["trail"] for v in order_map.values())
-        logger.info(f"[ORDER VERIFY] {total_orders} emir "
-                    f"(SL={total_sl}, trail={total_trail}) | "
+        expected = len(held_symbols) * 2
+        status = "OK" if (total_sl + total_trail) == expected else "EKSİK"
+        logger.info(f"[ORDER VERIFY] {status} | {total_orders} emir "
+                    f"(SL={total_sl}, trail={total_trail}, beklenen={expected}) | "
                     f"pozisyon={len(held_symbols)}")
 
         # İlk çalışmada response yapısını logla (teşhis için)
@@ -1442,22 +1592,76 @@ class ScannerStateMachine:
         if algo_samples:
             s = algo_samples[0]
             logger.info(f"[ORDER VERIFY] Algo örnek key'ler: {sorted(s.keys())}")
+            # Tüm type-related field'ları logla (teşhis)
+            logger.info(f"[ORDER VERIFY] Algo örnek type alanları: "
+                        f"type={s.get('type')}, orderType={s.get('orderType')}, "
+                        f"origType={s.get('origType')}, "
+                        f"algoOrderType={s.get('algoOrderType')}")
 
         strat = self._config.get("strategy", {})
+        self._apply_order_rules(rest, held_symbols, order_map, strat)
+
+    def _verify_server_orders_per_symbol(self, rest, held_symbols: set) -> None:
+        """Bulk read başarısız olduğunda her sembol için tek tek sorgula."""
+        strat = self._config.get("strategy", {})
+        order_map = {}
+        failed_symbols = []
+
+        for symbol in held_symbols:
+            try:
+                orders = rest.get_symbol_open_orders_combined(symbol)
+                if orders is None:
+                    failed_symbols.append(symbol)
+                    continue
+                sym_map = self._build_order_map(orders)
+                order_map.update(sym_map)
+                # Sembol order_map'te yoksa boş ekle
+                if symbol not in order_map:
+                    order_map[symbol] = {"sl": 0, "trail": 0, "other": 0, "total": 0}
+            except Exception as e:
+                logger.error(f"[ORDER VERIFY] {symbol}: per-symbol read failed: {e}")
+                failed_symbols.append(symbol)
+
+        if failed_symbols:
+            logger.warning(f"[ORDER VERIFY] Per-symbol fallback: {len(failed_symbols)} "
+                           f"sembol okunamadı: {failed_symbols}")
+
+        # Başarılı okunanlar için kuralları uygula
+        verified_symbols = held_symbols - set(failed_symbols)
+        if verified_symbols:
+            total_sl = sum(order_map.get(s, {}).get("sl", 0) for s in verified_symbols)
+            total_trail = sum(order_map.get(s, {}).get("trail", 0) for s in verified_symbols)
+            logger.info(f"[ORDER VERIFY] Per-symbol: {len(verified_symbols)} sembol okundu "
+                        f"(SL={total_sl}, trail={total_trail})")
+            self._apply_order_rules(rest, verified_symbols, order_map, strat)
+
+    def _apply_order_rules(self, rest, held_symbols: set, order_map: dict,
+                           strat: dict) -> None:
+        """Verify kurallarını uygula. Davranış config'den kontrol edilir:
+        - order_verify_clean_orphans: pozisyonsuz emirleri sil/bırak
+        - order_verify_fix_duplicates: mükerrer emirleri sil+yenile / bırak
+        - order_verify_no_cancel: eksik emirde sadece ekle / sil+yenile
+        """
+        no_cancel = strat.get("order_verify_no_cancel", True)
+        fix_dupes = strat.get("order_verify_fix_duplicates", False)
+        clean_orphans = strat.get("order_verify_clean_orphans", True)
 
         # ── KURAL 3: Pozisyonu olmayan artık emirleri temizle ──
         orphan_symbols = set(order_map.keys()) - held_symbols
         for sym in orphan_symbols:
             info = order_map[sym]
-            # Sadece SL/trailing türü emirleri olan orphan'ları temizle
-            # (LIMIT gibi diğer emirlere dokunma)
             if info["sl"] > 0 or info["trail"] > 0:
-                logger.warning(f"[ORDER VERIFY] {sym}: Pozisyon YOK ama "
-                               f"{info['total']} emir var — orphan temizleniyor")
-                try:
-                    rest.cancel_all_orders(sym)
-                except Exception as e:
-                    logger.error(f"[ORDER VERIFY] {sym}: orphan temizleme hatası: {e}")
+                if clean_orphans:
+                    logger.warning(f"[ORDER VERIFY] {sym}: Pozisyon YOK ama "
+                                   f"{info['total']} emir var — orphan temizleniyor")
+                    try:
+                        rest.cancel_all_orders(sym)
+                    except Exception as e:
+                        logger.error(f"[ORDER VERIFY] {sym}: orphan temizleme hatası: {e}")
+                else:
+                    logger.info(f"[ORDER VERIFY] {sym}: Pozisyon YOK, "
+                                f"{info['total']} orphan emir var — "
+                                f"temizleme KAPALI, bırakıldı")
 
         # ── KURAL 2 + 4: Her pozisyon için kontrol ──
         for symbol in held_symbols:
@@ -1467,26 +1671,31 @@ class ScannerStateMachine:
 
             info = order_map.get(symbol, {"sl": 0, "trail": 0, "other": 0, "total": 0})
 
-            # KURAL 4: Fazla emir var → temizle + doğru 1+1 koy
+            # KURAL 4: Mükerrer emir var (2+ SL veya 2+ trailing)
             if info["sl"] > 1 or info["trail"] > 1:
-                logger.warning(f"[ORDER VERIFY] {symbol}: FAZLA EMİR "
-                               f"(SL={info['sl']}, trail={info['trail']}) "
-                               f"— temizlenip 1+1 yeniden konuyor")
-                try:
-                    rest.cancel_all_orders(symbol)
-                except Exception as e:
-                    logger.error(f"[ORDER VERIFY] {symbol}: cancel failed: {e}")
+                if fix_dupes:
+                    logger.warning(f"[ORDER VERIFY] {symbol}: MÜKERRER "
+                                   f"(SL={info['sl']}, trail={info['trail']}) "
+                                   f"— temizlenip 1+1 yeniden konuyor")
+                    try:
+                        rest.cancel_all_orders(symbol)
+                    except Exception as e:
+                        logger.error(f"[ORDER VERIFY] {symbol}: cancel failed: {e}")
+                    self._place_missing_orders(symbol, pos, strat,
+                                               need_sl=True, need_trailing=True)
                     continue
-                # 1+1 yeniden koy
-                self._place_missing_orders(symbol, pos, strat,
-                                           need_sl=True, need_trailing=True)
+                else:
+                    logger.info(f"[ORDER VERIFY] {symbol}: mükerrer emir var "
+                                f"(SL={info['sl']}, trail={info['trail']}) — "
+                                f"temizleme KAPALI, bırakıldı")
+
+            # Yeterli emir var → OK
+            if info["sl"] >= 1 and info["trail"] >= 1:
+                logger.debug(f"[ORDER VERIFY] {symbol}: OK "
+                             f"(SL={info['sl']}, trail={info['trail']})")
                 continue
 
-            # Tam 1+1 — OK
-            if info["sl"] == 1 and info["trail"] == 1:
-                continue
-
-            # KURAL 2: Eksik emir koy (mevcut emirlere dokunma)
+            # KURAL 2: Eksik emir — sadece ekle veya sil+yenile
             need_sl = info["sl"] == 0
             need_trail = info["trail"] == 0
 
@@ -1496,18 +1705,48 @@ class ScannerStateMachine:
             if need_trail:
                 missing.append("TRAILING")
 
-            logger.warning(f"[ORDER VERIFY] {symbol}: EKSİK {', '.join(missing)} "
-                           f"(mevcut: SL={info['sl']}, trail={info['trail']}) "
-                           f"— eksik emir konuyor")
-            self._place_missing_orders(symbol, pos, strat, need_sl, need_trail)
+            if no_cancel:
+                # Sadece eksik olanı ekle, mevcut emirlere DOKUNMA
+                logger.warning(f"[ORDER VERIFY] {symbol}: EKSİK {', '.join(missing)} "
+                               f"(mevcut: SL={info['sl']}, trail={info['trail']}) "
+                               f"— sadece eksik ekleniyor")
+                self._place_missing_orders(symbol, pos, strat, need_sl, need_trail)
+            else:
+                # Hepsini sil + 1 SL + 1 trailing yeniden koy
+                logger.warning(f"[ORDER VERIFY] {symbol}: EKSİK {', '.join(missing)} "
+                               f"(mevcut: SL={info['sl']}, trail={info['trail']}) "
+                               f"— temizlenip 1+1 yeniden konuyor")
+                try:
+                    rest.cancel_all_orders(symbol)
+                except Exception as e:
+                    logger.error(f"[ORDER VERIFY] {symbol}: cancel failed: {e}")
+                self._place_missing_orders(symbol, pos, strat,
+                                           need_sl=True, need_trailing=True)
+
+    def _get_actual_qty_and_side(self, symbol: str) -> tuple:
+        """Binance API'den gerçek pozisyon miktarı ve yönünü oku.
+        Returns (abs_qty, is_long) or (0, None) if not found/error.
+        is_long=True → LONG, is_long=False → SHORT, is_long=None → bulunamadı."""
+        try:
+            api_positions = self._order_executor.get_open_positions()
+            if api_positions:
+                for p in api_positions:
+                    if p.get("symbol") == symbol:
+                        amt = float(p.get("positionAmt", 0))
+                        if amt == 0:
+                            return (0, None)
+                        return (abs(amt), amt > 0)
+        except Exception as e:
+            logger.warning(f"[ORDER REPAIR] {symbol}: API qty read failed: {e}")
+        return (0, None)
 
     def _place_missing_orders(self, symbol: str, pos, strat: dict,
                                need_sl: bool, need_trailing: bool) -> None:
-        """KIRMIZI KURAL 2+3: Sadece eksik emirleri koy, mevcut emirlere DOKUNMA.
-        cancel_all_orders ÇAĞRILMAZ.
+        """Eksik emirleri koy. Mevcut emirlere dokunma.
+        Emir koymadan önce Binance'den GERÇEK qty okunur (stale pos.size koruması).
 
-        SL  = entry - 2×ATR (her zaman orijinal plan)
-        Trail = entry ± 3×ATR tetik, 1×ATR callback (her zaman orijinal plan)
+        SL  = entry ± N×ATR (orijinal plan)
+        Trail = entry ± M×ATR tetik, K×ATR callback (orijinal plan)
         """
         try:
             rest = self._order_executor._rest
@@ -1527,72 +1766,269 @@ class ScannerStateMachine:
                 logger.warning(f"[ORDER REPAIR] {symbol}: ATR=0, fallback ATR=%2 of entry "
                                f"= {atr:.8f}")
 
+            # ── GERÇEK QTY + YÖN: Binance'den oku ──
+            actual_qty, api_is_long = self._get_actual_qty_and_side(symbol)
+            if actual_qty <= 0:
+                # Pozisyon API'de yok — kapanmış olabilir
+                logger.warning(f"[ORDER REPAIR] {symbol}: API'de pozisyon YOK — "
+                               f"repair iptal, pozisyon kapatılıyor")
+                self._position_mgr.close_position(symbol, reason="api_position_gone")
+                return
+            # ── YÖN KONTROLÜ: API yönü sistem yönüyle eşleşmeli ──
+            if api_is_long is not None and api_is_long != is_long:
+                logger.critical(f"[ORDER REPAIR] {symbol}: YÖN UYUMSUZLUĞU! "
+                                f"Sistem={'LONG' if is_long else 'SHORT'} "
+                                f"API={'LONG' if api_is_long else 'SHORT'} "
+                                f"— repair DURDURULDU, pozisyon takipten siliniyor")
+                self._position_mgr.close_position(symbol, reason="direction_mismatch")
+                # Ters yöndeki orphan emirleri temizle
+                try:
+                    self._order_executor._rest.cancel_all_orders(symbol)
+                    logger.info(f"[ORDER REPAIR] {symbol}: orphan emirler iptal edildi")
+                except Exception:
+                    pass
+                return
+            if actual_qty != pos.size:
+                logger.warning(f"[ORDER REPAIR] {symbol}: QTY MISMATCH! "
+                               f"pos.size={pos.size} → API={actual_qty} (güncellendi)")
+                pos.size = actual_qty
+
+            logger.info(f"[ORDER REPAIR] {symbol}: başlıyor "
+                        f"(need_sl={need_sl}, need_trailing={need_trailing}, "
+                        f"entry={entry_price}, ATR={atr:.8f}, qty={actual_qty}, "
+                        f"side={'LONG' if is_long else 'SHORT'}, regime={entry_regime})")
+
             # ── Config multiplier'ları ──
-            sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
-            activate_mult = strat.get("trailing_atr_activate_mult", 3.0)
-            distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+            entry_mode = getattr(pos, 'entry_mode', 'TREND')
 
-            if strat.get("adx_regime_enabled", False) and entry_regime in (
-                    "RANGING", "WEAK_TREND", "STRONG_TREND"):
-                prefix = {"RANGING": "adx_regime_ranging",
-                          "WEAK_TREND": "adx_regime_weak",
-                          "STRONG_TREND": "adx_regime_strong"}[entry_regime]
-                sl_atr_mult = strat.get(f"{prefix}_sl_atr", sl_atr_mult)
-                activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
-                distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
+            # ── Sisteme göre eksik emir onarımı ──
+            if entry_mode == "SYSTEM_H":
+                sl_placed, trail_placed = self._place_missing_orders_system_h(
+                    symbol, pos, rest, pp, is_long, close_side,
+                    entry_price, actual_qty, entry_regime,
+                    need_sl, need_trailing)
+            elif entry_mode == "SYSTEM_D":
+                sl_placed, trail_placed = self._place_missing_orders_system_d(
+                    symbol, pos, rest, pp, is_long, close_side,
+                    entry_price, actual_qty, entry_regime,
+                    need_sl, need_trailing)
+            elif entry_mode == "SYSTEM_B":
+                sl_placed, trail_placed = self._place_missing_orders_system_b(
+                    symbol, pos, rest, pp, is_long, close_side,
+                    entry_price, actual_qty, entry_regime,
+                    need_sl, need_trailing)
+            else:
+                sl_placed, trail_placed = self._place_missing_orders_system_a(
+                    symbol, pos, strat, rest, pp, is_long, close_side,
+                    entry_price, atr, actual_qty, entry_mode, entry_regime,
+                    need_sl, need_trailing)
 
-            # ── 1. Place MISSING SL (orijinal plan: entry ± N×ATR) ──
-            if need_sl:
-                if is_long:
-                    sl_price = round(entry_price - (atr * sl_atr_mult), pp)
-                else:
-                    sl_price = round(entry_price + (atr * sl_atr_mult), pp)
-                try:
-                    rest.place_order(
-                        symbol=symbol, side=close_side,
-                        order_type="STOP_MARKET",
-                        quantity=pos.size, stop_price=sl_price,
-                    )
-                    logger.info(f"[ORDER REPAIR] {symbol}: Eksik SL kondu "
-                                f"@ {sl_price} ({sl_atr_mult}xATR)")
-                except Exception as e:
-                    logger.error(f"[ORDER REPAIR] {symbol}: SL placement FAILED: {e}")
-
-            # ── 2. Place MISSING TRAILING (orijinal plan: entry ± M×ATR tetik, K×ATR callback) ──
-            if need_trailing:
-                callback_pct = (atr * distance_mult) / entry_price * 100
-                callback_pct = max(0.1, min(5.0, round(callback_pct, 1)))
-
-                if is_long:
-                    activation_price = round(entry_price + (atr * activate_mult), pp)
-                else:
-                    activation_price = round(entry_price - (atr * activate_mult), pp)
-
-                try:
-                    rest.place_order(
-                        symbol=symbol, side=close_side,
-                        order_type="TRAILING_STOP_MARKET",
-                        quantity=pos.size,
-                        stop_price=activation_price,
-                        callback_rate=callback_pct,
-                    )
-                    self._server_trailing[symbol] = {
-                        "callback_pct": callback_pct,
-                        "activation_price": activation_price,
-                        "sl_price": 0,
-                        "timestamp": time.time(),
-                        "renewal_count": getattr(pos, 'trailing_renewal_count', 0),
-                    }
-                    logger.info(f"[ORDER REPAIR] {symbol}: Eksik TRAILING kondu "
-                                f"activation={activation_price} callback={callback_pct}% "
-                                f"({activate_mult}xATR tetik, {distance_mult}xATR geri çekilme)")
-                except Exception as e:
-                    logger.error(f"[ORDER REPAIR] {symbol}: Trailing placement FAILED: {e}")
+            # Sonuç özeti + başarısız olursa erken verify tetikle
+            any_failed = (need_sl and not sl_placed) or (need_trailing and not trail_placed)
+            logger.info(f"[ORDER REPAIR] {symbol}: sonuç — "
+                        f"SL={'OK' if sl_placed or not need_sl else 'FAIL'}, "
+                        f"Trail={'OK' if trail_placed or not need_trailing else 'FAIL'}")
+            if any_failed:
+                self._last_order_verify_time = 0.0
+                logger.warning(f"[ORDER REPAIR] {symbol}: eksik emir kaldı — "
+                               f"erken verify tetiklendi")
 
         except Exception as e:
             logger.error(f"[ORDER REPAIR] {symbol}: repair failed: {e}")
             import traceback
             logger.error(f"[ORDER REPAIR] traceback: {traceback.format_exc()}")
+            self._last_order_verify_time = 0.0  # erken verify
+
+    def _place_missing_orders_system_a(self, symbol, pos, strat, rest, pp,
+                                        is_long, close_side, entry_price,
+                                        atr, actual_qty, entry_mode,
+                                        entry_regime, need_sl, need_trailing):
+        """System A: ATR bazlı eksik emir onarımı."""
+        sl_atr_mult = strat.get("server_sl_atr_mult", 2.0)
+        activate_mult = strat.get("trailing_atr_activate_mult", 3.0)
+        distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
+
+        # MR override
+        if entry_mode == "MEAN_REVERSION" and strat.get("mr_trailing_enabled", True):
+            activate_mult = strat.get("mr_trailing_activate_atr", 1.5)
+            distance_mult = strat.get("mr_trailing_callback_atr", 0.5)
+        elif strat.get("adx_regime_enabled", False) and entry_regime in (
+                "RANGING", "WEAK_TREND", "STRONG_TREND"):
+            prefix = {"RANGING": "adx_regime_ranging",
+                      "WEAK_TREND": "adx_regime_weak",
+                      "STRONG_TREND": "adx_regime_strong"}[entry_regime]
+            sl_atr_mult = strat.get(f"{prefix}_sl_atr", sl_atr_mult)
+            activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
+            distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
+
+        sl_placed = False
+        trail_placed = False
+
+        if need_sl:
+            if is_long:
+                sl_price = round(entry_price - (atr * sl_atr_mult), pp)
+            else:
+                sl_price = round(entry_price + (atr * sl_atr_mult), pp)
+            try:
+                result = rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=actual_qty, stop_price=sl_price,
+                    reduce_only=True,
+                )
+                sl_placed = True
+                algo_id = result.get("algoId", "?") if isinstance(result, dict) else "?"
+                logger.info(f"[ORDER REPAIR] {symbol}: Eksik SL kondu "
+                            f"@ {sl_price} ({sl_atr_mult}xATR) qty={actual_qty} "
+                            f"algoId={algo_id}")
+            except Exception as e:
+                logger.error(f"[ORDER REPAIR] {symbol}: SL placement FAILED: {e}")
+
+        if need_trailing:
+            callback_pct = (atr * distance_mult) / entry_price * 100
+            callback_pct = max(0.1, min(5.0, round(callback_pct, 1)))
+
+            if is_long:
+                activation_price = round(entry_price + (atr * activate_mult), pp)
+            else:
+                activation_price = round(entry_price - (atr * activate_mult), pp)
+
+            try:
+                result = rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=actual_qty,
+                    stop_price=activation_price,
+                    callback_rate=callback_pct,
+                    reduce_only=True,
+                )
+                trail_placed = True
+                algo_id = result.get("algoId", "?") if isinstance(result, dict) else "?"
+                self._server_trailing[symbol] = {
+                    "callback_pct": callback_pct,
+                    "activation_price": activation_price,
+                    "sl_price": 0,
+                    "timestamp": time.time(),
+                    "renewal_count": getattr(pos, 'trailing_renewal_count', 0),
+                }
+                logger.info(f"[ORDER REPAIR] {symbol}: Eksik TRAILING kondu "
+                            f"activation={activation_price} callback={callback_pct}% "
+                            f"({activate_mult}xATR tetik, {distance_mult}xATR callback) "
+                            f"qty={actual_qty} algoId={algo_id}")
+            except Exception as e:
+                logger.error(f"[ORDER REPAIR] {symbol}: Trailing placement FAILED: {e}")
+
+        return sl_placed, trail_placed
+
+    def _place_missing_orders_system_b(self, symbol, pos, rest, pp,
+                                        is_long, close_side, entry_price,
+                                        actual_qty, entry_regime,
+                                        need_sl, need_trailing):
+        """System B: G bazlı eksik emir onarımı.
+        SL = sl_carpan × G (%), Trailing/TP = rejime göre."""
+        sb = self._config.get("system_b", {})
+        G = getattr(pos, 'entry_bb_width', 0)
+        is_ranging = entry_regime in ("RANGING", "WEAK_RANGING",
+                                      "SYNCED:RANGING", "SYNCED:WEAK_RANGING")
+
+        sl_placed = False
+        trail_placed = False
+
+        if G <= 0:
+            # G değeri yoksa ATR fallback
+            atr = pos.atr_at_entry if hasattr(pos, 'atr_at_entry') else 0
+            if atr <= 0:
+                atr = entry_price * 0.02
+            G = (atr / entry_price * 100)
+            logger.warning(f"[ORDER REPAIR SysB] {symbol}: G=0, ATR fallback → G={G:.3f}%")
+
+        logger.info(f"[ORDER REPAIR SysB] {symbol}: G={G:.3f}% "
+                    f"regime={entry_regime} side={'LONG' if is_long else 'SHORT'}")
+
+        # ── 1. SL: sl_carpan × G ──
+        if need_sl:
+            sl_carpan = sb.get("sl_carpan", 1.5)
+            sl_offset = entry_price * (sl_carpan * G / 100)
+            if is_long:
+                sl_price = round(entry_price - sl_offset, pp)
+            else:
+                sl_price = round(entry_price + sl_offset, pp)
+
+            try:
+                result = rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=actual_qty, stop_price=sl_price,
+                    reduce_only=True,
+                )
+                sl_placed = True
+                algo_id = result.get("algoId", "?") if isinstance(result, dict) else "?"
+                logger.info(f"[ORDER REPAIR SysB] {symbol}: SL kondu @ {sl_price} "
+                            f"({sl_carpan}×G={sl_carpan * G:.2f}%) qty={actual_qty} "
+                            f"algoId={algo_id}")
+            except Exception as e:
+                logger.error(f"[ORDER REPAIR SysB] {symbol}: SL FAILED: {e}")
+
+        # ── 2. Trailing veya TP (rejime göre) ──
+        if need_trailing and is_ranging:
+            # Ranging: sabit TP (bant bazlı) — G/2 mesafe
+            tp_offset = entry_price * (G / 2 / 100)
+            if is_long:
+                tp_price = round(entry_price + tp_offset, pp)
+            else:
+                tp_price = round(entry_price - tp_offset, pp)
+
+            try:
+                result = rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    quantity=actual_qty, stop_price=tp_price,
+                    reduce_only=True,
+                )
+                trail_placed = True  # TP counts as the "trailing" slot
+                algo_id = result.get("algoId", "?") if isinstance(result, dict) else "?"
+                logger.info(f"[ORDER REPAIR SysB] {symbol}: TP kondu @ {tp_price} "
+                            f"(ranging, G/2={G / 2:.2f}%) algoId={algo_id}")
+            except Exception as e:
+                logger.error(f"[ORDER REPAIR SysB] {symbol}: TP FAILED: {e}")
+        elif need_trailing:
+            # Trend: trailing (tetik_carpan × G, trail_carpan × G callback)
+            tetik_carpan = sb.get("tetik_carpan", 2.5)
+            trail_carpan = sb.get("trail_carpan", 0.5)
+
+            activation_offset = entry_price * (tetik_carpan * G / 100)
+            if is_long:
+                activation_price = round(entry_price + activation_offset, pp)
+            else:
+                activation_price = round(entry_price - activation_offset, pp)
+
+            callback_pct = trail_carpan * G
+            callback_pct = max(0.1, min(5.0, round(callback_pct, 1)))
+
+            try:
+                result = rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=actual_qty,
+                    stop_price=activation_price,
+                    callback_rate=callback_pct,
+                    reduce_only=True,
+                )
+                trail_placed = True
+                algo_id = result.get("algoId", "?") if isinstance(result, dict) else "?"
+                self._server_trailing[symbol] = {
+                    "callback_pct": callback_pct,
+                    "activation_price": activation_price,
+                    "timestamp": time.time(),
+                }
+                logger.info(f"[ORDER REPAIR SysB] {symbol}: TRAILING kondu "
+                            f"activation={activation_price} ({tetik_carpan}×G) "
+                            f"callback={callback_pct}% ({trail_carpan}×G) "
+                            f"algoId={algo_id}")
+            except Exception as e:
+                logger.error(f"[ORDER REPAIR SysB] {symbol}: TRAILING FAILED: {e}")
+
+        return sl_placed, trail_placed
 
     def _execute_partial_tp(self, symbol: str, current_price: float) -> None:
         """Close a portion of the position at N×ATR profit, keep rest for trailing."""
@@ -2203,6 +2639,19 @@ class ScannerStateMachine:
 
             sl_roi = round(net_sl_roi, 1)
 
+            # Minimum SL mesafesi: fee + spread koruması
+            # Pozisyon açılır açılmaz SL'ye takılmasını engeller
+            # Min SL = 3 × (round-trip fee + tahmini spread)
+            # spread tahmini = fee × 0.5 (maker-taker farkı)
+            spread_est = fee_pct * 0.5
+            min_sl_distance = 3.0 * (fee_pct + spread_est)
+            if sl_price_pct < min_sl_distance:
+                logger.warning(f"Order rejected: SL too tight for {symbol} "
+                               f"(SL={sl_price_pct*100:.3f}% < min={min_sl_distance*100:.3f}% "
+                               f"= 3×(fee+spread)). Fee/spread kaybi riski.")
+                self._failed_symbols[symbol] = time.time()
+                return False
+
             # Only calculate TP if tp_enabled in config
             if strat.get("tp_enabled", False):
                 tp_price_pct = liq_pct * tp_liq_mult
@@ -2253,13 +2702,33 @@ class ScannerStateMachine:
         limit_atr_offset = strat.get("limit_atr_offset", 0.5) if strat else 0.5
         limit_timeout = strat.get("limit_timeout_seconds", 300) if strat else 300
 
-        # Mean Reversion override: always limit entry
+        # Mean Reversion override: always limit entry at BB band price
         is_mr = getattr(self, '_mr_buying_active', False)
         if is_mr:
             limit_enabled = True
-            limit_atr_offset = strat.get("limit_atr_offset", 0.5)
-            logger.info(f"[MR] {symbol}: limit entry {limit_atr_offset}xATR "
-                        f"(BB={getattr(candidate, 'bb_percent_b', 0):.0%})")
+            # MR felsefesi: giriş BB bandında olmalı, genel ATR offset'te değil
+            # BB band fiyatını hedefle, küçük buffer ile dolma olasılığını artır
+            mr_indicators = getattr(candidate, 'indicator_values', {})
+            bb_lower = mr_indicators.get("BB_Lower", 0) if mr_indicators else 0
+            bb_upper = mr_indicators.get("BB_Upper", 0) if mr_indicators else 0
+            mr_band_buffer_atr = 0.1  # band'a 0.1×ATR buffer (dolma kolaylığı)
+            if direction == "LONG" and bb_lower > 0 and atr > 0:
+                # LONG: alt banda yakın al, küçük buffer ile biraz üstüne koy
+                limit_atr_offset = max((price - bb_lower) / atr - mr_band_buffer_atr, 0.05)
+                logger.info(f"[MR] {symbol}: limit entry at BB lower band "
+                            f"(BB_L={bb_lower:.6f}, offset={limit_atr_offset:.2f}xATR, "
+                            f"BB%={getattr(candidate, 'bb_percent_b', 0):.0%})")
+            elif direction == "SHORT" and bb_upper > 0 and atr > 0:
+                # SHORT: üst banda yakın sat, küçük buffer ile biraz altına koy
+                limit_atr_offset = max((bb_upper - price) / atr - mr_band_buffer_atr, 0.05)
+                logger.info(f"[MR] {symbol}: limit entry at BB upper band "
+                            f"(BB_U={bb_upper:.6f}, offset={limit_atr_offset:.2f}xATR, "
+                            f"BB%={getattr(candidate, 'bb_percent_b', 0):.0%})")
+            else:
+                # Fallback: BB verisi yoksa genel offset kullan
+                limit_atr_offset = strat.get("limit_atr_offset", 0.5)
+                logger.info(f"[MR] {symbol}: limit entry {limit_atr_offset}xATR (fallback) "
+                            f"(BB={getattr(candidate, 'bb_percent_b', 0):.0%})")
 
         # ADX regime override: entry type + ATR offset
         adx_regime = getattr(candidate, 'adx_regime', '') if candidate else ''
@@ -2489,7 +2958,11 @@ class ScannerStateMachine:
                         symbol, current_price)
 
                     if exit_reason == self._position_mgr.EXIT_PARTIAL_TP:
-                        self._execute_partial_tp(symbol, current_price)
+                        pos_obj = self._position_mgr.get_position(symbol)
+                        if pos_obj and pos_obj.entry_mode == "SYSTEM_F":
+                            self._execute_partial_tp_system_f(symbol, current_price)
+                        else:
+                            self._execute_partial_tp(symbol, current_price)
                         continue  # Don't full-close, position stays open
 
                     if exit_reason != "HOLD":
@@ -2703,16 +3176,19 @@ class ScannerStateMachine:
                             f"margin={margin:.2f} "
                             f"score={entry_score:+.1f}")
 
-                # Emir kontrolü _verify_server_orders tarafından yapılacak.
-                # Startup'ta per-symbol API çağrısı yapmıyoruz — scanner
-                # başladıktan sonra ilk verify döngüsü bunu halledecek.
-                logger.info(f"[SYNC] {symbol}: Emir kontrolü ilk verify "
-                            f"döngüsünde yapılacak")
+                # Hemen SL/trailing kontrolü yap — 30s boşluk bırakma
+                logger.info(f"[SYNC] {symbol}: SL/trailing emir kontrolü yapılıyor...")
+                try:
+                    pos_obj = self._position_mgr.get_position(symbol)
+                    if pos_obj and atr > 0:
+                        self._place_initial_trailing(symbol, pos_obj, entry_price, atr)
+                except Exception as e:
+                    logger.warning(f"[SYNC] {symbol}: SL/trailing placement failed: {e}")
 
             logger.info(f"Synced {len(api_positions)} API position(s)")
 
-            # Orphan emir temizliği ve eksik emir kontrolü
-            # ilk _verify_server_orders döngüsünde yapılacak (KURAL 2+3+4)
+            # İlk verify döngüsü eksik emirleri tekrar kontrol edecek
+            self._last_order_verify_time = 0.0  # hemen verify tetikle
 
         except Exception as e:
             logger.error(f"Failed to sync API positions: {e}")
@@ -2868,7 +3344,7 @@ class ScannerStateMachine:
             # KIRMIZI KURAL 3: Mevcut emirler SİLİNMEZ.
             # Yeni pozisyon açılışında zaten emir olmamalı.
             strat = self._config.get("strategy", {})
-            activate_mult = strat.get("trailing_atr_activate_mult", 4.0)
+            activate_mult = strat.get("trailing_atr_activate_mult", 3.0)
             distance_mult = strat.get("trailing_atr_distance_mult", 1.0)
 
             is_long = pos.side == OrderSide.BUY_LONG
@@ -2882,28 +3358,27 @@ class ScannerStateMachine:
 
             atr_pct = atr / entry_price * 100 if entry_price > 0 and atr > 0 else 0
 
-            # === MR TRAILING OVERRIDE ===
+            # === REGIME/MODE OVERRIDES ===
             entry_mode = getattr(pos, 'entry_mode', 'TREND')
+            entry_regime = getattr(pos, 'entry_regime', '')  # HER ZAMAN tanımla
+
             if entry_mode == "MEAN_REVERSION" and strat.get("mr_trailing_enabled", True):
                 activate_mult = strat.get("mr_trailing_activate_atr", 1.5)
                 distance_mult = strat.get("mr_trailing_callback_atr", 0.5)
                 logger.info(f"[MR TRAILING] {symbol}: MR override → "
                             f"trail={activate_mult}/{distance_mult}xATR")
-            else:
-                # === ADX REGIME OVERRIDE for SL/trailing ===
-                entry_regime = getattr(pos, 'entry_regime', '')
-                if strat.get("adx_regime_enabled", False) and entry_regime in (
-                        "RANGING", "WEAK_TREND", "STRONG_TREND"):
-                    prefix = {
-                        "RANGING": "adx_regime_ranging",
-                        "WEAK_TREND": "adx_regime_weak",
-                        "STRONG_TREND": "adx_regime_strong",
-                    }[entry_regime]
-                    activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
-                    distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
-                    logger.info(f"[ADX REGIME] {symbol}: {entry_regime} → "
-                                f"SL={strat.get(f'{prefix}_sl_atr', 2.0)}xATR, "
-                                f"trail={activate_mult}/{distance_mult}xATR")
+            elif strat.get("adx_regime_enabled", False) and entry_regime in (
+                    "RANGING", "WEAK_TREND", "STRONG_TREND"):
+                prefix = {
+                    "RANGING": "adx_regime_ranging",
+                    "WEAK_TREND": "adx_regime_weak",
+                    "STRONG_TREND": "adx_regime_strong",
+                }[entry_regime]
+                activate_mult = strat.get(f"{prefix}_trail_activate_atr", activate_mult)
+                distance_mult = strat.get(f"{prefix}_trail_callback_atr", distance_mult)
+                logger.info(f"[ADX REGIME] {symbol}: {entry_regime} → "
+                            f"SL={strat.get(f'{prefix}_sl_atr', 2.0)}xATR, "
+                            f"trail={activate_mult}/{distance_mult}xATR")
 
             # === SERVER SL: 2×ATR STOP_MARKET (crash koruması — HER ZAMAN aktif) ===
             # Not: sl_enabled sadece software SL'yi kontrol eder, server SL her zaman gönderilir
@@ -2929,6 +3404,7 @@ class ScannerStateMachine:
                         order_type="STOP_MARKET",
                         quantity=pos.size,
                         stop_price=sl_price,
+                        reduce_only=True,
                     )
                     sl_placed = True
                     logger.info(f"[SERVER SL] {symbol}: {sl_atr_mult}xATR SL @ {sl_price} "
@@ -2959,6 +3435,7 @@ class ScannerStateMachine:
                     quantity=pos.size,
                     stop_price=activation_price,
                     callback_rate=callback_pct,
+                    reduce_only=True,
                 )
                 trailing_placed = True
             except Exception as trail_err:
@@ -3019,6 +3496,7 @@ class ScannerStateMachine:
                             symbol=symbol, side=close_side,
                             order_type="STOP_MARKET",
                             quantity=pos.size, stop_price=sl_price,
+                            reduce_only=True,
                         )
                         sl_placed = True
                         logger.info(f"[RETRY OK] SL placed for {symbol} @ {sl_price}")
@@ -3041,6 +3519,7 @@ class ScannerStateMachine:
                             quantity=pos.size,
                             stop_price=activation_price,
                             callback_rate=callback_pct,
+                            reduce_only=True,
                         )
                         trailing_placed = True
                         logger.info(f"[RETRY OK] Trailing placed for {symbol} "
@@ -3204,6 +3683,4115 @@ class ScannerStateMachine:
 
         return result
 
+    def get_system_b_results(self) -> list:
+        """Return last System B scan results (for GUI)."""
+        return self._last_system_b_results
+
+    def get_system_d_results(self) -> list:
+        """Return last System D scan results (for GUI)."""
+        return self._last_system_d_results
+
+    def get_system_e_results(self) -> list:
+        """Return last System E scan results (for GUI)."""
+        return self._last_system_e_results
+
+    def get_system_f_results(self) -> list:
+        """Return last System F (Son Kursun) scan results (for GUI)."""
+        return self._last_system_f_results
+
+    def place_breakeven_tp_all(self) -> list[dict]:
+        """Tüm açık pozisyonlara breakeven TP emri gönder.
+
+        TP fiyatı = entry_price + fee + spread + slippage (LONG)
+                  = entry_price - fee - spread - slippage (SHORT)
+
+        Mevcut SL emirlerine DOKUNMAZ. Sadece TAKE_PROFIT_MARKET ekler.
+        Eğer zaten TP emri varsa, önce onu iptal edip yenisini gönderir.
+
+        Returns: [{symbol, side, entry, tp_price, status, error}, ...]
+        """
+        results = []
+        rest = self._rest
+        if not rest:
+            return [{"error": "REST client yok"}]
+
+        positions = self._position_mgr.get_all_positions()
+        if not positions:
+            return [{"error": "Açık pozisyon yok"}]
+
+        se = self._config.get("system_e", {})
+        strat = self._config.get("strategy", {})
+
+        # Fee hesabı: round-trip fee (giriş + çıkış)
+        fee_rate = se.get("fee_rate", strat.get("fee_pct", 0.10) / 100)
+        # fee_rate genellikle tek yön (0.0004 = %0.04), round-trip = 2x
+        fee_roundtrip = fee_rate * 2  # giriş + çıkış
+
+        # Spread tahmini: fee'nin yarısı kadar
+        spread_pct = fee_roundtrip * 0.5
+
+        # Slippage: sabit tahmin
+        slippage_pct = 0.0003  # %0.03
+
+        # Toplam maliyet: fee + spread + slippage
+        total_cost_pct = fee_roundtrip + spread_pct + slippage_pct
+
+        logger.info(f"[Breakeven TP] Maliyet: fee={fee_roundtrip*100:.4f}% "
+                    f"+ spread={spread_pct*100:.4f}% + slip={slippage_pct*100:.4f}% "
+                    f"= toplam {total_cost_pct*100:.4f}%")
+
+        for symbol, pos in positions.items():
+            entry_price = pos.entry_price
+            pp = 2  # price precision
+
+            if self._symbol_info_cache:
+                try:
+                    si = self._symbol_info_cache.get(symbol)
+                    if si:
+                        pp = si.price_precision
+                except Exception:
+                    pass
+
+            # Breakeven TP: maliyet + minimum kâr tampon (%0.01 ekstra)
+            buffer_pct = 0.0001  # %0.01 minimum kâr tamponu
+            tp_offset = total_cost_pct + buffer_pct
+
+            if pos.side == OrderSide.BUY_LONG:
+                tp_price = round(entry_price * (1 + tp_offset), pp)
+                close_side = "SELL"
+            else:
+                tp_price = round(entry_price * (1 - tp_offset), pp)
+                close_side = "BUY"
+
+            # Mevcut TP emirlerini iptal et (SL'ye DOKUNMA)
+            try:
+                # Algo emirleri kontrol et (TAKE_PROFIT_MARKET)
+                algo_orders = rest.get_algo_open_orders(symbol) or []
+                for o in algo_orders:
+                    if o.get("type") == "TAKE_PROFIT_MARKET":
+                        algo_id = o.get("algoId")
+                        if algo_id:
+                            try:
+                                rest._signed_delete("/fapi/v1/algoOrder",
+                                                    {"algoId": algo_id})
+                                logger.info(f"[Breakeven TP] {symbol}: eski TP iptal (algoId={algo_id})")
+                            except Exception as e:
+                                logger.warning(f"[Breakeven TP] {symbol}: TP iptal hata: {e}")
+
+                # Regular TP emirleri kontrol et
+                regular_orders = rest.get_open_orders(symbol=symbol) or []
+                for o in regular_orders:
+                    if o.get("type") == "TAKE_PROFIT_MARKET":
+                        oid = o.get("orderId")
+                        if oid:
+                            try:
+                                rest._signed_delete("/fapi/v1/order",
+                                                    {"symbol": symbol, "orderId": oid})
+                                logger.info(f"[Breakeven TP] {symbol}: eski TP iptal (orderId={oid})")
+                            except Exception as e:
+                                logger.warning(f"[Breakeven TP] {symbol}: TP iptal hata: {e}")
+            except Exception as e:
+                logger.warning(f"[Breakeven TP] {symbol}: TP iptal kontrol hata: {e}")
+
+            # Yeni TP emri gönder
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    quantity=pos.size,
+                    stop_price=tp_price,
+                    reduce_only=True,
+                )
+                status = "OK"
+                logger.info(f"[Breakeven TP] {symbol}: TAKE_PROFIT_MARKET @ {tp_price} "
+                            f"(entry={entry_price}, offset={tp_offset*100:.4f}%)")
+            except Exception as e:
+                status = f"HATA: {e}"
+                logger.error(f"[Breakeven TP] {symbol}: FAILED: {e}")
+
+            results.append({
+                "symbol": symbol,
+                "side": pos.side.value,
+                "entry_price": entry_price,
+                "tp_price": tp_price,
+                "offset_pct": tp_offset * 100,
+                "status": status,
+            })
+
+        return results
+
     @property
     def is_running(self) -> bool:
         return self._running
+
+    # ══════════════════════════════════════════════════════════════════
+    # ════  SYSTEM B — Dalga Analizi Tarama & Alım  ══════════════════
+    # ══════════════════════════════════════════════════════════════════
+
+    def _do_scanning_system_b(self) -> None:
+        """System B tarama döngüsü: MTF veri çek → rejim → zigzag → skor → alım."""
+
+        # Step 0: Check pending limit orders
+        if self._pending_limits:
+            self._check_pending_limits()
+
+        # Step A: Check held positions
+        if self._position_mgr.has_position:
+            self._check_held_positions()
+
+        self._scan_count += 1
+        sb = self._config.get("system_b", {})
+        max_pos = sb.get("max_pozisyon", 6)
+        self._position_mgr._max_positions = max_pos
+
+        logger.info(f"[SysB] Scan #{self._scan_count} starting... "
+                    f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+
+        # 1. Symbol universe
+        coin_sayisi = sb.get("coin_sayisi", 50)
+        self._universe._top_n = coin_sayisi
+        symbols = self._universe.refresh()
+        if not symbols:
+            logger.warning("[SysB] No symbols to scan")
+            self._stop_event.wait(timeout=10)
+            return
+
+        # 2. Fetch klines: macro (1h) + micro (5m)
+        buyuk_tf = sb.get("buyuk_tf", "1h")
+        buyuk_mum = sb.get("buyuk_tf_mum", 168)
+        kucuk_tf = sb.get("kucuk_tf", "5m")
+        kucuk_mum = sb.get("kucuk_tf_mum", 288)
+
+        klines_macro_map = self._fetcher.fetch_batch(
+            symbols, buyuk_tf, buyuk_mum)
+        klines_micro_map = self._fetcher.fetch_batch(
+            symbols, kucuk_tf, kucuk_mum)
+
+        # 3. Funding rates (1 batch call)
+        market_ctx = self._fetch_funding_rates(list(klines_micro_map.keys()))
+
+        # 4. Score all symbols
+        results = self._system_b_scanner.score_batch(
+            list(klines_micro_map.keys()),
+            klines_macro_map, klines_micro_map, market_ctx)
+
+        # 5. Rejim hysteresis: 3 ardışık aynı okuma gerekli
+        teyit_n = sb.get("rejim_degisim_teyit", 3)
+        for r in results:
+            sym = r.symbol
+            regime_str = r.regime.regime
+            if sym not in self._system_b_regime_history:
+                self._system_b_regime_history[sym] = []
+            history = self._system_b_regime_history[sym]
+            history.append(regime_str)
+            # Son N okuma aynı değilse → UNDECIDED
+            if len(history) >= teyit_n:
+                recent = history[-teyit_n:]
+                if len(set(recent)) != 1:
+                    r.regime.regime = "UNDECIDED"
+                    r.eligible = False
+                    if not r.reject_reason:
+                        r.reject_reason = "hysteresis_pending"
+            elif len(history) < teyit_n:
+                # Bootstrap: ilk okumada teyit=1 (belgede belirtilmiş)
+                if len(history) < 1:
+                    r.regime.regime = "UNDECIDED"
+                    r.eligible = False
+                    if not r.reject_reason:
+                        r.reject_reason = "hysteresis_bootstrap"
+            # History uzamasın
+            if len(history) > teyit_n * 2:
+                self._system_b_regime_history[sym] = history[-teyit_n:]
+
+        self._last_system_b_results = results
+        eligible = [r for r in results if r.eligible]
+
+        # Log top 5
+        for i, r in enumerate(results[:5]):
+            logger.info(f"  [SysB] #{i+1} {r.symbol}: score={r.score:+.1f} "
+                        f"dir={r.direction} regime={r.regime.regime} "
+                        f"G={r.G:.3f}% I={r.I:.3f}% "
+                        f"entry={r.entry.score}/3 wp={r.wave_position:.0%} "
+                        f"lev={r.leverage}x "
+                        f"eligible={r.eligible} reject={r.reject_reason or '-'}")
+
+        logger.info(f"[SysB] Results: {len(results)} total, {len(eligible)} eligible")
+
+        # Publish for GUI
+        self._event_bus.publish(EventType.SCANNER_UPDATE, {
+            "scan_count": self._scan_count,
+            "total_symbols": len(symbols),
+            "scored": len(results),
+            "eligible": len(eligible),
+            "mr_scored": 0,
+            "mr_eligible": 0,
+            "positions": self._position_mgr.position_count,
+            "max_positions": max_pos,
+            "system_b": True,
+            "top_5": [
+                {"symbol": r.symbol, "score": r.score, "direction": r.direction,
+                 "regime": r.regime.regime, "G": r.G, "I": r.I}
+                for r in results[:5]
+            ],
+            "candidate": eligible[0].symbol if eligible else None,
+        })
+
+        # Close-only mode
+        if self._config.get("strategy.close_only", False):
+            if self._position_mgr.has_position:
+                logger.info(f"[SysB] Close-only: monitoring {self._position_mgr.position_count} pos")
+            self._wait(sb.get("scan_interval_seconds", 300))
+            return
+
+        # 6. Filter candidates and buy
+        now = time.time()
+        # Cleanup expired cooldowns
+        self._loss_cooldown_symbols = {
+            s: t for s, t in self._loss_cooldown_symbols.items()
+            if now - t < (sb.get("loss_cooldown_dakika", 30) * 60)
+        }
+        self._failed_symbols = {
+            s: t for s, t in self._failed_symbols.items()
+            if now - t < self._failed_cooldown
+        }
+
+        max_ayni_yon = sb.get("max_ayni_yon", 4)
+        candidates = []
+        for r in eligible:
+            if r.symbol in self._failed_symbols:
+                continue
+            if r.symbol in self._loss_cooldown_symbols:
+                continue
+            # Coin daily ban kontrolü (System A ile aynı kural)
+            coin_ok, coin_reason = self._check_coin_daily_ban(r.symbol)
+            if not coin_ok:
+                continue
+            if self._position_mgr.is_holding(r.symbol):
+                continue
+            if r.symbol in self._pending_limits:
+                continue
+
+            # Yön dengesi
+            dir_count = self._count_direction(r.direction)
+            if dir_count >= max_ayni_yon:
+                continue
+
+            candidates.append(r)
+
+        bought_any = False
+        if candidates and self._position_mgr.has_capacity:
+            # Balance kontrolü
+            real_balance = 0.0
+            if self._order_executor and hasattr(self._order_executor, "get_balance"):
+                try:
+                    real_balance = self._order_executor.get_balance()
+                except Exception:
+                    pass
+            if real_balance > 0 and real_balance < 0.30:
+                logger.info(f"[SysB] Balance too low ({real_balance:.2f}$)")
+                self._wait(60)
+                return
+
+            for cand in candidates:
+                total_occupied = self._position_mgr.position_count + len(self._pending_limits)
+                if total_occupied >= max_pos:
+                    break
+                if not self._check_trade_frequency():
+                    break
+
+                logger.info(f"[SysB] Candidate: {cand.symbol} score={cand.score:+.1f} "
+                            f"dir={cand.direction} G={cand.G:.3f}% lev={cand.leverage}x "
+                            f"entry_type={cand.entry_type} regime={cand.regime.regime}")
+
+                if self._do_buying_system_b(cand):
+                    bought_any = True
+
+        if bought_any:
+            self._wait(5)
+        else:
+            # System B: 5dk tarama aralığı (strateji belgesinde belirtilmiş)
+            scan_interval = sb.get("scan_interval_seconds", 300)
+            self._wait(scan_interval)
+
+    def _count_direction(self, direction: str) -> int:
+        """Belirli yöndeki açık pozisyon sayısı."""
+        count = 0
+        target_side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        for pos in self._position_mgr.get_all_positions().values():
+            if pos.side == target_side:
+                count += 1
+        return count
+
+    def _do_buying_system_b(self, cand: 'SystemBScanResult') -> bool:
+        """System B pozisyon açma: G bazlı kaldıraç, SL, trailing."""
+        symbol = cand.symbol
+        direction = cand.direction
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        sb = self._config.get("system_b", {})
+
+        # 1. Fresh price
+        price = cand.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # 2. Leverage
+        leverage = cand.leverage
+        lev_enabled = self._config.get("leverage.enabled", False)
+        if not lev_enabled:
+            leverage = 1
+
+        # Binance max leverage kontrolü
+        if leverage > 1:
+            try:
+                margin_est = 5.0  # tahmini margin
+                available_max = self._rest.get_max_leverage(symbol, margin_est * leverage)
+                if available_max < leverage:
+                    leverage = available_max
+                if leverage < sb.get("min_kaldirac", 2):
+                    logger.info(f"[SysB] {symbol} max lev {leverage}x < min, skipping")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
+            except Exception as e:
+                logger.warning(f"[SysB] {symbol} max leverage check failed: {e}")
+
+        # 3. Position sizing: bakiye / 12
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            try:
+                real_balance = self._order_executor.get_balance()
+            except Exception:
+                pass
+
+        divider = sb.get("portfoy_bolen", 12)
+        locked_margin = self._position_mgr.get_total_margin()
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 5.0)
+
+        if wallet >= 12.0:
+            margin_usdt = round(wallet / divider, 2)
+        elif wallet >= 4.0:
+            margin_usdt = 1.0
+        else:
+            margin_usdt = round(wallet / 4, 2)
+
+        if margin_usdt < 0.30:
+            logger.warning(f"[SysB] Margin too low: {margin_usdt}$ (wallet={wallet:.2f}$)")
+            return False
+        if real_balance > 0 and margin_usdt > real_balance * 0.95:
+            margin_usdt = round(real_balance * 0.95, 2)
+
+        logger.info(f"[SysB] {symbol} sizing: wallet={wallet:.2f}$ → "
+                    f"margin={margin_usdt}$ × {leverage}x")
+
+        # 4. Set leverage + margin type on Binance
+        if leverage > 1:
+            try:
+                self._rest.set_margin_type(symbol, "ISOLATED")
+            except Exception:
+                pass
+            try:
+                self._rest.set_leverage(symbol, leverage)
+            except Exception as e:
+                logger.warning(f"[SysB] set_leverage failed: {e}")
+
+        # 5. Qty precision
+        qty_precision = 3
+        min_notional = 5.0
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    qty_precision = si.quantity_precision
+                    min_notional = si.min_notional
+            except Exception:
+                pass
+
+        notional_usdt = margin_usdt * leverage
+        if notional_usdt < min_notional:
+            needed = min_notional / leverage * 1.05
+            if needed > margin_usdt * 2.0:
+                logger.info(f"[SysB] {symbol} min notional needs {needed:.2f}$ > 2x target, skip")
+                self._failed_symbols[symbol] = time.time()
+                return False
+            margin_usdt = round(needed, 2)
+            notional_usdt = margin_usdt * leverage
+
+        size_qty = round(notional_usdt / price, qty_precision) if price > 0 else 0
+
+        # 6. SL/TP hesaplama
+        G = cand.G
+        is_ranging = cand.regime.regime in ("RANGING", "WEAK_RANGING")
+
+        if is_ranging:
+            # Ranging: sabit SL/TP (bant bazlı)
+            sl_price = cand.ranging_sl
+            tp_price = cand.ranging_tp
+            sl_pct = abs(price - sl_price) / price * 100 if price > 0 else 3.0
+        else:
+            # Trend: G bazlı SL, trailing kullanılır
+            sl_carpan = sb.get("sl_carpan", 1.5)
+            sl_pct = sl_carpan * G + sb.get("slippage_buffer", 0.1)
+            if side == OrderSide.BUY_LONG:
+                sl_price = price * (1 - sl_pct / 100)
+            else:
+                sl_price = price * (1 + sl_pct / 100)
+            tp_price = 0.0  # trailing kullanılır, sabit TP yok (clamped trailing hariç)
+            if cand.ranging_tp > 0 and cand.trailing_callback_pct == 0:
+                # Trailing kullanılamadı → sabit TP
+                tp_price = cand.ranging_tp
+
+        # 6b. Min SL mesafesi: fee+spread koruması
+        fee_rate = sb.get("fee_rate", 0.0004)
+        fee_roundtrip = fee_rate * 2 * 100  # % cinsinden
+        spread_est = fee_roundtrip * 0.5
+        min_sl_pct = 3.0 * (fee_roundtrip + spread_est)
+        if sl_pct < min_sl_pct:
+            logger.warning(f"[SysB] {symbol} SL too tight "
+                           f"(SL={sl_pct:.3f}% < min={min_sl_pct:.3f}% "
+                           f"= 3×(fee+spread)). Skipping.")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # 7. Execute order
+        entry_type = cand.entry_type
+        use_market = sb.get("hemen_gir_market", True)
+
+        if entry_type == "MARKET_ENTER" and use_market:
+            order_type = OrderType.MARKET
+        else:
+            # Limit emir
+            order_type = OrderType.LIMIT
+            buffer_pct = sb.get("limit_buffer_yuzde", 0.05) / 100
+            if side == OrderSide.BUY_LONG:
+                price = price * (1 - buffer_pct)
+            else:
+                price = price * (1 + buffer_pct)
+
+        try:
+            if not self._order_executor:
+                logger.error("[SysB] No order executor")
+                return False
+
+            self._order_executor.execute_order(
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                size=size_qty,
+                price=price if order_type == "LIMIT" else None,
+                leverage=leverage,
+                sl_percent=0,  # SL handled by _place_initial_trailing_system_b
+                tp_percent=0,  # TP handled separately
+            )
+        except Exception as e:
+            logger.error(f"[SysB] Order failed for {symbol}: {e}")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # 8. Open position in manager
+        pos = self._position_mgr.open_position(
+            symbol=symbol,
+            side=side,
+            price=price,
+            size=size_qty,
+            atr=cand.atr,
+            leverage=leverage,
+            margin_usdt=margin_usdt,
+            timeframe=sb.get("kucuk_tf", "5m"),
+            entry_score=abs(cand.score),
+            entry_confluence=0.0,
+            entry_adx=0.0,
+            entry_rsi=cand.rsi,
+            entry_regime=cand.regime.regime,
+            entry_regime_confidence=cand.regime.confidence,
+            entry_mode="SYSTEM_B",
+        )
+
+        if pos:
+            # Store System B specific data on position
+            pos.entry_bb_width = cand.G  # G değerini bb_width alanında sakla (reuse)
+            self._trade_timestamps.append(time.time())
+
+            # 9. Place SL + trailing/TP orders on Binance
+            self._place_initial_trailing_system_b(
+                symbol, pos, price, cand)
+
+            logger.info(f"[SysB] ✓ Opened {direction} {symbol} @ {price:.6f} "
+                        f"lev={leverage}x margin={margin_usdt}$ "
+                        f"G={G:.3f}% SL={sl_pct:.2f}% "
+                        f"regime={cand.regime.regime}")
+
+            self._event_bus.publish(EventType.ORDER_PLACED, {
+                "symbol": symbol,
+                "side": direction,
+                "price": price,
+                "size": size_qty,
+                "leverage": leverage,
+                "system": "B",
+            })
+            return True
+
+        return False
+
+    def _place_initial_trailing_system_b(self, symbol: str, pos,
+                                         entry_price: float,
+                                         cand: 'SystemBScanResult') -> None:
+        """System B: G bazlı SL + trailing emir gönder."""
+        try:
+            rest = self._order_executor._rest
+            pp = self._order_executor._get_price_precision(symbol)
+        except Exception as e:
+            logger.error(f"[SysB] Cannot access REST client: {e}")
+            return
+
+        sb = self._config.get("system_b", {})
+        is_long = pos.side == OrderSide.BUY_LONG
+        close_side = "SELL" if is_long else "BUY"
+        G = cand.G
+        is_ranging = cand.regime.regime in ("RANGING", "WEAK_RANGING")
+
+        # ── SERVER SL ──
+        sl_carpan = sb.get("sl_carpan", 1.5)
+        min_sl_offset = entry_price * (sl_carpan * G / 100) if G > 0 else entry_price * 0.01
+
+        if is_ranging:
+            sl_price = cand.ranging_sl
+            # Minimum SL mesafesi koruması (ranging SL çok yakın olabilir)
+            if is_long:
+                max_sl = entry_price - min_sl_offset
+                sl_price = min(sl_price, max_sl)
+            else:
+                min_sl = entry_price + min_sl_offset
+                sl_price = max(sl_price, min_sl)
+            sl_price = round(sl_price, pp)
+        else:
+            sl_offset = entry_price * (sl_carpan * G / 100)
+            if is_long:
+                sl_price = round(entry_price - sl_offset, pp)
+            else:
+                sl_price = round(entry_price + sl_offset, pp)
+
+        sl_dist_pct = abs(entry_price - sl_price) / entry_price * 100
+
+        try:
+            rest.place_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="STOP_MARKET",
+                quantity=pos.size,
+                stop_price=sl_price,
+                reduce_only=True,
+            )
+            logger.info(f"[SysB SL] {symbol}: SL @ {sl_price} "
+                        f"(mesafe={sl_dist_pct:.2f}%, {sl_carpan}×G)")
+        except Exception as e:
+            logger.error(f"[SysB SL] {symbol}: FAILED: {e}")
+
+        if is_ranging:
+            # ── RANGING: SABİT TP (trailing yok) ──
+            tp_price = round(cand.ranging_tp, pp)
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    quantity=pos.size,
+                    stop_price=tp_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysB TP] {symbol}: TP @ {tp_price} (ranging)")
+            except Exception as e:
+                logger.error(f"[SysB TP] {symbol}: FAILED: {e}")
+        else:
+            # ── TREND: TRAILING_STOP_MARKET ──
+            if cand.trailing_callback_pct > 0:
+                tetik_carpan = sb.get("tetik_carpan", 2.5)
+                activation_offset = entry_price * (tetik_carpan * G / 100)
+                if is_long:
+                    activation_price = round(entry_price + activation_offset, pp)
+                else:
+                    activation_price = round(entry_price - activation_offset, pp)
+
+                callback_pct = max(0.1, min(5.0, round(cand.trailing_callback_pct, 1)))
+
+                try:
+                    rest.place_order(
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="TRAILING_STOP_MARKET",
+                        quantity=pos.size,
+                        activation_price=activation_price,
+                        callback_rate=callback_pct,
+                        reduce_only=True,
+                    )
+                    logger.info(f"[SysB TRAIL] {symbol}: trigger={activation_price} "
+                                f"callback={callback_pct}%")
+                    self._server_trailing[symbol] = {
+                        "callback_pct": callback_pct,
+                        "activation_price": activation_price,
+                        "timestamp": time.time(),
+                    }
+                except Exception as e:
+                    logger.error(f"[SysB TRAIL] {symbol}: FAILED: {e}")
+            elif cand.ranging_tp > 0:
+                # Trailing kullanılamadı → sabit TP (I × 0.8)
+                tp_price = round(cand.ranging_tp, pp)
+                try:
+                    rest.place_order(
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="TAKE_PROFIT_MARKET",
+                        quantity=pos.size,
+                        stop_price=tp_price,
+                        reduce_only=True,
+                    )
+                    logger.info(f"[SysB TP] {symbol}: fixed TP @ {tp_price} "
+                                f"(trailing unavailable)")
+                except Exception as e:
+                    logger.error(f"[SysB TP] {symbol}: FAILED: {e}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # ════  SYSTEM D — Sıralı Coin Analiz & Trade  ════════════════════
+    # ══════════════════════════════════════════════════════════════════
+
+    def _do_scanning_system_d(self) -> None:
+        """System D tarama döngüsü: Top N coin → MTF analiz → sıralı alım."""
+
+        # Step 0: Check pending limit orders
+        if self._pending_limits:
+            self._check_pending_limits()
+
+        # Step A: Check held positions
+        if self._position_mgr.has_position:
+            self._check_held_positions()
+
+        self._scan_count += 1
+        sd = self._config.get("system_d", {})
+        max_pos = sd.get("max_pozisyon", 12)
+        self._position_mgr._max_positions = max_pos
+
+        logger.info(f"[SysD] Scan #{self._scan_count} starting... "
+                    f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+
+        # 1. Symbol universe (hacim sıralı top N)
+        coin_sayisi = sd.get("coin_sayisi", 50)
+        self._universe._top_n = coin_sayisi
+        symbols = self._universe.refresh()
+        if not symbols:
+            logger.warning("[SysD] No symbols to scan")
+            self._stop_event.wait(timeout=10)
+            return
+
+        # 2. Zoom Diyafram: kademeli TF fetch (API tasarrufu)
+        # Adım 1: Zoom aday TF'leri çek (5m, 15m, 30m, 1h — hızlı dirsek tespiti)
+        # Adım 2: Seçilen optimal + mid + macro TF'leri çek
+        from scanner.system_d_scanner import ZOOM_TF_LADDER
+        mum_sayisi = sd.get("mikro_tf_mum", 200)
+
+        # Zoom + yön TF'leri: 6 TF × N coin (makul API yükü)
+        fetch_tfs = [
+            ("5m", 5), ("15m", 15), ("30m", 30), ("1h", 60),  # zoom adayları
+            ("4h", 240), ("1d", 1440),                          # yön büyük TF
+        ]
+
+        klines_all_tf: dict[str, dict[str, list]] = {sym: {} for sym in symbols}
+        for tf_name, tf_min in fetch_tfs:
+            tf_map = self._fetcher.fetch_batch(symbols, tf_name, mum_sayisi)
+            for sym, klines in tf_map.items():
+                # DataFrame → list of lists (system_d_scanner list bekliyor)
+                if hasattr(klines, 'values'):
+                    klines_all_tf[sym][tf_name] = klines.values.tolist()
+                else:
+                    klines_all_tf[sym][tf_name] = klines
+
+        # 3. Funding rates (1 batch call)
+        market_ctx = self._fetch_funding_rates(symbols)
+
+        # 4. Volume map (for display)
+        volume_map = {}
+        try:
+            tickers = self._rest.get_24h_ticker()
+            for t in tickers:
+                s = t.get("symbol", "")
+                if s in klines_all_tf:
+                    volume_map[s] = float(t.get("quoteVolume", 0))
+        except Exception:
+            pass
+
+        # 5. Score all symbols (zoom diyafram ile)
+        results = self._system_d_scanner.score_batch(
+            symbols, klines_all_tf, market_ctx, volume_map)
+
+        self._last_system_d_results = results
+        eligible = [r for r in results if r.eligible]
+
+        # Log top 5
+        for i, r in enumerate(results[:5]):
+            z = r.zoom
+            logger.info(f"  [SysD] #{r.rank} {r.symbol}: score={r.score:+.1f} "
+                        f"dir={r.direction} regime={r.regime} "
+                        f"zoom={z.optimal_tf}(mid={z.mid_tf},mac={z.macro_tf}) "
+                        f"G={r.leverage_calc.G:.3f}% SL={r.sl_pct:.2f}% "
+                        f"lev={r.leverage}x "
+                        f"eligible={r.eligible} reject={r.reject_reason or '-'}")
+
+        logger.info(f"[SysD] Results: {len(results)} total, {len(eligible)} eligible")
+
+        # Publish for GUI
+        self._event_bus.publish(EventType.SCANNER_UPDATE, {
+            "scan_count": self._scan_count,
+            "total_symbols": len(symbols),
+            "scored": len(results),
+            "eligible": len(eligible),
+            "mr_scored": 0,
+            "mr_eligible": 0,
+            "positions": self._position_mgr.position_count,
+            "max_positions": max_pos,
+            "system_d": True,
+            "top_5": [
+                {"symbol": r.symbol, "score": r.score, "direction": r.direction,
+                 "regime": r.regime, "G": r.leverage_calc.G}
+                for r in results[:5]
+            ],
+            "candidate": eligible[0].symbol if eligible else None,
+        })
+
+        # Close-only mode
+        if self._config.get("strategy.close_only", False):
+            if self._position_mgr.has_position:
+                logger.info(f"[SysD] Close-only: monitoring {self._position_mgr.position_count} pos")
+            self._wait(sd.get("scan_interval_seconds", 30))
+            return
+
+        # 6. Filter candidates and buy (sıralı, hacim öncelikli)
+        now = time.time()
+        self._failed_symbols = {
+            s: t for s, t in self._failed_symbols.items()
+            if now - t < self._failed_cooldown
+        }
+
+        # Cooldown filtresi
+        cooldown_enabled = sd.get("cooldown_enabled", False)
+        cooldown_secs = sd.get("cooldown_seconds", 600)
+        if cooldown_enabled:
+            self._loss_cooldown_symbols = {
+                s: t for s, t in self._loss_cooldown_symbols.items()
+                if now - t < cooldown_secs
+            }
+
+        # Yön dengesi: mevcut pozisyon sayıları
+        yon_denge = sd.get("yon_denge_enabled", True)
+        yon_oran = sd.get("yon_denge_oran", "2-1")
+        max_ayni_yon = sd.get("max_ayni_yon", 8)
+        try:
+            yon_parts = yon_oran.split("-")
+            yon_majority = int(yon_parts[0])
+            yon_minority = int(yon_parts[1])
+        except (ValueError, IndexError):
+            yon_majority, yon_minority = 2, 1
+
+        candidates = []
+        for r in eligible:
+            if r.symbol in self._failed_symbols:
+                continue
+            if self._position_mgr.is_holding(r.symbol):
+                continue
+            if r.symbol in self._pending_limits:
+                continue
+            # Cooldown kontrolü
+            if cooldown_enabled and r.symbol in self._loss_cooldown_symbols:
+                continue
+            # Coin daily ban kontrolü (System A ile aynı kural)
+            coin_ok, coin_reason = self._check_coin_daily_ban(r.symbol)
+            if not coin_ok:
+                continue
+            # Yön dengesi kontrolü
+            if yon_denge:
+                dir_count = self._count_direction(r.direction)
+                if dir_count >= max_ayni_yon:
+                    continue
+                # Oran kontrolü: majority <= X * (floor(minority / Y) + 1)
+                opp_dir = "SHORT" if r.direction == "LONG" else "LONG"
+                opp_count = self._count_direction(opp_dir)
+                if dir_count >= yon_majority * (opp_count // yon_minority + 1):
+                    continue
+            candidates.append(r)
+
+        bought_any = False
+        if candidates and self._position_mgr.has_capacity:
+            # Balance kontrolü
+            real_balance = 0.0
+            if self._order_executor and hasattr(self._order_executor, "get_balance"):
+                try:
+                    real_balance = self._order_executor.get_balance()
+                except Exception:
+                    pass
+            if real_balance > 0 and real_balance < 0.30:
+                logger.info(f"[SysD] Balance too low ({real_balance:.2f}$)")
+                self._wait(60)
+                return
+
+            for cand in candidates:
+                total_occupied = self._position_mgr.position_count + len(self._pending_limits)
+                if total_occupied >= max_pos:
+                    break
+                if not self._check_trade_frequency():
+                    break
+
+                logger.info(f"[SysD] Candidate: {cand.symbol} score={cand.score:+.1f} "
+                            f"dir={cand.direction} G={cand.leverage_calc.G:.3f}% "
+                            f"lev={cand.leverage}x regime={cand.regime}")
+
+                if self._do_buying_system_d(cand):
+                    bought_any = True
+
+        if bought_any:
+            self._wait(5)
+        else:
+            scan_interval = sd.get("scan_interval_seconds", 30)
+            self._wait(scan_interval)
+
+    def _do_buying_system_d(self, cand: 'SystemDScanResult') -> bool:
+        """System D pozisyon açma: G bazlı kaldıraç, limit emir."""
+        symbol = cand.symbol
+        direction = cand.direction
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        sd = self._config.get("system_d", {})
+
+        # 1. Fresh price
+        price = cand.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # 2. Leverage
+        leverage = cand.leverage
+        lev_enabled = self._config.get("leverage.enabled", False)
+        if not lev_enabled:
+            leverage = 1
+
+        # Binance max leverage kontrolü
+        if leverage > 1:
+            try:
+                margin_est = 5.0
+                available_max = self._rest.get_max_leverage(symbol, margin_est * leverage)
+                if available_max < leverage:
+                    leverage = available_max
+                if leverage < sd.get("min_kaldirac", 2):
+                    logger.info(f"[SysD] {symbol} max lev {leverage}x < min, skipping")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
+            except Exception as e:
+                logger.warning(f"[SysD] {symbol} max leverage check failed: {e}")
+
+        # 3. Position sizing: bakiye / portfoy_bolen
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            try:
+                real_balance = self._order_executor.get_balance()
+            except Exception:
+                pass
+
+        divider = sd.get("portfoy_bolen", 12)
+        locked_margin = self._position_mgr.get_total_margin()
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 5.0)
+
+        if wallet >= 12.0:
+            margin_usdt = round(wallet / divider, 2)
+        elif wallet >= 4.0:
+            margin_usdt = 1.0
+        else:
+            margin_usdt = round(wallet / 4, 2)
+
+        if margin_usdt < 0.30:
+            logger.warning(f"[SysD] Margin too low: {margin_usdt}$ (wallet={wallet:.2f}$)")
+            return False
+        if real_balance > 0 and margin_usdt > real_balance * 0.95:
+            margin_usdt = round(real_balance * 0.95, 2)
+
+        logger.info(f"[SysD] {symbol} sizing: wallet={wallet:.2f}$ → "
+                    f"margin={margin_usdt}$ × {leverage}x")
+
+        # 4. Set leverage + margin type on Binance
+        if leverage > 1:
+            try:
+                self._rest.set_margin_type(symbol, "ISOLATED")
+            except Exception:
+                pass
+            try:
+                self._rest.set_leverage(symbol, leverage)
+            except Exception as e:
+                logger.warning(f"[SysD] set_leverage failed: {e}")
+
+        # 5. Qty precision + tick size
+        qty_precision = 3
+        min_notional = 5.0
+        si = None
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    qty_precision = si.quantity_precision
+                    min_notional = si.min_notional
+            except Exception:
+                pass
+
+        notional_usdt = margin_usdt * leverage
+        if notional_usdt < min_notional:
+            needed = min_notional / leverage * 1.05
+            if needed > margin_usdt * 2.0:
+                logger.info(f"[SysD] {symbol} min notional needs {needed:.2f}$ > 2x target, skip")
+                self._failed_symbols[symbol] = time.time()
+                return False
+            margin_usdt = round(needed, 2)
+            notional_usdt = margin_usdt * leverage
+
+        size_qty = round(notional_usdt / price, qty_precision) if price > 0 else 0
+
+        # 6. Entry: Limit emir (0.1 × ATR offset) — tick size ile yuvarlama
+        atr_offset = sd.get("limit_atr_offset", 0.1)
+        atr = cand.atr
+        offset_amount = atr * atr_offset
+
+        if side == OrderSide.BUY_LONG:
+            limit_price = price - offset_amount
+        else:
+            limit_price = price + offset_amount
+
+        # Tick size validation (Binance -4014 hatası önlenir)
+        if si:
+            limit_price = si.validate_price(limit_price)
+        else:
+            limit_price = round(limit_price, 4)
+
+        timeout_s = sd.get("limit_timeout_seconds", 60)
+
+        # 6b. Min SL mesafesi: fee+spread koruması
+        fee_rate = sd.get("fee_rate", 0.0004)
+        fee_roundtrip = fee_rate * 2 * 100  # % cinsinden
+        spread_est = fee_roundtrip * 0.5
+        min_sl_pct = 3.0 * (fee_roundtrip + spread_est)
+        if cand.sl_pct < min_sl_pct:
+            logger.warning(f"[SysD] {symbol} SL too tight "
+                           f"(SL={cand.sl_pct:.3f}% < min={min_sl_pct:.3f}% "
+                           f"= 3×(fee+spread)). Skipping.")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # 7. SL hesaplama (tick size ile yuvarlama)
+        sl_pct = cand.sl_pct
+        if side == OrderSide.BUY_LONG:
+            sl_price = limit_price * (1 - sl_pct / 100)
+        else:
+            sl_price = limit_price * (1 + sl_pct / 100)
+        if si:
+            sl_price = si.validate_price(sl_price)
+        else:
+            sl_price = round(sl_price, 4)
+
+        try:
+            if not self._order_executor:
+                logger.error("[SysD] No order executor")
+                return False
+
+            self._order_executor.execute_order(
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.LIMIT,
+                size=size_qty,
+                price=limit_price,
+                leverage=leverage,
+                sl_percent=0,  # SL handled by server-side orders
+                tp_percent=0,
+            )
+        except Exception as e:
+            logger.error(f"[SysD] Order failed for {symbol}: {e}")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # 8. Track as pending limit
+        self._pending_limits[symbol] = {
+            "order_id": None,
+            "limit_price": limit_price,
+            "side": side,
+            "size": size_qty,
+            "atr": atr,
+            "candidate": cand,
+            "leverage": leverage,
+            "margin_usdt": margin_usdt,
+            "placed_time": time.time(),
+            "timeout": timeout_s,
+            "qty_precision": qty_precision,
+            "entry_mode": "SYSTEM_D",
+        }
+
+        logger.info(f"[SysD] Limit order placed: {symbol} {direction} "
+                    f"@ {limit_price} (offset={offset_amount:.6f}) "
+                    f"size={size_qty} lev={leverage}x SL={sl_pct:.2f}% "
+                    f"timeout={timeout_s}s")
+
+        # Record trade timestamp
+        self._trade_timestamps.append(time.time())
+
+        return True
+
+    def _open_position_system_d(self, symbol: str, cand: 'SystemDScanResult',
+                                side: OrderSide, price: float,
+                                size_qty: float, leverage: int,
+                                margin_usdt: float) -> None:
+        """System D pozisyonu aç ve server-side emirleri yerleştir."""
+        sd = self._config.get("system_d", {})
+
+        pos = self._position_mgr.open_position(
+            symbol=symbol,
+            side=side,
+            price=price,
+            size=size_qty,
+            atr=cand.atr,
+            leverage=leverage,
+            margin_usdt=margin_usdt,
+            timeframe=sd.get("mikro_tf", "5m"),
+            entry_score=abs(cand.score),
+            entry_confluence=0.0,
+            entry_adx=cand.regime_result.adx if cand.regime_result else 0,
+            entry_rsi=cand.direction_result.micro.rsi_value if cand.direction_result and cand.direction_result.micro else 50,
+            entry_regime=cand.regime,
+            entry_regime_confidence=0.0,
+            entry_mode="SYSTEM_D",
+            entry_bb_width=cand.leverage_calc.G,  # G değeri → SL override için
+        )
+
+        if not pos:
+            logger.error(f"[SysD] Failed to open position for {symbol}")
+            return
+
+        # Server-side SL emri
+        self._place_initial_orders_system_d(symbol, pos, cand, sd)
+
+    def _place_initial_orders_system_d(self, symbol: str, pos,
+                                        cand: 'SystemDScanResult',
+                                        sd: dict) -> None:
+        """Server-side SL + trailing/TP emirleri yerleştir."""
+        rest = self._rest
+        if not rest:
+            return
+
+        pp = 2  # price precision
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+            except Exception:
+                pass
+
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        entry_price = pos.entry_price
+
+        # 1. SL emri (STOP_MARKET)
+        sl_pct = cand.sl_pct
+        if pos.side == OrderSide.BUY_LONG:
+            sl_price = round(entry_price * (1 - sl_pct / 100), pp)
+        else:
+            sl_price = round(entry_price * (1 + sl_pct / 100), pp)
+
+        try:
+            rest.place_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="STOP_MARKET",
+                quantity=pos.size,
+                stop_price=sl_price,
+                reduce_only=True,
+            )
+            logger.info(f"[SysD SL] {symbol}: STOP_MARKET @ {sl_price} "
+                        f"(SL={sl_pct:.2f}%)")
+        except Exception as e:
+            logger.error(f"[SysD SL] {symbol}: FAILED: {e}")
+
+        # 2. Rejime göre trailing veya sabit TP
+        if cand.regime == "TREND" and cand.trailing_callback_pct > 0:
+            # Trailing stop
+            callback_pct = round(cand.trailing_callback_pct, 2)
+            callback_pct = max(0.1, min(callback_pct, 5.0))
+
+            activation_price = None
+            if cand.trailing_trigger_pct > 0:
+                if pos.side == OrderSide.BUY_LONG:
+                    activation_price = round(entry_price * (1 + cand.trailing_trigger_pct / 100), pp)
+                else:
+                    activation_price = round(entry_price * (1 - cand.trailing_trigger_pct / 100), pp)
+
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=pos.size,
+                    callback_rate=callback_pct,
+                    stop_price=activation_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysD Trail] {symbol}: callback={callback_pct}% "
+                            f"activation={activation_price}")
+            except Exception as e:
+                logger.error(f"[SysD Trail] {symbol}: FAILED: {e}")
+        elif cand.tp_pct > 0:
+            # Sabit TP (RANGING)
+            if pos.side == OrderSide.BUY_LONG:
+                tp_price = round(entry_price * (1 + cand.tp_pct / 100), pp)
+            else:
+                tp_price = round(entry_price * (1 - cand.tp_pct / 100), pp)
+
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    quantity=pos.size,
+                    stop_price=tp_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysD TP] {symbol}: TAKE_PROFIT @ {tp_price} "
+                            f"(TP={cand.tp_pct:.2f}%)")
+            except Exception as e:
+                logger.error(f"[SysD TP] {symbol}: FAILED: {e}")
+
+    def _on_limit_filled_system_d(self, symbol: str, info: dict,
+                                   fill_price: float) -> None:
+        """Handle System D limit order fill: open position + server orders."""
+        cand = info["candidate"]
+
+        self._open_position_system_d(
+            symbol, cand, info["side"], fill_price,
+            info["size"], info["leverage"], info["margin_usdt"])
+
+        if self._risk_manager:
+            self._risk_manager.record_order(
+                info["size"], fill_price,
+                margin_usdt=info["margin_usdt"],
+            )
+
+        if self._order_logger:
+            self._order_logger.log_order(
+                symbol=symbol, side=info["side"].value, order_type="Limit",
+                price=fill_price, size=info["size"],
+                notional_usdt=info["size"] * fill_price,
+                status="filled",
+                trigger_source=f"system_d:{cand.score:+.0f}",
+            )
+
+        self._event_bus.publish(EventType.ORDER_PLACED, {
+            "symbol": symbol, "side": info["side"].value,
+            "size": info["size"], "price": fill_price,
+            "order_type": "SYSTEM_D_LIMIT_FILLED",
+        })
+
+    def _place_missing_orders_system_d(self, symbol, pos, rest, pp,
+                                        is_long, close_side,
+                                        entry_price, actual_qty,
+                                        entry_regime,
+                                        need_sl, need_trailing):
+        """System D: G bazlı eksik emir onarımı.
+
+        G değeri pos.entry_bb_width alanında saklanır.
+        Rejime göre: TREND → trailing, RANGING → sabit TP.
+        """
+        sd = self._config.get("system_d", {})
+        G = getattr(pos, 'entry_bb_width', 0)
+        if G <= 0:
+            G = 0.5  # fallback
+
+        sl_placed = False
+        trail_placed = False
+
+        # SL çarpanı: rejime göre
+        if entry_regime in ("TREND",):
+            sl_mult = sd.get("sl_carpan_trend", 1.5)
+        else:
+            sl_mult = sd.get("sl_carpan_ranging", 2.0)
+
+        sl_pct = G * sl_mult
+
+        # ── SL emri ──
+        if need_sl:
+            if is_long:
+                sl_price = round(entry_price * (1 - sl_pct / 100), pp)
+            else:
+                sl_price = round(entry_price * (1 + sl_pct / 100), pp)
+            try:
+                result = rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=actual_qty, stop_price=sl_price,
+                    reduce_only=True,
+                )
+                sl_placed = True
+                logger.info(f"[SysD REPAIR] {symbol}: SL @ {sl_price} "
+                            f"(G={G:.3f}%, {sl_mult}xG={sl_pct:.3f}%)")
+            except Exception as e:
+                logger.error(f"[SysD REPAIR] {symbol}: SL FAILED: {e}")
+
+        # ── Trailing veya TP emri ──
+        if need_trailing:
+            if entry_regime in ("TREND",):
+                # Trailing stop
+                tetik_mult = sd.get("trailing_tetik_g_carpan", 2.0)
+                mesafe_mult = sd.get("trailing_mesafe_g_carpan", 0.5)
+                callback_pct = G * mesafe_mult
+                callback_pct = max(0.1, min(callback_pct, 5.0))
+                callback_pct = round(callback_pct, 2)
+
+                tetik_pct = G * tetik_mult
+                if is_long:
+                    activation_price = round(entry_price * (1 + tetik_pct / 100), pp)
+                else:
+                    activation_price = round(entry_price * (1 - tetik_pct / 100), pp)
+
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="TRAILING_STOP_MARKET",
+                        quantity=actual_qty,
+                        callback_rate=callback_pct,
+                        stop_price=activation_price,
+                        reduce_only=True,
+                    )
+                    trail_placed = True
+                    logger.info(f"[SysD REPAIR] {symbol}: Trailing "
+                                f"callback={callback_pct}% activation={activation_price}")
+                except Exception as e:
+                    logger.error(f"[SysD REPAIR] {symbol}: Trailing FAILED: {e}")
+            else:
+                # Ranging: sabit TP
+                tp_mult = sd.get("ranging_tp_g_carpan", 3.0)
+                tp_pct = G * tp_mult
+                if is_long:
+                    tp_price = round(entry_price * (1 + tp_pct / 100), pp)
+                else:
+                    tp_price = round(entry_price * (1 - tp_pct / 100), pp)
+
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="TAKE_PROFIT_MARKET",
+                        quantity=actual_qty,
+                        stop_price=tp_price,
+                        reduce_only=True,
+                    )
+                    trail_placed = True
+                    logger.info(f"[SysD REPAIR] {symbol}: TP @ {tp_price} "
+                                f"({tp_mult}xG={tp_pct:.3f}%)")
+                except Exception as e:
+                    logger.error(f"[SysD REPAIR] {symbol}: TP FAILED: {e}")
+
+        return sl_placed, trail_placed
+
+    # ══════════════════════════════════════════════════════════════════
+    # ════  SYSTEM E — Yüksek Kaldıraç Yön Kesinliği  ═════════════════
+    # ══════════════════════════════════════════════════════════════════
+
+    def _do_scanning_system_e(self) -> None:
+        """System E tarama döngüsü: Top N coin → 5 TF sinyal uyumu → max kaldıraç alım."""
+
+        # Step 0: Check pending limit orders
+        if self._pending_limits:
+            self._check_pending_limits()
+
+        # Step A: Check held positions
+        if self._position_mgr.has_position:
+            self._check_held_positions()
+
+        self._scan_count += 1
+        se = self._config.get("system_e", {})
+        max_pos = se.get("max_pozisyon", 12)
+        self._position_mgr._max_positions = max_pos
+
+        logger.info(f"[SysE] Scan #{self._scan_count} starting... "
+                    f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+
+        # 1. Symbol universe (hacim sıralı top N)
+        coin_sayisi = se.get("coin_sayisi", 50)
+        self._universe._top_n = coin_sayisi
+        symbols = self._universe.refresh()
+        if not symbols:
+            logger.warning("[SysE] No symbols to scan")
+            self._stop_event.wait(timeout=10)
+            return
+
+        # 2. 5 TF kline çek: 5m, 15m, 1h, 4h, 1d
+        mum_sayisi = se.get("mum_sayisi", 200)
+        fetch_tfs = [
+            ("5m", 5), ("15m", 15), ("1h", 60), ("4h", 240), ("1d", 1440),
+        ]
+
+        klines_all_tf: dict[str, dict[str, list]] = {sym: {} for sym in symbols}
+        for tf_name, tf_min in fetch_tfs:
+            tf_map = self._fetcher.fetch_batch(symbols, tf_name, mum_sayisi)
+            for sym, klines in tf_map.items():
+                if hasattr(klines, 'values'):
+                    klines_all_tf[sym][tf_name] = klines.values.tolist()
+                else:
+                    klines_all_tf[sym][tf_name] = klines
+
+        # 3. Funding rates (1 batch call)
+        market_ctx = self._fetch_funding_rates(symbols)
+
+        # 4. Volume map
+        volume_map = {}
+        try:
+            tickers = self._rest.get_24h_ticker()
+            for t in tickers:
+                s = t.get("symbol", "")
+                if s in klines_all_tf:
+                    volume_map[s] = float(t.get("quoteVolume", 0))
+        except Exception:
+            pass
+
+        # 5. Score all symbols
+        results = self._system_e_scanner.score_batch(
+            symbols, klines_all_tf, market_ctx, volume_map)
+
+        self._last_system_e_results = results
+        eligible = [r for r in results if r.eligible]
+
+        # Log top 5
+        for i, r in enumerate(results[:5]):
+            logger.info(f"  [SysE] #{r.rank} {r.symbol}: score={r.score:+.1f} "
+                        f"dir={r.direction} uyum={r.aligned_count}/{r.total_tfs} "
+                        f"guc={r.direction_strength:.2f} lev={r.leverage}x "
+                        f"eligible={r.eligible} reject={r.reject_reason or '-'}")
+
+        logger.info(f"[SysE] Results: {len(results)} total, {len(eligible)} eligible")
+
+        # Publish for GUI
+        self._event_bus.publish(EventType.SCANNER_UPDATE, {
+            "scan_count": self._scan_count,
+            "total_symbols": len(symbols),
+            "scored": len(results),
+            "eligible": len(eligible),
+            "mr_scored": 0,
+            "mr_eligible": 0,
+            "positions": self._position_mgr.position_count,
+            "max_positions": max_pos,
+            "system_e": True,
+            "candidate": eligible[0].symbol if eligible else None,
+        })
+
+        # Close-only mode
+        if self._config.get("strategy.close_only", False):
+            if self._position_mgr.has_position:
+                logger.info(f"[SysE] Close-only: monitoring {self._position_mgr.position_count} pos")
+            self._wait(se.get("scan_interval_seconds", 30))
+            return
+
+        # 6. Filter candidates and buy
+        now = time.time()
+        self._failed_symbols = {
+            s: t for s, t in self._failed_symbols.items()
+            if now - t < self._failed_cooldown
+        }
+
+        # Yön dengesi
+        yon_denge = se.get("yon_denge_enabled", True)
+        yon_oran = se.get("yon_denge_oran", "2-1")
+        max_ayni_yon = se.get("max_ayni_yon", 8)
+        try:
+            yon_parts = yon_oran.split("-")
+            yon_majority = int(yon_parts[0])
+            yon_minority = int(yon_parts[1])
+        except (ValueError, IndexError):
+            yon_majority, yon_minority = 2, 1
+
+        candidates = []
+        for r in eligible:
+            if r.symbol in self._failed_symbols:
+                continue
+            if self._position_mgr.is_holding(r.symbol):
+                continue
+            if r.symbol in self._pending_limits:
+                continue
+            # Coin daily ban
+            coin_ok, coin_reason = self._check_coin_daily_ban(r.symbol)
+            if not coin_ok:
+                continue
+            # Yön dengesi
+            if yon_denge:
+                dir_count = self._count_direction(r.direction)
+                if dir_count >= max_ayni_yon:
+                    continue
+                opp_dir = "SHORT" if r.direction == "LONG" else "LONG"
+                opp_count = self._count_direction(opp_dir)
+                if dir_count >= yon_majority * (opp_count // yon_minority + 1):
+                    continue
+            candidates.append(r)
+
+        bought_any = False
+        if candidates and self._position_mgr.has_capacity:
+            real_balance = 0.0
+            if self._order_executor and hasattr(self._order_executor, "get_balance"):
+                try:
+                    real_balance = self._order_executor.get_balance()
+                except Exception:
+                    pass
+            if real_balance > 0 and real_balance < 0.30:
+                logger.info(f"[SysE] Balance too low ({real_balance:.2f}$)")
+                self._wait(60)
+                return
+
+            for cand in candidates:
+                total_occupied = self._position_mgr.position_count + len(self._pending_limits)
+                if total_occupied >= max_pos:
+                    break
+                if not self._check_trade_frequency():
+                    break
+
+                logger.info(f"[SysE] Candidate: {cand.symbol} score={cand.score:+.1f} "
+                            f"dir={cand.direction} uyum={cand.aligned_count}/{cand.total_tfs} "
+                            f"lev={cand.leverage}x")
+
+                if self._do_buying_system_e(cand):
+                    bought_any = True
+
+        if bought_any:
+            self._wait(5)
+        else:
+            scan_interval = se.get("scan_interval_seconds", 30)
+            self._wait(scan_interval)
+
+    def _do_buying_system_e(self, cand: 'SystemEScanResult') -> bool:
+        """System E pozisyon açma: max kaldıraç, market giriş, emergency SL + trailing."""
+        symbol = cand.symbol
+        direction = cand.direction
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        se = self._config.get("system_e", {})
+
+        # 1. Fresh price
+        price = cand.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # 2. Max leverage (Binance limiti ile)
+        leverage = cand.leverage
+        lev_enabled = self._config.get("leverage.enabled", False)
+        if not lev_enabled:
+            leverage = 1
+
+        if leverage > 1:
+            try:
+                margin_est = 5.0
+                available_max = self._rest.get_max_leverage(symbol, margin_est * leverage)
+                if available_max < leverage:
+                    leverage = available_max
+                if leverage < 2:
+                    logger.info(f"[SysE] {symbol} max lev {leverage}x too low, skipping")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
+            except Exception as e:
+                logger.warning(f"[SysE] {symbol} max leverage check failed: {e}")
+
+        # 3. Position sizing: bakiye / portfoy_bolen (System A kuralları)
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            try:
+                real_balance = self._order_executor.get_balance()
+            except Exception:
+                pass
+
+        divider = se.get("portfoy_bolen", 12)
+        locked_margin = self._position_mgr.get_total_margin()
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 5.0)
+
+        if wallet >= 12.0:
+            margin_usdt = round(wallet / divider, 2)
+        elif wallet >= 4.0:
+            margin_usdt = 1.0
+        else:
+            margin_usdt = round(wallet / 4, 2)
+
+        if margin_usdt < 0.30:
+            logger.warning(f"[SysE] Margin too low: {margin_usdt}$")
+            return False
+        if real_balance > 0 and margin_usdt > real_balance * 0.95:
+            margin_usdt = round(real_balance * 0.95, 2)
+
+        logger.info(f"[SysE] {symbol} sizing: wallet={wallet:.2f}$ → "
+                    f"margin={margin_usdt}$ × {leverage}x")
+
+        # 4. Set leverage + margin type
+        if leverage > 1:
+            try:
+                self._rest.set_margin_type(symbol, "ISOLATED")
+            except Exception:
+                pass
+            try:
+                self._rest.set_leverage(symbol, leverage)
+            except Exception as e:
+                logger.warning(f"[SysE] set_leverage failed: {e}")
+
+        # 5. Qty precision
+        qty_precision = 3
+        min_notional = 5.0
+        si = None
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    qty_precision = si.quantity_precision
+                    min_notional = si.min_notional
+            except Exception:
+                pass
+
+        notional_usdt = margin_usdt * leverage
+        if notional_usdt < min_notional:
+            needed = min_notional / leverage * 1.05
+            if needed > margin_usdt * 2.0:
+                logger.info(f"[SysE] {symbol} min notional needs {needed:.2f}$, skip")
+                self._failed_symbols[symbol] = time.time()
+                return False
+            margin_usdt = round(needed, 2)
+            notional_usdt = margin_usdt * leverage
+
+        size_qty = round(notional_usdt / price, qty_precision) if price > 0 else 0
+
+        # 6. MARKET giriş (hız önemli — limit bekleme yok)
+        try:
+            if not self._order_executor:
+                logger.error("[SysE] No order executor")
+                return False
+
+            self._order_executor.execute_order(
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.MARKET,
+                size=size_qty,
+                price=price,
+                leverage=leverage,
+                sl_percent=0,  # SL yok, emergency server-side
+                tp_percent=0,
+            )
+        except Exception as e:
+            logger.error(f"[SysE] Order failed for {symbol}: {e}")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # 7. Pozisyonu aç ve server emirlerini yerleştir
+        self._open_position_system_e(
+            symbol, cand, side, price, size_qty, leverage, margin_usdt)
+
+        if self._risk_manager:
+            self._risk_manager.record_order(
+                size_qty, price, margin_usdt=margin_usdt)
+
+        if self._order_logger:
+            self._order_logger.log_order(
+                symbol=symbol, side=side.value, order_type="Market",
+                price=price, size=size_qty,
+                notional_usdt=size_qty * price,
+                status="filled",
+                trigger_source=f"system_e:{cand.score:+.0f}",
+            )
+
+        self._trade_timestamps.append(time.time())
+        return True
+
+    def _open_position_system_e(self, symbol: str, cand: 'SystemEScanResult',
+                                side: OrderSide, price: float,
+                                size_qty: float, leverage: int,
+                                margin_usdt: float) -> None:
+        """System E pozisyonu aç ve server-side emirleri yerleştir."""
+        se = self._config.get("system_e", {})
+
+        # RSI from 5m TF
+        rsi_val = 50.0
+        for sig in cand.tf_signals:
+            if sig.timeframe == "5m":
+                rsi_val = sig.rsi_value
+                break
+
+        # ADX from 1h TF
+        adx_val = 0.0
+        for sig in cand.tf_signals:
+            if sig.timeframe == "1h":
+                adx_val = sig.adx_value
+                break
+
+        pos = self._position_mgr.open_position(
+            symbol=symbol,
+            side=side,
+            price=price,
+            size=size_qty,
+            atr=cand.atr,
+            leverage=leverage,
+            margin_usdt=margin_usdt,
+            timeframe="5m",
+            entry_score=abs(cand.score),
+            entry_confluence=0.0,
+            entry_adx=adx_val,
+            entry_rsi=rsi_val,
+            entry_regime="",
+            entry_regime_confidence=0.0,
+            entry_mode="SYSTEM_E",
+            entry_bb_width=0.0,
+        )
+
+        if not pos:
+            logger.error(f"[SysE] Failed to open position for {symbol}")
+            return
+
+        # Server-side emirleri yerleştir
+        self._place_initial_orders_system_e(symbol, pos, cand, se)
+
+    def _place_initial_orders_system_e(self, symbol: str, pos,
+                                        cand: 'SystemEScanResult',
+                                        se: dict) -> None:
+        """Server-side Emergency SL + Trailing Stop emirleri.
+
+        GARANTİLİ: her iki emir de başarıyla gönderilmeli.
+        - Emergency başarısız → pozisyon kapatılır (korunmasız kalınamaz)
+        - Trailing başarısız → 3 deneme, hâlâ başarısız → uyarı (emergency korur)
+        Placement sonrası Binance API ile doğrulama yapılır.
+        """
+        rest = self._rest
+        if not rest:
+            logger.error(f"[SysE] {symbol}: REST client yok, pozisyon kapatılıyor!")
+            self._emergency_close_system_e(symbol, pos, "no_rest_client")
+            return
+
+        pp = 2
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+            except Exception:
+                pass
+
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        entry_price = pos.entry_price
+        max_retries = 3
+
+        # ═══ 1. Emergency STOP_MARKET (likidasyon %80) — ZORUNLU ═══
+        emergency_pct = cand.emergency_sl_pct / 100.0
+        if pos.side == OrderSide.BUY_LONG:
+            emergency_price = round(entry_price * (1 - emergency_pct), pp)
+        else:
+            emergency_price = round(entry_price * (1 + emergency_pct), pp)
+
+        emergency_placed = False
+        for attempt in range(1, max_retries + 1):
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=pos.size,
+                    stop_price=emergency_price,
+                    reduce_only=True,
+                )
+                emergency_placed = True
+                logger.info(f"[SysE EMRG] {symbol}: STOP_MARKET @ {emergency_price} "
+                            f"(emergency={cand.emergency_sl_pct:.2f}%) [attempt {attempt}]")
+                break
+            except Exception as e:
+                logger.error(f"[SysE EMRG] {symbol}: attempt {attempt}/{max_retries} FAILED: {e}")
+                if attempt < max_retries:
+                    time.sleep(1)  # kısa bekleme, sonra tekrar dene
+
+        if not emergency_placed:
+            # Emergency SL gönderilemedi → pozisyonu kapat (korunmasız kalınamaz)
+            logger.error(f"[SysE EMRG] {symbol}: {max_retries} deneme başarısız! "
+                         f"Pozisyon korunmasız → KAPATILIYOR")
+            self._emergency_close_system_e(symbol, pos, "emergency_sl_failed")
+            return
+
+        # ═══ 2. TRAILING_STOP_MARKET (ROI→fiyat dönüşümü scanner'da yapıldı) ═══
+        # cand.trailing_trigger_pct = ROI%/leverage (fiyat yüzdesi)
+        # cand.trailing_callback_pct = ROI%/leverage (fiyat yüzdesi, 0.1-5.0 arası)
+        trailing_trigger = cand.trailing_trigger_pct   # zaten fiyat %'si
+        trailing_callback = cand.trailing_callback_pct  # zaten fiyat %'si
+
+        # Binance callback sınırı: 0.1% - 5.0% (scanner'da zaten clamp edildi)
+        callback_pct = round(max(0.1, min(trailing_callback, 5.0)), 2)
+
+        se_cfg = self._config.get("system_e", {})
+        roi_trigger = se_cfg.get("trailing_tetik_pct", 50.0)
+        roi_callback = se_cfg.get("trailing_callback_pct", 10.0)
+
+        if pos.side == OrderSide.BUY_LONG:
+            activation_price = round(entry_price * (1 + trailing_trigger / 100), pp)
+        else:
+            activation_price = round(entry_price * (1 - trailing_trigger / 100), pp)
+
+        trailing_placed = False
+        for attempt in range(1, max_retries + 1):
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=pos.size,
+                    callback_rate=callback_pct,
+                    stop_price=activation_price,
+                    reduce_only=True,
+                )
+                trailing_placed = True
+                logger.info(f"[SysE Trail] {symbol}: ROI trigger={roi_trigger}% "
+                            f"→ fiyat={trailing_trigger:.4f}% "
+                            f"ROI callback={roi_callback}% → fiyat={callback_pct}% "
+                            f"activation={activation_price} [attempt {attempt}]")
+                break
+            except Exception as e:
+                logger.error(f"[SysE Trail] {symbol}: attempt {attempt}/{max_retries} FAILED: {e}")
+                if attempt < max_retries:
+                    time.sleep(1)
+
+        if not trailing_placed:
+            logger.error(f"[SysE Trail] {symbol}: {max_retries} deneme başarısız! "
+                         f"Emergency SL aktif ama trailing yok — pozisyon kapatılıyor")
+            self._emergency_close_system_e(symbol, pos, "trailing_failed")
+            return
+
+        # ═══ 3. Doğrulama: Binance'de emirlerin varlığını kontrol et ═══
+        try:
+            time.sleep(0.5)  # API'nin emirleri işlemesi için kısa bekleme
+            open_orders = rest.get_open_orders(symbol=symbol) or []
+
+            has_stop = any(
+                o.get("type") == "STOP_MARKET" and o.get("status") in ("NEW",)
+                for o in open_orders
+            )
+            has_trailing = any(
+                o.get("type") == "TRAILING_STOP_MARKET" and o.get("status") in ("NEW",)
+                for o in open_orders
+            )
+
+            if not has_stop:
+                logger.error(f"[SysE VERIFY] {symbol}: STOP_MARKET doğrulanamadı! "
+                             f"Tekrar gönderiliyor...")
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="STOP_MARKET", quantity=pos.size,
+                        stop_price=emergency_price, reduce_only=True,
+                    )
+                    logger.info(f"[SysE VERIFY] {symbol}: STOP_MARKET tekrar gönderildi")
+                except Exception as e:
+                    logger.error(f"[SysE VERIFY] {symbol}: STOP_MARKET tekrar BAŞARISIZ: {e}")
+                    self._emergency_close_system_e(symbol, pos, "verify_emergency_failed")
+                    return
+
+            if not has_trailing:
+                logger.error(f"[SysE VERIFY] {symbol}: TRAILING_STOP_MARKET doğrulanamadı! "
+                             f"Tekrar gönderiliyor...")
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="TRAILING_STOP_MARKET", quantity=pos.size,
+                        callback_rate=callback_pct, stop_price=activation_price,
+                        reduce_only=True,
+                    )
+                    logger.info(f"[SysE VERIFY] {symbol}: TRAILING tekrar gönderildi")
+                except Exception as e:
+                    logger.error(f"[SysE VERIFY] {symbol}: TRAILING tekrar BAŞARISIZ: {e}")
+                    self._emergency_close_system_e(symbol, pos, "verify_trailing_failed")
+                    return
+
+            logger.info(f"[SysE OK] {symbol}: Emergency SL + Trailing Stop DOĞRULANDI "
+                        f"(STOP={has_stop}, TRAIL={has_trailing})")
+
+        except Exception as e:
+            logger.warning(f"[SysE VERIFY] {symbol}: Doğrulama hatası (emirler "
+                           f"muhtemelen yerinde): {e}")
+
+    def _emergency_close_system_e(self, symbol: str, pos, reason: str) -> None:
+        """System E: server emirleri gönderilemediğinde pozisyonu hemen kapat."""
+        logger.error(f"[SysE CLOSE] {symbol}: Korunmasız pozisyon kapatılıyor "
+                     f"(sebep: {reason})")
+        try:
+            self._rest.cancel_all_orders(symbol)
+        except Exception:
+            pass
+
+        # Güncel fiyatı al
+        close_price = pos.entry_price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            close_price = float(ticker.get("price", close_price))
+        except Exception:
+            pass
+
+        try:
+            close_side = OrderSide.SELL_SHORT if pos.side == OrderSide.BUY_LONG else OrderSide.BUY_LONG
+            if self._order_executor:
+                self._order_executor.execute_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type=OrderType.MARKET,
+                    size=pos.size,
+                    price=close_price,
+                    leverage=pos.leverage,
+                    sl_percent=0,
+                    tp_percent=0,
+                )
+            self._position_mgr.close_position(
+                symbol, exit_price=close_price,
+                reason=f"system_e_{reason}")
+            logger.info(f"[SysE CLOSE] {symbol}: Pozisyon kapatıldı @ {close_price}")
+        except Exception as e:
+            logger.error(f"[SysE CLOSE] {symbol}: Kapatma BAŞARISIZ: {e}")
+
+    def _on_limit_filled_system_e(self, symbol: str, info: dict,
+                                   fill_price: float) -> None:
+        """Handle System E limit order fill: open position + server orders."""
+        cand = info["candidate"]
+
+        self._open_position_system_e(
+            symbol, cand, info["side"], fill_price,
+            info["size"], info["leverage"], info["margin_usdt"])
+
+        if self._risk_manager:
+            self._risk_manager.record_order(
+                info["size"], fill_price, margin_usdt=info["margin_usdt"])
+
+        if self._order_logger:
+            self._order_logger.log_order(
+                symbol=symbol, side=info["side"].value, order_type="Limit",
+                price=fill_price, size=info["size"],
+                notional_usdt=info["size"] * fill_price,
+                status="filled",
+                trigger_source=f"system_e:{cand.score:+.0f}",
+            )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ═══ SYSTEM F — SON KURSUN (Last Bullet)                          ═══
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _do_scanning_system_f(self) -> None:
+        """System F iki katmanli tarama: TAM TARAMA (periyodik) + HIZLI TARAMA (surekli)."""
+
+        # Step 0: Check pending limit orders
+        if self._pending_limits:
+            self._check_pending_limits()
+
+        # Step A: Check held positions
+        if self._position_mgr.has_position:
+            self._check_held_positions()
+
+        self._scan_count += 1
+        sf = self._config.get("system_f", {})
+        max_pos = sf.get("max_pozisyon", 1)
+        self._position_mgr._max_positions = max_pos
+
+        # Tam tarama mi, hizli tarama mi?
+        now = time.time()
+        full_scan_interval = sf.get("full_scan_interval_seconds", 300)
+        needs_full_scan = (
+            now - self._sf_last_full_scan_time >= full_scan_interval
+            or not self._sf_shortlist
+        )
+
+        if needs_full_scan:
+            logger.info(f"[SysF] TAM TARAMA #{self._scan_count} starting... "
+                        f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+            results, eligible = self._do_full_scan_system_f(sf)
+            self._sf_last_full_scan_time = now
+            scan_type = "FULL"
+        else:
+            logger.info(f"[SysF] HIZLI TARAMA #{self._scan_count} "
+                        f"[shortlist: {len(self._sf_shortlist)} coin] "
+                        f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+            results, eligible = self._do_fast_scan_system_f(sf)
+            scan_type = "FAST"
+
+        # Log top 5
+        for i, r in enumerate(results[:5]):
+            logger.info(f"  [SysF] #{r.rank} {r.symbol}: skor={r.composite_score:.0f} "
+                        f"dir={r.direction} uyum={r.aligned_count}/{r.total_tfs} "
+                        f"lev={r.smart_leverage}x EV={r.ev_pct:+.1f}% "
+                        f"P(w)={r.p_win:.0f}% av={r.av_sinifi or '-'} "
+                        f"eligible={r.eligible} reject={r.reject_reason or '-'}")
+
+        logger.info(f"[SysF] {scan_type}: {len(results)} scored, {len(eligible)} eligible, "
+                    f"shortlist={len(self._sf_shortlist)}")
+
+        # Publish for GUI
+        self._event_bus.publish(EventType.SCANNER_UPDATE, {
+            "scan_count": self._scan_count,
+            "total_symbols": len(self._sf_cached_symbols) if self._sf_cached_symbols else len(results),
+            "scored": len(results),
+            "eligible": len(eligible),
+            "mr_scored": 0,
+            "mr_eligible": 0,
+            "positions": self._position_mgr.position_count,
+            "max_positions": max_pos,
+            "system_f": True,
+            "candidate": eligible[0].symbol if eligible else None,
+        })
+
+        # Close-only mode
+        if self._config.get("strategy.close_only", False):
+            if self._position_mgr.has_position:
+                logger.info(f"[SysF] Close-only: monitoring {self._position_mgr.position_count} pos")
+            self._wait(sf.get("scan_interval_seconds", 10))
+            return
+
+        # Filter candidates and buy
+        self._sf_try_buy(eligible, sf, max_pos)
+
+        if scan_type == "FULL":
+            self._wait(5)
+        else:
+            self._wait(sf.get("scan_interval_seconds", 10))
+
+    def _do_full_scan_system_f(self, sf: dict) -> tuple[list, list]:
+        """TAM TARAMA: 50 coin × 6 TF + OB + BTC beta → shortlist olustur."""
+        # 1. Symbol universe
+        coin_sayisi = sf.get("coin_sayisi", 50)
+        self._universe._top_n = coin_sayisi
+        symbols = self._universe.refresh()
+        if not symbols:
+            logger.warning("[SysF] No symbols to scan")
+            return [], []
+        self._sf_cached_symbols = symbols
+
+        # 2. TF kline cek (config'den direction_tfs + 1m tetik)
+        mum_sayisi = sf.get("mum_sayisi", 200)
+        _tf_min_map = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+                       "1h": 60, "2h": 120, "4h": 240, "8h": 480, "12h": 720, "1d": 1440}
+        cfg_dir_tfs = sf.get("direction_tfs", ["5m", "1h", "4h"])
+        fetch_tf_names = ["1m"] + [tf for tf in cfg_dir_tfs if tf != "1m"]
+        fetch_tfs = [(tf, _tf_min_map.get(tf, 5)) for tf in fetch_tf_names]
+        klines_all_tf: dict[str, dict[str, list]] = {sym: {} for sym in symbols}
+        for tf_name, tf_min in fetch_tfs:
+            tf_map = self._fetcher.fetch_batch(symbols, tf_name, mum_sayisi)
+            for sym, klines in tf_map.items():
+                if hasattr(klines, 'values'):
+                    klines_all_tf[sym][tf_name] = klines.values.tolist()
+                else:
+                    klines_all_tf[sym][tf_name] = klines
+
+        # 3. Funding rates
+        market_ctx = self._fetch_funding_rates(symbols)
+
+        # 4. Volume map
+        volume_map = {}
+        try:
+            tickers = self._rest.get_24h_ticker()
+            for t in tickers:
+                s = t.get("symbol", "")
+                if s in klines_all_tf:
+                    volume_map[s] = float(t.get("quoteVolume", 0))
+        except Exception:
+            pass
+
+        # 5. Preliminary scoring → top 15 icin OB cek
+        ob_map = {}
+        preliminary = self._system_f_scanner.score_batch(
+            symbols, klines_all_tf, market_ctx, volume_map,
+            btc_direction="FLAT")
+        top_15 = [r.symbol for r in preliminary[:15]]
+        for sym in top_15:
+            try:
+                depth = self._rest.get_depth(sym, limit=50)
+                if depth:
+                    vol = volume_map.get(sym, 0)
+                    ob_result = self._ob_analyzer.analyze(depth, volume_24h=vol)
+                    ob_map[sym] = ob_result
+            except Exception:
+                pass
+
+        # 6. BTC beta
+        beta_map = {}
+        try:
+            self._btc_corr.refresh()
+            for sym in top_15:
+                beta_map[sym] = self._btc_corr.get_beta(sym)
+        except Exception:
+            pass
+
+        # 6b. BTC direction
+        btc_direction = "FLAT"
+        try:
+            btc_klines = self._fetcher.fetch_single("BTCUSDT", "1h", 30)
+            if btc_klines is not None:
+                if hasattr(btc_klines, 'values'):
+                    btc_klines = btc_klines.values.tolist()
+                if len(btc_klines) >= 25:
+                    import numpy as _np
+                    btc_closes = _np.array([float(k[4]) for k in btc_klines])
+                    k9 = 2.0 / 10
+                    k21 = 2.0 / 22
+                    ema9 = float(btc_closes[0])
+                    ema21 = float(btc_closes[0])
+                    for v in btc_closes[1:]:
+                        ema9 = v * k9 + ema9 * (1 - k9)
+                        ema21 = v * k21 + ema21 * (1 - k21)
+                    gap_pct = (ema9 - ema21) / float(btc_closes[-1]) * 100
+                    if gap_pct > 0.05:
+                        btc_direction = "LONG"
+                    elif gap_pct < -0.05:
+                        btc_direction = "SHORT"
+                    logger.info(f"[SysF] BTC direction: {btc_direction} (gap={gap_pct:.3f}%)")
+        except Exception as e:
+            logger.warning(f"[SysF] BTC direction check failed: {e}")
+
+        # 7. Final scoring
+        results = self._system_f_scanner.score_batch(
+            symbols, klines_all_tf, market_ctx, volume_map, ob_map, beta_map,
+            btc_direction=btc_direction)
+
+        # 8. Cache verilerini sakla (15m haric — hizli taramada taze cekilir)
+        self._sf_cached_klines = {}
+        for sym in symbols:
+            cached_tf = {}
+            sym_data = klines_all_tf.get(sym, {})
+            for tf in ("1h", "4h", "1d"):
+                if tf in sym_data:
+                    cached_tf[tf] = sym_data[tf]
+            if cached_tf:
+                self._sf_cached_klines[sym] = cached_tf
+        self._sf_cached_market_ctx = market_ctx
+        self._sf_cached_ob_map = ob_map
+        self._sf_cached_beta_map = beta_map
+        self._sf_cached_btc_direction = btc_direction
+        self._sf_cached_volume_map = volume_map
+
+        # 9. Shortlist olustur
+        self._sf_shortlist = self._build_sf_shortlist(results, sf)
+        self._sf_last_full_results = list(results)
+        self._last_system_f_results = results
+
+        eligible = [r for r in results if r.eligible]
+        return results, eligible
+
+    def _do_fast_scan_system_f(self, sf: dict) -> tuple[list, list]:
+        """HIZLI TARAMA: sadece shortlist coinler × 1m + 5m, cache'li ust TF verileriyle."""
+        shortlist = self._sf_shortlist
+        if not shortlist:
+            return self._sf_last_full_results, []
+
+        mum_sayisi = sf.get("mum_sayisi", 200)
+
+        # Taze cek: 1m (tetik) + direction TF'lerden kisa olanlar
+        cfg_dir_tfs = sf.get("direction_tfs", ["5m", "1h", "4h"])
+        _tf_min_map = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+                       "1h": 60, "2h": 120, "4h": 240, "8h": 480, "12h": 720, "1d": 1440}
+        # 30dk ve altindaki TF'ler taze cekilir, ustundekiler cache'den gelir
+        fresh_tfs = ["1m"] + [tf for tf in cfg_dir_tfs
+                              if _tf_min_map.get(tf, 5) <= 30 and tf != "1m"]
+        cached_tfs = [tf for tf in cfg_dir_tfs if _tf_min_map.get(tf, 5) > 30]
+
+        klines_all_tf: dict[str, dict[str, list]] = {}
+        for tf_name in fresh_tfs:
+            tf_map = self._fetcher.fetch_batch(shortlist, tf_name, mum_sayisi)
+            for sym, klines in tf_map.items():
+                if sym not in klines_all_tf:
+                    klines_all_tf[sym] = {}
+                if hasattr(klines, 'values'):
+                    klines_all_tf[sym][tf_name] = klines.values.tolist()
+                else:
+                    klines_all_tf[sym][tf_name] = klines
+
+        # Cache'li ust TF verilerini birlestir (yavas degisir)
+        for sym in shortlist:
+            if sym not in klines_all_tf:
+                klines_all_tf[sym] = {}
+            cached = self._sf_cached_klines.get(sym, {})
+            for tf in cached_tfs:
+                if tf in cached:
+                    klines_all_tf[sym][tf] = cached[tf]
+
+        # Shortlist icin OB guncelle (hizli — az coin)
+        ob_map = dict(self._sf_cached_ob_map)
+        if sf.get("fast_scan_ob_refresh", True):
+            for sym in shortlist:
+                try:
+                    depth = self._rest.get_depth(sym, limit=50)
+                    if depth:
+                        vol = self._sf_cached_volume_map.get(sym, 0)
+                        ob_result = self._ob_analyzer.analyze(depth, volume_24h=vol)
+                        ob_map[sym] = ob_result
+                except Exception:
+                    pass
+
+        # BTC yonu taze cek (tek API call — btc_ reject'li coinler icin kritik)
+        btc_direction = self._sf_cached_btc_direction
+        try:
+            btc_klines = self._fetcher.fetch_single("BTCUSDT", "1h", 30)
+            if btc_klines is not None:
+                if hasattr(btc_klines, 'values'):
+                    btc_klines = btc_klines.values.tolist()
+                if len(btc_klines) >= 25:
+                    import numpy as _np
+                    btc_closes = _np.array([float(k[4]) for k in btc_klines])
+                    k9 = 2.0 / 10
+                    k21 = 2.0 / 22
+                    ema9 = float(btc_closes[0])
+                    ema21 = float(btc_closes[0])
+                    for v in btc_closes[1:]:
+                        ema9 = v * k9 + ema9 * (1 - k9)
+                        ema21 = v * k21 + ema21 * (1 - k21)
+                    gap_pct = (ema9 - ema21) / float(btc_closes[-1]) * 100
+                    if gap_pct > 0.05:
+                        btc_direction = "LONG"
+                    elif gap_pct < -0.05:
+                        btc_direction = "SHORT"
+                    else:
+                        btc_direction = "FLAT"
+                    self._sf_cached_btc_direction = btc_direction
+        except Exception:
+            pass
+
+        # Skorla
+        fast_results = self._system_f_scanner.score_batch(
+            shortlist, klines_all_tf,
+            self._sf_cached_market_ctx,
+            self._sf_cached_volume_map,
+            ob_map,
+            self._sf_cached_beta_map,
+            btc_direction=btc_direction)
+
+        # GUI icin: tam sonuclarin uzerine hizli sonuclari yaz
+        result_map = {r.symbol: r for r in self._sf_last_full_results}
+        for r in fast_results:
+            result_map[r.symbol] = r
+        merged = sorted(result_map.values(),
+                        key=lambda r: (not r.eligible, -r.composite_score))
+
+        self._last_system_f_results = merged
+        eligible = [r for r in merged if r.eligible]
+        return merged, eligible
+
+    def _build_sf_shortlist(self, results: list, sf: dict) -> list[str]:
+        """Tam tarama sonuclarindan hizli tarama icin aday listesi olustur.
+
+        Kriter: eligible + 4+/5 uyum + hizli degisen sebeple reddedilen + yuksek skor.
+        """
+        max_shortlist = sf.get("shortlist_size", 10)
+        fast_prefixes = (
+            "no_spike", "score_", "ev_", "p_sl_",
+            "weak_", "vol_filter_", "thin_book", "spread_",
+            "wall_", "ob_against_", "btc_", "mixed_", "beta_",
+        )
+        shortlist = []
+
+        for r in results:
+            if r.eligible:
+                shortlist.append(r.symbol)
+            elif r.aligned_count >= 4 and r.direction != "SKIP":
+                shortlist.append(r.symbol)
+            elif any(r.reject_reason.startswith(p) for p in fast_prefixes):
+                shortlist.append(r.symbol)
+            elif r.composite_score >= 70:
+                shortlist.append(r.symbol)
+
+            if len(shortlist) >= max_shortlist:
+                break
+
+        logger.info(f"[SysF] Shortlist: {len(shortlist)} coin — {shortlist}")
+        return shortlist
+
+    def _sf_try_buy(self, eligible: list, sf: dict, max_pos: int) -> None:
+        """Eligible adaylardan en iyisini sec ve al."""
+        now = time.time()
+        self._failed_symbols = {
+            s: t for s, t in self._failed_symbols.items()
+            if now - t < self._failed_cooldown
+        }
+
+        candidates = []
+        for r in eligible:
+            if r.symbol in self._failed_symbols:
+                continue
+            if self._position_mgr.is_holding(r.symbol):
+                continue
+            if r.symbol in self._pending_limits:
+                continue
+            coin_ok, coin_reason = self._check_coin_daily_ban(r.symbol)
+            if not coin_ok:
+                continue
+            candidates.append(r)
+
+        if not candidates or not self._position_mgr.has_capacity:
+            return
+
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            try:
+                real_balance = self._order_executor.get_balance()
+            except Exception:
+                pass
+        if real_balance > 0 and real_balance < 0.10:
+            logger.info(f"[SysF] Balance too low ({real_balance:.4f}$)")
+            return
+
+        cand = candidates[0]
+        total_occupied = self._position_mgr.position_count + len(self._pending_limits)
+        if total_occupied < max_pos:
+            if self._check_trade_frequency():
+                logger.info(f"[SysF] SON KURSUN: {cand.symbol} skor={cand.composite_score:.0f} "
+                            f"dir={cand.direction} lev={cand.smart_leverage}x "
+                            f"EV={cand.ev_pct:+.1f}% P(w)={cand.p_win:.0f}% "
+                            f"TP={cand.dynamic_tp_roi:.1f}% av={cand.av_sinifi}")
+                self._do_buying_system_f(cand)
+
+    def _do_buying_system_f(self, cand: 'SystemFScanResult') -> bool:
+        """System F pozisyon acma: akilli kaldirac, market giris, SL + trailing."""
+        symbol = cand.symbol
+        direction = cand.direction
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        sf = self._config.get("system_f", {})
+
+        # 1. Fresh price
+        price = cand.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # 2. Smart leverage
+        leverage = cand.smart_leverage
+        lev_enabled = self._config.get("leverage.enabled", False)
+        if not lev_enabled:
+            leverage = 1
+
+        if leverage > 1:
+            try:
+                margin_est = 5.0
+                available_max = self._rest.get_max_leverage(symbol, margin_est * leverage)
+                if available_max < leverage:
+                    leverage = available_max
+                if leverage < 2:
+                    logger.info(f"[SysF] {symbol} max lev {leverage}x too low, skipping")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
+            except Exception as e:
+                logger.warning(f"[SysF] {symbol} max leverage check failed: {e}")
+
+        # 3. Position sizing: ALL-IN (tek pozisyon — bakiyenin %95'i)
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            try:
+                real_balance = self._order_executor.get_balance()
+            except Exception:
+                pass
+
+        locked_margin = self._position_mgr.get_total_margin()
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 0.49)
+
+        # All-in: bakiyenin %95'i (kucuk tampon birak)
+        margin_usdt = round(real_balance * 0.95, 4) if real_balance > 0 else round(wallet * 0.95, 4)
+
+        if margin_usdt < 0.10:
+            logger.warning(f"[SysF] Margin too low: {margin_usdt}$")
+            return False
+
+        logger.info(f"[SysF] {symbol} sizing: wallet={wallet:.4f}$ → "
+                    f"margin={margin_usdt:.4f}$ x {leverage}x")
+
+        # 4. Set leverage + margin type
+        if leverage > 1:
+            try:
+                self._rest.set_margin_type(symbol, "ISOLATED")
+            except Exception:
+                pass
+            try:
+                self._rest.set_leverage(symbol, leverage)
+            except Exception as e:
+                logger.warning(f"[SysF] set_leverage failed: {e}")
+
+        # 5. Qty precision
+        qty_precision = 3
+        min_notional = 5.0
+        si = None
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    qty_precision = si.quantity_precision
+                    min_notional = si.min_notional
+            except Exception:
+                pass
+
+        notional_usdt = margin_usdt * leverage
+        if notional_usdt < min_notional:
+            needed = min_notional / leverage * 1.05
+            if needed > margin_usdt * 2.0:
+                logger.info(f"[SysF] {symbol} min notional needs {needed:.4f}$, skip")
+                self._failed_symbols[symbol] = time.time()
+                return False
+            margin_usdt = round(needed, 4)
+            notional_usdt = margin_usdt * leverage
+
+        size_qty = round(notional_usdt / price, qty_precision) if price > 0 else 0
+
+        # 6. MARKET giris (hiz kritik — limit bekleme yok)
+        try:
+            if not self._order_executor:
+                logger.error("[SysF] No order executor")
+                return False
+
+            self._order_executor.execute_order(
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.MARKET,
+                size=size_qty,
+                price=price,
+                leverage=leverage,
+                sl_percent=0,  # SL server-side ayri gonderilecek
+                tp_percent=0,
+            )
+        except Exception as e:
+            logger.error(f"[SysF] Order failed for {symbol}: {e}")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # 7. Pozisyonu ac ve server emirlerini yerlestir
+        self._open_position_system_f(
+            symbol, cand, side, price, size_qty, leverage, margin_usdt)
+
+        if self._risk_manager:
+            self._risk_manager.record_order(
+                size_qty, price, margin_usdt=margin_usdt)
+
+        if self._order_logger:
+            self._order_logger.log_order(
+                symbol=symbol, side=side.value, order_type="Market",
+                price=price, size=size_qty,
+                notional_usdt=size_qty * price,
+                status="filled",
+                trigger_source=f"system_f:{cand.composite_score:.0f}",
+            )
+
+        self._trade_timestamps.append(time.time())
+        return True
+
+    def _open_position_system_f(self, symbol: str, cand: 'SystemFScanResult',
+                                 side: OrderSide, price: float,
+                                 size_qty: float, leverage: int,
+                                 margin_usdt: float) -> None:
+        """System F pozisyonu ac ve server-side emirleri yerlestir."""
+        sf = self._config.get("system_f", {})
+
+        # RSI from 5m TF
+        rsi_val = 50.0
+        for sig in cand.tf_signals:
+            if sig.timeframe == "5m":
+                rsi_val = sig.rsi_value
+                break
+
+        # ADX from 1h TF
+        adx_val = 0.0
+        for sig in cand.tf_signals:
+            if sig.timeframe == "1h":
+                adx_val = sig.adx_value
+                break
+
+        # Dynamic TP price hesapla (software yedek: avg_fwd × mult)
+        software_tp_mult = sf.get("software_tp_mult", 2.0)
+        software_tp_pct = cand.dynamic_tp_pct * software_tp_mult
+        if cand.direction == "LONG":
+            dynamic_tp_price = price * (1 + software_tp_pct / 100)
+        else:
+            dynamic_tp_price = price * (1 - software_tp_pct / 100)
+
+        pos = self._position_mgr.open_position(
+            symbol=symbol,
+            side=side,
+            price=price,
+            size=size_qty,
+            atr=cand.atr,
+            leverage=leverage,
+            margin_usdt=margin_usdt,
+            timeframe="5m",
+            entry_score=cand.composite_score,
+            entry_confluence=0.0,
+            entry_adx=adx_val,
+            entry_rsi=rsi_val,
+            entry_regime=f"SYS_F_{cand.av_sinifi}",
+            entry_regime_confidence=cand.direction_strength,
+            entry_mode="SYSTEM_F",
+            entry_bb_width=cand.sl_pct,
+            mr_tp_price=dynamic_tp_price,
+        )
+
+        if not pos:
+            logger.error(f"[SysF] Failed to open position for {symbol}")
+            return
+
+        # Server-side emirleri yerlestir
+        self._place_initial_orders_system_f(symbol, pos, cand, sf)
+
+    def _place_initial_orders_system_f(self, symbol: str, pos,
+                                         cand: 'SystemFScanResult',
+                                         sf: dict) -> None:
+        """Server-side SL (1.5xATR) + Emergency + Trailing emirleri.
+
+        GARANTILI: SL ve emergency basarili olmali.
+        - SL basarisiz → pozisyon kapatilir
+        - Emergency basarisiz → uyari (SL korur)
+        - Trailing basarisiz → uyari (SL + emergency korur)
+        """
+        rest = self._rest
+        if not rest:
+            logger.error(f"[SysF] {symbol}: REST client yok, pozisyon kapatiliyor!")
+            self._emergency_close_system_f(symbol, pos, "no_rest_client")
+            return
+
+        pp = 2
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+            except Exception:
+                pass
+
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        entry_price = pos.entry_price
+        max_retries = 3
+
+        # ═══ 1. STOP_MARKET (SL: 1.5xATR + fee) — ZORUNLU ═══
+        sl_pct = cand.sl_pct / 100.0
+        if pos.side == OrderSide.BUY_LONG:
+            sl_price = round(entry_price * (1 - sl_pct), pp)
+        else:
+            sl_price = round(entry_price * (1 + sl_pct), pp)
+
+        sl_placed = False
+        for attempt in range(1, max_retries + 1):
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=pos.size,
+                    stop_price=sl_price,
+                    reduce_only=True,
+                )
+                sl_placed = True
+                logger.info(f"[SysF SL] {symbol}: STOP_MARKET @ {sl_price} "
+                            f"(SL={cand.sl_pct:.2f}%) [attempt {attempt}]")
+                break
+            except Exception as e:
+                logger.error(f"[SysF SL] {symbol}: attempt {attempt}/{max_retries} FAILED: {e}")
+                if attempt < max_retries:
+                    time.sleep(1)
+
+        if not sl_placed:
+            logger.error(f"[SysF SL] {symbol}: SL gonderilemedi! Pozisyon KAPATILIYOR")
+            self._emergency_close_system_f(symbol, pos, "sl_failed")
+            return
+
+        # ═══ 2. STOP_MARKET (Emergency: likidasyon %80) — YEDEK ═══
+        emergency_pct = cand.emergency_sl_pct / 100.0
+        if pos.side == OrderSide.BUY_LONG:
+            emergency_price = round(entry_price * (1 - emergency_pct), pp)
+        else:
+            emergency_price = round(entry_price * (1 + emergency_pct), pp)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=pos.size,
+                    stop_price=emergency_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysF EMRG] {symbol}: STOP_MARKET @ {emergency_price} "
+                            f"(emergency={cand.emergency_sl_pct:.2f}%) [attempt {attempt}]")
+                break
+            except Exception as e:
+                logger.error(f"[SysF EMRG] {symbol}: attempt {attempt}/{max_retries} FAILED: {e}")
+                if attempt < max_retries:
+                    time.sleep(1)
+
+        # ═══ 3. TRAILING_STOP_MARKET (dinamik TP + swing trailing) ═══
+        trailing_trigger = cand.trailing_trigger_pct   # swing forward avg (fiyat %)
+        trailing_callback = cand.trailing_callback_pct  # swing retrace × 0.8 (fiyat %)
+        callback_pct = round(max(0.1, min(trailing_callback, 5.0)), 2)
+
+        if pos.side == OrderSide.BUY_LONG:
+            activation_price = round(entry_price * (1 + trailing_trigger / 100), pp)
+        else:
+            activation_price = round(entry_price * (1 - trailing_trigger / 100), pp)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=pos.size,
+                    callback_rate=callback_pct,
+                    stop_price=activation_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysF Trail] {symbol}: swing-TP fiyat={trailing_trigger:.3f}% "
+                            f"(ROI={cand.dynamic_tp_roi:.1f}%) callback={callback_pct}% "
+                            f"activation={activation_price} av={cand.av_sinifi} "
+                            f"[attempt {attempt}]")
+                break
+            except Exception as e:
+                logger.error(f"[SysF Trail] {symbol}: attempt {attempt}/{max_retries} FAILED: {e}")
+                if attempt < max_retries:
+                    time.sleep(1)
+
+        # ═══ 4. Dogrulama ═══
+        try:
+            time.sleep(0.5)
+            open_orders = rest.get_open_orders(symbol=symbol) or []
+
+            has_stop = any(
+                o.get("type") == "STOP_MARKET" and o.get("status") in ("NEW",)
+                for o in open_orders
+            )
+            if not has_stop:
+                logger.error(f"[SysF VERIFY] {symbol}: STOP_MARKET dogrulanamadi!")
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="STOP_MARKET", quantity=pos.size,
+                        stop_price=sl_price, reduce_only=True,
+                    )
+                except Exception as e:
+                    logger.error(f"[SysF VERIFY] {symbol}: SL tekrar BASARISIZ: {e}")
+                    self._emergency_close_system_f(symbol, pos, "verify_sl_failed")
+                    return
+
+            logger.info(f"[SysF OK] {symbol}: SL + Emergency + Trailing DOGRULANDI")
+
+        except Exception as e:
+            logger.warning(f"[SysF VERIFY] {symbol}: Dogrulama hatasi: {e}")
+
+    def _execute_partial_tp_system_f(self, symbol: str, current_price: float) -> None:
+        """System F partial TP: %50 kapat + server emirlerini guncelle.
+
+        Generic _execute_partial_tp'den fark:
+        1. close_pct'yi system_f config'inden okur (strategy'den degil)
+        2. Partial close sonrasi server emirlerini (SL + emergency + trailing)
+           iptal edip kalan miktar icin yeniden gonderir
+        """
+        pos = self._position_mgr.get_position(symbol)
+        if not pos:
+            return
+
+        sf = self._config.get("system_f", {})
+        close_pct = sf.get("stage1_close_pct", 0.5)
+
+        # Qty precision
+        qty_precision = 3
+        if self._symbol_info_cache:
+            try:
+                sym_info = self._symbol_info_cache.get(symbol)
+                if sym_info:
+                    qty_precision = sym_info.quantity_precision
+            except Exception:
+                pass
+
+        close_size = round(pos.size * close_pct, qty_precision)
+        if close_size <= 0:
+            logger.warning(f"[SysF PARTIAL] {symbol}: close_size=0, skipping")
+            pos.partial_tp_taken = False
+            return
+
+        remaining = round(pos.size - close_size, qty_precision)
+        if remaining <= 0:
+            # Kalan yok, tamamen kapat
+            logger.info(f"[SysF PARTIAL] {symbol}: remaining=0, full close")
+            self._sell_position(symbol, current_price, "system_f_full_tp")
+            return
+
+        # 1. Pozisyonun yarisini market emirle kapat
+        close_side = (OrderSide.SELL_SHORT if pos.side == OrderSide.BUY_LONG
+                      else OrderSide.BUY_LONG)
+
+        success = False
+        if self._order_executor:
+            try:
+                if hasattr(self._order_executor, "close_position"):
+                    success = self._order_executor.close_position(
+                        symbol, pos.side, close_size,
+                        limit_exit=False, limit_offset_pct=0.0)
+                else:
+                    success = self._order_executor.execute_order(
+                        symbol=symbol, side=close_side,
+                        order_type=OrderType.MARKET,
+                        size=close_size, reduce_only=True,
+                        qty_precision=qty_precision,
+                    )
+            except Exception as e:
+                logger.error(f"[SysF PARTIAL] {symbol}: order failed: {e}")
+
+        if not success:
+            pos.partial_tp_taken = False
+            logger.warning(f"[SysF PARTIAL] {symbol}: close failed, will retry")
+            return
+
+        # 2. Pozisyon boyutunu guncelle
+        self._position_mgr.update_position_size(symbol, remaining)
+
+        pnl_pct = self._position_mgr._get_pnl_pct(pos, current_price)
+        logger.info(f"[SysF PARTIAL] {symbol}: Stage 1 kapatildi — "
+                    f"{close_pct*100:.0f}% ({close_size} qty) @ ROI={pnl_pct:+.1f}%, "
+                    f"kalan {remaining} qty")
+
+        if self._order_logger:
+            self._order_logger.log_order(
+                symbol=symbol, side=close_side.value,
+                order_type="Market",
+                price=current_price, size=close_size,
+                notional_usdt=close_size * current_price,
+                status="filled",
+                trigger_source="system_f_partial_tp",
+            )
+
+        # 3. Server emirlerini iptal et ve kalan miktar icin yeniden gonder
+        rest = self._rest
+        if not rest:
+            logger.warning(f"[SysF PARTIAL] {symbol}: REST yok, server emirleri guncellenemedi")
+            return
+
+        try:
+            rest.cancel_all_orders(symbol)
+            logger.info(f"[SysF PARTIAL] {symbol}: eski server emirleri iptal edildi")
+        except Exception as e:
+            logger.error(f"[SysF PARTIAL] {symbol}: cancel_all failed: {e}")
+
+        # 4. Kalan miktar icin yeni SL + trailing gonder
+        pp = 2
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+            except Exception:
+                pass
+
+        close_side_str = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        entry_price = pos.entry_price
+
+        # SL: orijinal SL fiyatini koru ama kalan miktar ile
+        sl_pct_val = pos.entry_bb_width / 100.0  # entry_bb_width = sl_pct
+        if sl_pct_val > 0:
+            if pos.side == OrderSide.BUY_LONG:
+                sl_price = round(entry_price * (1 - sl_pct_val), pp)
+            else:
+                sl_price = round(entry_price * (1 + sl_pct_val), pp)
+
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side_str,
+                    order_type="STOP_MARKET", quantity=remaining,
+                    stop_price=sl_price, reduce_only=True,
+                )
+                logger.info(f"[SysF PARTIAL] {symbol}: yeni SL @ {sl_price} "
+                            f"(qty={remaining})")
+            except Exception as e:
+                logger.error(f"[SysF PARTIAL] {symbol}: yeni SL FAILED: {e}")
+
+        # Trailing: mevcut kardan itibaren daha siki trailing
+        trailing_callback_roi = sf.get("stage2_callback_roi_pct", 5.0)
+        lev = pos.leverage if pos.leverage > 0 else 1
+        callback_price_pct = trailing_callback_roi / lev
+        callback_pct = round(max(0.1, min(callback_price_pct, 5.0)), 2)
+
+        # Activation: simdi zaten karda, mevcut fiyattan itibaren aktif olsun
+        try:
+            rest.place_order(
+                symbol=symbol, side=close_side_str,
+                order_type="TRAILING_STOP_MARKET", quantity=remaining,
+                callback_rate=callback_pct,
+                stop_price=round(current_price, pp),
+                reduce_only=True,
+            )
+            logger.info(f"[SysF PARTIAL] {symbol}: yeni trailing — "
+                        f"callback={callback_pct}% (ROI {trailing_callback_roi}%) "
+                        f"activation=current_price={current_price}")
+        except Exception as e:
+            logger.error(f"[SysF PARTIAL] {symbol}: yeni trailing FAILED: {e}")
+
+    def _emergency_close_system_f(self, symbol: str, pos, reason: str) -> None:
+        """System F: server emirleri gonderilemediginde pozisyonu hemen kapat."""
+        logger.error(f"[SysF CLOSE] {symbol}: Korunmasiz pozisyon kapatiliyor "
+                     f"(sebep: {reason})")
+        try:
+            self._rest.cancel_all_orders(symbol)
+        except Exception:
+            pass
+
+        # Guncel fiyati al
+        current_price = pos.entry_price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            current_price = float(ticker.get("price", current_price))
+        except Exception:
+            pass
+
+        # Market emirle kapat
+        close_side = (OrderSide.SELL_SHORT if pos.side == OrderSide.BUY_LONG
+                      else OrderSide.BUY_LONG)
+        try:
+            if self._order_executor:
+                if hasattr(self._order_executor, "close_position"):
+                    self._order_executor.close_position(
+                        symbol, pos.side, pos.size,
+                        limit_exit=False, limit_offset_pct=0.0)
+                else:
+                    self._order_executor.execute_order(
+                        symbol=symbol, side=close_side,
+                        order_type=OrderType.MARKET,
+                        size=pos.size, price=current_price,
+                        leverage=pos.leverage,
+                        sl_percent=0, tp_percent=0,
+                    )
+        except Exception as e:
+            logger.error(f"[SysF CLOSE] {symbol}: Kapatma BASARISIZ: {e}")
+
+        # Remove position
+        self._position_mgr.close_position(
+            symbol, current_price,
+            reason=f"system_f_{reason}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ═══ SYSTEM G — PER-COIN OPTIMIZED TRADING                         ═══
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _do_scanning_system_g(self) -> None:
+        """System G: sinyal tara + eligible coinler icin async optimizasyon."""
+        if self._pending_limits:
+            self._check_pending_limits()
+        if self._position_mgr.has_position:
+            self._check_held_positions()
+
+        self._scan_count += 1
+        sg = self._config.get("system_g", {})
+        pos_cfg = sg.get("position", {})
+        max_pos = pos_cfg.get("max_pozisyon", 12)
+        self._position_mgr._max_positions = max_pos
+
+        # Full scan vs fast scan
+        now = time.time()
+        full_interval = sg.get("full_scan_interval_seconds", 300)
+        needs_full = (now - self._sg_last_full_scan_time >= full_interval
+                      or not self._sg_shortlist)
+
+        if needs_full:
+            logger.info(f"[SysG] TAM TARAMA #{self._scan_count} "
+                        f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+            results, eligible = self._do_full_scan_system_g(sg)
+            self._sg_last_full_scan_time = now
+        else:
+            logger.info(f"[SysG] HIZLI TARAMA #{self._scan_count} "
+                        f"[shortlist: {len(self._sg_shortlist)}] "
+                        f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+            results, eligible = self._do_fast_scan_system_g(sg)
+
+        self._last_system_g_results = results
+
+        # Log top 5
+        for r in results[:5]:
+            logger.info(f"  [SysG] #{r.rank} {r.symbol}: dir={r.direction} "
+                        f"uyum={r.aligned_count}/{r.total_tfs} "
+                        f"opt={r.opt_status} "
+                        f"lev={r.smart_leverage}x "
+                        f"bt_roi={r.backtest_roi:+.1f}% "
+                        f"eligible={r.eligible} reject={r.reject_reason or '-'}")
+
+        logger.info(f"[SysG] {len(results)} scored, {len(eligible)} eligible")
+
+        # Publish for GUI
+        self._event_bus.publish(EventType.SCANNER_UPDATE, {
+            "scan_count": self._scan_count,
+            "total_symbols": len(self._sg_cached_symbols) if self._sg_cached_symbols else len(results),
+            "scored": len(results),
+            "eligible": len(eligible),
+            "mr_scored": 0, "mr_eligible": 0,
+            "positions": self._position_mgr.position_count,
+            "max_positions": max_pos,
+            "system_g": True,
+            "candidate": eligible[0].symbol if eligible else None,
+        })
+
+        if self._config.get("strategy.close_only", False):
+            self._wait(sg.get("scan_interval_seconds", 10))
+            return
+
+        # Try to buy best candidate
+        self._sg_try_buy(eligible, sg, max_pos)
+        self._wait(sg.get("scan_interval_seconds", 10))
+
+    def _do_full_scan_system_g(self, sg: dict) -> tuple[list, list]:
+        """Full scan: fetch all TFs + submit optimizations for eligible coins."""
+        coin_sayisi = sg.get("coin_sayisi", 50)
+        self._universe._top_n = coin_sayisi
+        symbols = self._universe.refresh()
+        if not symbols:
+            return [], []
+        self._sg_cached_symbols = symbols
+
+        # Fetch klines
+        mum_sayisi = sg.get("mum_sayisi", 200)
+        cfg_dir_tfs = sg.get("direction_tfs", ["5m", "1h", "4h"])
+        _tf_min_map = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                       "1h": 60, "2h": 120, "4h": 240, "1d": 1440}
+        fetch_tfs = [(tf, _tf_min_map.get(tf, 5)) for tf in cfg_dir_tfs]
+
+        klines_all_tf: dict[str, dict[str, list]] = {sym: {} for sym in symbols}
+        for tf_name, tf_min in fetch_tfs:
+            tf_map = self._fetcher.fetch_batch(symbols, tf_name, mum_sayisi)
+            for sym, klines in tf_map.items():
+                if hasattr(klines, 'values'):
+                    klines_all_tf[sym][tf_name] = klines.values.tolist()
+                else:
+                    klines_all_tf[sym][tf_name] = klines
+
+        # Cache klines for fast scan
+        self._sg_cached_klines = klines_all_tf
+
+        # Funding rates
+        market_ctx = self._fetch_funding_rates(symbols)
+
+        # Volume map
+        volume_map = {}
+        try:
+            tickers = self._rest.get_24h_ticker()
+            for t in tickers:
+                s = t.get("symbol", "")
+                if s in klines_all_tf:
+                    volume_map[s] = float(t.get("quoteVolume", 0))
+        except Exception:
+            pass
+        self._sg_cached_volume_map = volume_map
+
+        # BTC direction
+        btc_direction = "FLAT"
+        try:
+            btc_klines = self._fetcher.fetch_single("BTCUSDT", "1h", 30)
+            if btc_klines is not None:
+                if hasattr(btc_klines, 'values'):
+                    btc_klines = btc_klines.values.tolist()
+                if len(btc_klines) >= 25:
+                    from scanner.system_g_scanner import SystemGScanner
+                    btc_ind = self._system_g_scanner._analyze_tf(btc_klines, "1h", sg)
+                    btc_direction = btc_ind.strict_direction
+        except Exception:
+            pass
+        self._sg_cached_btc_direction = btc_direction
+
+        # Score all
+        results = self._system_g_scanner.score_batch(
+            symbols, klines_all_tf, market_ctx, volume_map,
+            {}, {}, btc_direction)
+
+        # For eligible coins: check optimization cache or submit async
+        eligible = []
+        shortlist = []
+        for r in results:
+            if not r.eligible:
+                continue
+
+            shortlist.append(r.symbol)
+
+            # Check optimization cache
+            cache = self._system_g_scanner.get_cached(r.symbol)
+            if cache and cache.direction == r.direction:
+                r.opt_status = "CACHED"
+                r.opt_result = cache.best
+                r.smart_leverage = cache.best.combo.leverage
+                r.tp_pct = cache.best.combo.tp_pct
+                r.sl_pct = cache.best.combo.sl_pct
+                r.sl_mode = cache.best.combo.sl_mode
+                r.backtest_roi = cache.best.total_roi
+                r.backtest_wr = cache.best.win_rate
+                r.backtest_liq_rate = cache.best.liq_rate
+                r.composite_score = cache.best.score
+                if cache.best.total_roi > 0:
+                    eligible.append(r)
+                else:
+                    r.reject_reason = f"bt_roi_neg_{cache.best.total_roi:.0f}"
+            else:
+                # Submit async optimization — need 30d of 5m data
+                r.opt_status = "PENDING"
+                opt_days = sg.get("optimization", {}).get("days_back", 30)
+                try:
+                    from backtest.data_fetcher import fetch_klines
+                    from datetime import datetime, timedelta, timezone
+                    now_dt = datetime.now(timezone.utc)
+                    end_ms = int(now_dt.timestamp() * 1000)
+                    start_ms = int((now_dt - timedelta(days=opt_days)).timestamp() * 1000)
+                    warmup_ms = 200 * 5 * 60000
+                    kl_5m_30d = fetch_klines(r.symbol, "5m", start_ms - warmup_ms, end_ms)
+                    if kl_5m_30d and len(kl_5m_30d) >= 200:
+                        self._system_g_scanner.submit_optimization(
+                            r.symbol, r.direction, kl_5m_30d)
+                except Exception as e:
+                    logger.error(f"[SysG] Failed to fetch 5m data for {r.symbol}: {e}")
+                    r.opt_status = "FAILED"
+
+        self._sg_shortlist = shortlist[:10]
+
+        eligible.sort(key=lambda r: -r.composite_score)
+        return results, eligible
+
+    def _do_fast_scan_system_g(self, sg: dict) -> tuple[list, list]:
+        """Fast scan: check shortlist + check pending optimizations."""
+        shortlist = self._sg_shortlist
+        if not shortlist:
+            return self._last_system_g_results, []
+
+        mum_sayisi = sg.get("mum_sayisi", 200)
+        cfg_dir_tfs = sg.get("direction_tfs", ["5m", "1h", "4h"])
+        _tf_min_map = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+        fresh_tfs = [tf for tf in cfg_dir_tfs if _tf_min_map.get(tf, 5) <= 30]
+        cached_tfs = [tf for tf in cfg_dir_tfs if _tf_min_map.get(tf, 5) > 30]
+
+        klines_all_tf: dict[str, dict[str, list]] = {}
+        for tf_name in fresh_tfs:
+            tf_map = self._fetcher.fetch_batch(shortlist, tf_name, mum_sayisi)
+            for sym, klines in tf_map.items():
+                if sym not in klines_all_tf:
+                    klines_all_tf[sym] = {}
+                if hasattr(klines, 'values'):
+                    klines_all_tf[sym][tf_name] = klines.values.tolist()
+                else:
+                    klines_all_tf[sym][tf_name] = klines
+
+        for sym in shortlist:
+            if sym not in klines_all_tf:
+                klines_all_tf[sym] = {}
+            cached = self._sg_cached_klines.get(sym, {})
+            for tf in cached_tfs:
+                if tf in cached:
+                    klines_all_tf[sym][tf] = cached[tf]
+
+        results = self._system_g_scanner.score_batch(
+            shortlist, klines_all_tf, {}, self._sg_cached_volume_map,
+            {}, {}, self._sg_cached_btc_direction)
+
+        # Check pending optimizations
+        eligible = []
+        for r in results:
+            if not r.eligible:
+                continue
+
+            # Check if optimization completed
+            opt = self._system_g_scanner.check_optimization(r.symbol)
+            if opt:
+                r.opt_status = "FRESH"
+                r.opt_result = opt
+                r.smart_leverage = opt.combo.leverage
+                r.tp_pct = opt.combo.tp_pct
+                r.sl_pct = opt.combo.sl_pct
+                r.sl_mode = opt.combo.sl_mode
+                r.backtest_roi = opt.total_roi
+                r.backtest_wr = opt.win_rate
+                r.backtest_liq_rate = opt.liq_rate
+                r.composite_score = opt.score
+                if opt.total_roi > 0:
+                    eligible.append(r)
+            else:
+                cache = self._system_g_scanner.get_cached(r.symbol)
+                if cache and cache.direction == r.direction and cache.best.total_roi > 0:
+                    r.opt_status = "CACHED"
+                    r.opt_result = cache.best
+                    r.smart_leverage = cache.best.combo.leverage
+                    r.tp_pct = cache.best.combo.tp_pct
+                    r.sl_pct = cache.best.combo.sl_pct
+                    r.sl_mode = cache.best.combo.sl_mode
+                    r.backtest_roi = cache.best.total_roi
+                    r.backtest_wr = cache.best.win_rate
+                    r.composite_score = cache.best.score
+                    eligible.append(r)
+                else:
+                    r.opt_status = "PENDING"
+
+        eligible.sort(key=lambda r: -r.composite_score)
+        return results, eligible
+
+    def _sg_try_buy(self, eligible: list, sg: dict, max_pos: int) -> None:
+        """Select best candidate and buy."""
+        now = time.time()
+        self._failed_symbols = {
+            s: t for s, t in self._failed_symbols.items()
+            if now - t < self._failed_cooldown
+        }
+
+        pos_cfg = sg.get("position", {})
+        max_per_coin = pos_cfg.get("max_per_coin", 1)
+        cooldown_min = pos_cfg.get("cooldown_after_liq_minutes", 60)
+
+        candidates = []
+        for r in eligible:
+            if r.symbol in self._failed_symbols:
+                continue
+            if self._position_mgr.is_holding(r.symbol):
+                continue
+            if r.symbol in self._pending_limits:
+                continue
+            if r.opt_status not in ("CACHED", "FRESH"):
+                continue
+            if r.backtest_roi <= 0:
+                continue
+            candidates.append(r)
+
+        if not candidates or not self._position_mgr.has_capacity:
+            return
+
+        # Balance check
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            try:
+                real_balance = self._order_executor.get_balance()
+            except Exception:
+                pass
+        if real_balance > 0 and real_balance < 0.10:
+            logger.info(f"[SysG] Balance too low ({real_balance:.4f}$)")
+            return
+
+        cand = candidates[0]
+        total_occupied = self._position_mgr.position_count + len(self._pending_limits)
+        if total_occupied < max_pos:
+            if self._check_trade_frequency():
+                sl_str = "YOK" if cand.sl_mode == "no_sl" else f"{cand.sl_pct}%"
+                logger.info(f"[SysG] GIRIS: {cand.symbol} {cand.direction} "
+                            f"lev={cand.smart_leverage}x TP={cand.tp_pct}% SL={sl_str} "
+                            f"bt_roi={cand.backtest_roi:+.1f}% bt_wr={cand.backtest_wr:.0f}% "
+                            f"score={cand.composite_score:.1f}")
+                self._do_buying_system_g(cand)
+
+    def _do_buying_system_g(self, cand: SystemGScanResult) -> bool:
+        """System G pozisyon acma: optimized leverage, market giris."""
+        symbol = cand.symbol
+        direction = cand.direction
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        sg = self._config.get("system_g", {})
+        pos_cfg = sg.get("position", {})
+
+        # Fresh price
+        price = cand.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # Optimized leverage
+        leverage = cand.smart_leverage
+        lev_enabled = self._config.get("leverage.enabled", False)
+        if not lev_enabled:
+            leverage = 1
+
+        if leverage > 1:
+            try:
+                margin_est = 5.0
+                available_max = self._rest.get_max_leverage(symbol, margin_est * leverage)
+                if available_max < leverage:
+                    leverage = available_max
+                if leverage < 2:
+                    logger.info(f"[SysG] {symbol} max lev {leverage}x too low, skip")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
+            except Exception as e:
+                logger.warning(f"[SysG] {symbol} max leverage check failed: {e}")
+
+        # Position sizing: wallet / divider
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            try:
+                real_balance = self._order_executor.get_balance()
+            except Exception:
+                pass
+
+        locked_margin = self._position_mgr.get_total_margin()
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 0.49)
+
+        divider = pos_cfg.get("portfolio_divider", 12)
+        margin_usdt = round(wallet / divider, 4)
+
+        if margin_usdt < 0.10:
+            logger.warning(f"[SysG] Margin too low: {margin_usdt}$")
+            return False
+
+        logger.info(f"[SysG] {symbol} sizing: wallet={wallet:.4f}$ / {divider} = "
+                    f"{margin_usdt:.4f}$ x {leverage}x")
+
+        # Set leverage + margin type
+        if leverage > 1:
+            try:
+                self._rest.set_margin_type(symbol, "ISOLATED")
+            except Exception:
+                pass
+            try:
+                self._rest.set_leverage(symbol, leverage)
+            except Exception as e:
+                logger.warning(f"[SysG] set_leverage failed: {e}")
+
+        # Qty precision
+        qty_precision = 3
+        min_notional = 5.0
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    qty_precision = si.quantity_precision
+                    min_notional = si.min_notional
+            except Exception:
+                pass
+
+        notional_usdt = margin_usdt * leverage
+        if notional_usdt < min_notional:
+            needed = min_notional / leverage * 1.05
+            if needed > margin_usdt * 2.0:
+                self._failed_symbols[symbol] = time.time()
+                return False
+            margin_usdt = round(needed, 4)
+            notional_usdt = margin_usdt * leverage
+
+        size_qty = round(notional_usdt / price, qty_precision) if price > 0 else 0
+
+        # MARKET entry
+        try:
+            if not self._order_executor:
+                return False
+            self._order_executor.execute_order(
+                symbol=symbol, side=side,
+                order_type=OrderType.MARKET,
+                size=size_qty, price=price,
+                leverage=leverage, sl_percent=0, tp_percent=0,
+            )
+        except Exception as e:
+            logger.error(f"[SysG] Order failed for {symbol}: {e}")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # Open position
+        pos = self._position_mgr.open_position(
+            symbol=symbol, side=side, price=price,
+            size=size_qty, atr=cand.atr_pct * price / 100 if cand.atr_pct > 0 else 0,
+            leverage=leverage, margin_usdt=margin_usdt,
+            timeframe="5m",
+            entry_score=cand.composite_score,
+            entry_confluence=0.0,
+            entry_adx=0.0,
+            entry_rsi=50.0,
+            entry_regime=f"SYS_G_{cand.sl_mode}",
+            entry_regime_confidence=cand.direction_strength,
+            entry_mode="SYSTEM_G",
+            entry_bb_width=cand.sl_pct,  # store SL% here
+            mr_tp_price=0.0,
+        )
+
+        if not pos:
+            logger.error(f"[SysG] Failed to open position for {symbol}")
+            return False
+
+        # Server-side orders
+        self._place_initial_orders_system_g(symbol, pos, cand, sg)
+
+        if self._risk_manager:
+            self._risk_manager.record_order(size_qty, price, margin_usdt=margin_usdt)
+
+        self._trade_timestamps.append(time.time())
+        return True
+
+    def _place_initial_orders_system_g(self, symbol: str, pos,
+                                         cand: SystemGScanResult,
+                                         sg: dict) -> None:
+        """Server-side TP + emergency (+ optional SL) emirleri."""
+        try:
+            direction = cand.direction
+            price = pos.entry_price
+            size_qty = pos.size
+            leverage = pos.leverage
+            pos_cfg = sg.get("position", {})
+
+            # Emergency SL: liq mesafesinin %80'i
+            liq_factor = pos_cfg.get("liq_carpani", 0.7)
+            emrg_pct = pos_cfg.get("emergency_liq_pct", 80) / 100.0
+            liq_dist = (1.0 / leverage) * liq_factor * 100
+            emrg_dist = liq_dist * emrg_pct
+
+            if direction == "LONG":
+                emrg_price = round(price * (1 - emrg_dist / 100), 2)
+            else:
+                emrg_price = round(price * (1 + emrg_dist / 100), 2)
+
+            # Place emergency STOP_MARKET
+            emrg_side = "SELL" if direction == "LONG" else "BUY"
+            try:
+                self._rest.place_algo_order(
+                    symbol=symbol, side=emrg_side, type="STOP_MARKET",
+                    quantity=size_qty, stopPrice=emrg_price,
+                    timeInForce="GTE_GTC")
+                logger.info(f"[SysG] Emergency SL: {emrg_price} ({emrg_dist:.2f}%)")
+            except Exception as e:
+                logger.error(f"[SysG] Emergency order failed: {e}")
+
+            # SL (if sl_mode != no_sl)
+            if cand.sl_mode != "no_sl" and cand.sl_pct > 0:
+                if direction == "LONG":
+                    sl_price = round(price * (1 - cand.sl_pct / 100), 2)
+                else:
+                    sl_price = round(price * (1 + cand.sl_pct / 100), 2)
+                try:
+                    self._rest.place_algo_order(
+                        symbol=symbol, side=emrg_side, type="STOP_MARKET",
+                        quantity=size_qty, stopPrice=sl_price,
+                        timeInForce="GTE_GTC")
+                    logger.info(f"[SysG] SL: {sl_price} ({cand.sl_pct}%)")
+                except Exception as e:
+                    logger.error(f"[SysG] SL order failed: {e}")
+
+            # TP: TAKE_PROFIT_MARKET
+            if cand.tp_pct > 0:
+                if direction == "LONG":
+                    tp_price = round(price * (1 + cand.tp_pct / 100), 2)
+                else:
+                    tp_price = round(price * (1 - cand.tp_pct / 100), 2)
+                tp_side = "SELL" if direction == "LONG" else "BUY"
+                try:
+                    self._rest.place_algo_order(
+                        symbol=symbol, side=tp_side, type="TAKE_PROFIT_MARKET",
+                        quantity=size_qty, stopPrice=tp_price,
+                        timeInForce="GTE_GTC")
+                    logger.info(f"[SysG] TP: {tp_price} ({cand.tp_pct}%)")
+                except Exception as e:
+                    logger.error(f"[SysG] TP order failed: {e}")
+
+        except Exception as e:
+            logger.error(f"[SysG] _place_initial_orders failed: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # SYSTEM H — Hibrit Sistem (A + B + D + F)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _do_scanning_system_h(self) -> None:
+        """System H tarama döngüsü:
+        Faz 1: Sabit TF'de 50 coin skorla (A gibi)
+        Faz 2: Finalist coinler için Zoom Diyafram → G → kaldıraç
+        Faz 3: ER+Hurst rejim tespiti
+        Faz 4: P(win)/EV skor çarpanı
+        """
+        from scanner.system_h_scanner import ZOOM_TF_LADDER
+
+        # Step 0: Check pending limit orders
+        if self._pending_limits:
+            self._check_pending_limits()
+
+        # Step A: Check held positions
+        if self._position_mgr.has_position:
+            self._check_held_positions()
+
+        self._scan_count += 1
+        sh = self._config.get("system_h", {})
+        strat = self._config.get("strategy", {})
+        max_pos = sh.get("max_positions", strat.get("max_positions", 12))
+        self._position_mgr._max_positions = max_pos
+
+        logger.info(f"[SysH] Scan #{self._scan_count} starting... "
+                    f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+
+        # ── FAZ 1: Sabit TF'de tüm coinleri skorla (A gibi) ──
+
+        # 1. Symbol universe
+        coin_sayisi = sh.get("coin_sayisi", 50)
+        self._universe._top_n = coin_sayisi
+        symbols = self._universe.refresh()
+        if not symbols:
+            logger.warning("[SysH] No symbols to scan")
+            self._stop_event.wait(timeout=10)
+            return
+
+        # 2. Kline fetch — sabit TF (skorlama için)
+        scan_tf = sh.get("scan_timeframe", strat.get("kline_interval", "5m"))
+        kline_limit = sh.get("kline_limit", strat.get("kline_limit", 200))
+        klines_map = self._fetcher.fetch_batch(symbols, scan_tf, kline_limit)
+
+        # 3. Funding rates
+        market_ctx = self._fetch_funding_rates(symbols)
+
+        # 4. Ticker data
+        ticker_data = {}
+        try:
+            tickers = self._rest.get_24h_ticker()
+            for t in tickers:
+                s = t.get("symbol", "")
+                if s in klines_map:
+                    ticker_data[s] = {
+                        "volume_24h": float(t.get("quoteVolume", 0)),
+                        "price_change_pct": float(t.get("priceChangePercent", 0)),
+                    }
+        except Exception:
+            pass
+
+        # 5. BTC correlation check
+        btc_ok = True
+        if strat.get("btc_correlation_enabled", False):
+            try:
+                self._btc_corr.update()
+            except Exception:
+                pass
+
+        # 6. Orderbook analysis for top symbols (pre-scoring)
+        ob_map = {}
+        try:
+            pre_score_count = min(15, len(symbols))
+            for sym in symbols[:pre_score_count]:
+                depth = self._rest.get_depth(sym, limit=20)
+                if depth:
+                    analysis = self._ob_analyzer.analyze(depth)
+                    ob_map[sym] = analysis
+        except Exception:
+            pass
+
+        # Build market context map with OB data
+        ctx_map = {}
+        for sym in symbols:
+            ctx = market_ctx.get(sym, {})
+            if sym in ob_map:
+                ctx.update(ob_map[sym])
+            if ctx:
+                ctx_map[sym] = ctx
+
+        # 7. Score all symbols (Faz 1 — sabit TF, sıralama amaçlı)
+        results = self._system_h_scanner.score_batch(klines_map, ticker_data, ctx_map)
+        self._last_system_h_results = results
+
+        eligible = [r for r in results if r.eligible]
+
+        # Log top 5
+        for r in results[:5]:
+            logger.info(f"  [SysH F1] {r.symbol}: score={r.score:+.1f} "
+                        f"dir={r.direction} rsi={r.rsi:.0f} adx={r.adx:.0f} "
+                        f"eligible={r.eligible} reject={r.reject_reason or '-'}")
+
+        logger.info(f"[SysH] Faz 1: {len(results)} total, {len(eligible)} eligible")
+
+        # Publish for GUI
+        self._event_bus.publish(EventType.SCANNER_UPDATE, {
+            "scan_count": self._scan_count,
+            "total_symbols": len(symbols),
+            "scored": len(results),
+            "eligible": len(eligible),
+            "mr_scored": 0,
+            "mr_eligible": 0,
+            "positions": self._position_mgr.position_count,
+            "max_positions": max_pos,
+            "system_h": True,
+            "candidate": eligible[0].symbol if eligible else None,
+        })
+
+        # Close-only mode
+        if strat.get("close_only", False):
+            self._wait(sh.get("scan_interval_seconds", 30))
+            return
+
+        # ── FAZ 2+3+4: Finalist coinler için Zoom + Rejim + EV ──
+
+        now = time.time()
+        self._failed_symbols = {
+            s: t for s, t in self._failed_symbols.items()
+            if now - t < self._failed_cooldown
+        }
+        self._loss_cooldown_symbols = {
+            s: t for s, t in self._loss_cooldown_symbols.items()
+            if now - t < self._loss_cooldown_seconds
+        }
+
+        # Direction balance
+        yon_denge = sh.get("direction_balance_enabled",
+                           strat.get("direction_balance_enabled", True))
+        yon_oran = sh.get("direction_balance_ratio",
+                          strat.get("direction_balance_ratio", "2-1"))
+        try:
+            yon_parts = yon_oran.split("-")
+            yon_majority, yon_minority = int(yon_parts[0]), int(yon_parts[1])
+        except (ValueError, IndexError):
+            yon_majority, yon_minority = 2, 1
+
+        # Filter candidates (pre-zoom)
+        candidates = []
+        for r in eligible:
+            if r.symbol in self._failed_symbols:
+                continue
+            if self._position_mgr.is_holding(r.symbol):
+                continue
+            if r.symbol in self._pending_limits:
+                continue
+            if r.symbol in self._loss_cooldown_symbols:
+                continue
+            coin_ok, _ = self._check_coin_daily_ban(r.symbol)
+            if not coin_ok:
+                continue
+            if yon_denge:
+                dir_count = self._count_direction(r.direction)
+                max_ayni = sh.get("max_same_direction", 8)
+                if dir_count >= max_ayni:
+                    continue
+                opp_dir = "SHORT" if r.direction == "LONG" else "LONG"
+                opp_count = self._count_direction(opp_dir)
+                if dir_count >= yon_majority * (opp_count // yon_minority + 1):
+                    continue
+            candidates.append(r)
+
+        # Top N finalist → Zoom Diyafram uygula
+        max_finalists = sh.get("max_finalists", 5)
+        finalists = candidates[:max_finalists]
+
+        # BTC yön bilgisini hesapla (beta filtresi için)
+        btc_direction = "FLAT"
+        if sh.get("btc_beta_filter_enabled", False):
+            try:
+                btc_kl = self._fetcher.fetch_batch(["BTCUSDT"], "1h", 30)
+                btc_klines = btc_kl.get("BTCUSDT")
+                if btc_klines is not None and len(btc_klines) >= 20:
+                    if hasattr(btc_klines, 'values'):
+                        btc_closes = [float(r[4]) for r in btc_klines.values.tolist()]
+                    else:
+                        btc_closes = [float(k[4]) for k in btc_klines]
+                    if btc_closes[-1] > btc_closes[-10]:
+                        btc_direction = "LONG"
+                    elif btc_closes[-1] < btc_closes[-10]:
+                        btc_direction = "SHORT"
+            except Exception:
+                pass
+            # Beta: basit korelasyon tahmini (coin return vs BTC return)
+            for cand in finalists:
+                cand.btc_direction = btc_direction
+                cand.btc_beta = 0.8  # varsayılan yüksek korelasyon
+
+        if finalists:
+            # Zoom TF'leri fetch et (sadece finalist coinler için — API tasarrufu)
+            mum_sayisi = sh.get("zoom_kline_limit", 200)
+            finalist_symbols = [f.symbol for f in finalists]
+
+            klines_zoom_all: dict[str, dict[str, list]] = {sym: {} for sym in finalist_symbols}
+            for tf_name, tf_min in ZOOM_TF_LADDER:
+                tf_map = self._fetcher.fetch_batch(finalist_symbols, tf_name, mum_sayisi)
+                for sym, klines in tf_map.items():
+                    if hasattr(klines, 'values'):
+                        klines_zoom_all[sym][tf_name] = klines.values.tolist()
+                    else:
+                        klines_zoom_all[sym][tf_name] = klines
+
+            for cand in finalists:
+                sym = cand.symbol
+                klines_by_tf = klines_zoom_all.get(sym, {})
+
+                if not klines_by_tf:
+                    continue
+
+                # Faz 2: Zoom Diyafram → G → kaldıraç/SL/TP
+                self._system_h_scanner.enrich_with_zoom(cand, klines_by_tf)
+
+                if not cand.eligible:
+                    logger.info(f"  [SysH F2] {sym}: REJECTED after zoom: {cand.reject_reason}")
+                    continue
+
+                # Faz 2.5a: Climax filtresi (opsiyonel — F'den)
+                if sh.get("climax_filter_enabled", False):
+                    kl_zoom_climax = klines_by_tf.get(cand.zoom.optimal_tf, [])
+                    if self._system_h_scanner.check_volume_climax(
+                            kl_zoom_climax, cand.direction, sh):
+                        cand.eligible = False
+                        cand.reject_reason = "volume_climax"
+                        cand.climax_detected = True
+                        logger.info(f"  [SysH F2.5] {sym}: REJECTED climax detected")
+                        continue
+
+                # Faz 2.5b: BTC Beta filtresi (opsiyonel — F'den)
+                if sh.get("btc_beta_filter_enabled", False):
+                    btc_beta_val = cand.btc_beta
+                    btc_dir_val = cand.btc_direction
+                    if self._system_h_scanner.check_btc_beta_conflict(
+                            cand.direction, btc_beta_val, btc_dir_val, sh):
+                        cand.eligible = False
+                        cand.reject_reason = f"btc_beta_{btc_dir_val}"
+                        logger.info(f"  [SysH F2.5] {sym}: REJECTED btc_beta "
+                                    f"conflict (beta={btc_beta_val:.2f} btc={btc_dir_val})")
+                        continue
+
+                # Faz 2.5c: Per-coin optimizer (opsiyonel — G'den)
+                if sh.get("optimizer_enabled", False):
+                    opt_cache = self._system_h_scanner.get_opt_cached(sym)
+                    if opt_cache:
+                        self._system_h_scanner.apply_optimizer_result(cand, opt_cache.best)
+                        cand.opt_status = "CACHED"
+                    else:
+                        opt_done = self._system_h_scanner.check_optimization(sym)
+                        if opt_done:
+                            self._system_h_scanner.apply_optimizer_result(cand, opt_done)
+                            cand.opt_status = "FRESH"
+                        else:
+                            kl_5m_opt = klines_by_tf.get("5m", [])
+                            if kl_5m_opt and len(kl_5m_opt) >= 200:
+                                self._system_h_scanner.submit_optimization(
+                                    sym, cand.direction, kl_5m_opt)
+                                cand.opt_status = "PENDING"
+                            else:
+                                cand.opt_status = "NONE"
+
+                # Faz 3: ER+Hurst rejim tespiti
+                zoom = cand.zoom
+                kl_macro = klines_by_tf.get(zoom.macro_tf, [])
+                kl_micro = klines_by_tf.get(zoom.optimal_tf, [])
+
+                # Convert lists to DataFrames for ER+Hurst functions
+                if kl_macro and isinstance(kl_macro, list):
+                    import pandas as _pd
+                    cols = ["open_time", "open", "high", "low", "close", "volume"]
+                    if len(kl_macro[0]) > 6:
+                        cols += [f"c{i}" for i in range(6, len(kl_macro[0]))]
+                    kl_macro_df = _pd.DataFrame(kl_macro, columns=cols[:len(kl_macro[0])])
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        if c in kl_macro_df.columns:
+                            kl_macro_df[c] = kl_macro_df[c].astype(float)
+                else:
+                    kl_macro_df = kl_macro
+
+                if kl_micro and isinstance(kl_micro, list):
+                    import pandas as _pd
+                    cols = ["open_time", "open", "high", "low", "close", "volume"]
+                    if len(kl_micro[0]) > 6:
+                        cols += [f"c{i}" for i in range(6, len(kl_micro[0]))]
+                    kl_micro_df = _pd.DataFrame(kl_micro, columns=cols[:len(kl_micro[0])])
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        if c in kl_micro_df.columns:
+                            kl_micro_df[c] = kl_micro_df[c].astype(float)
+                else:
+                    kl_micro_df = kl_micro
+
+                regime_h = self._system_h_scanner.compute_regime_er_hurst(
+                    sym, kl_macro_df, kl_micro_df)
+                cand.regime_h = regime_h
+                cand.regime_zone = self._system_h_scanner.regime_to_zone(regime_h)
+
+                # Rejim UNDECIDED ise, GRAY zone olarak devam et (eleme yapma)
+                logger.info(f"  [SysH F3] {sym}: ER+Hurst regime={regime_h.regime} "
+                            f"zone={cand.regime_zone} er_macro={regime_h.er_macro:.3f} "
+                            f"er_micro={regime_h.er_micro:.3f} hurst={regime_h.hurst:.3f}")
+
+                # Faz 4: P(win)/EV (Zoom TF verilerinden — bedava)
+                kl_zoom_tf = klines_by_tf.get(zoom.optimal_tf, [])
+                self._system_h_scanner.compute_probability(cand, kl_zoom_tf)
+
+                prob = cand.probability
+
+                # Faz 5: H-specific final skor (A'nın 4 bileşeni yerine 5 bileşen)
+                self._system_h_scanner.compute_final_score(cand)
+
+                logger.info(f"  [SysH F4-5] {sym}: P(win)={prob.p_win:.2f} "
+                            f"EV={prob.ev_pct:.1f}% "
+                            f"final_score={cand.score:+.1f} "
+                            f"G={cand.G:.3f}% lev={cand.leverage}x "
+                            f"SL={cand.sl_pct:.2f}% trail={cand.trailing_trigger_pct:.2f}% "
+                            f"opt={cand.opt_status}")
+
+        # ── BUYING: en iyi finalistten satın al ──
+
+        # Re-sort finalists by updated score
+        buy_candidates = [c for c in finalists if c.eligible and c.G > 0]
+        buy_candidates.sort(key=lambda c: abs(c.score), reverse=True)
+
+        bought_any = False
+        if buy_candidates and self._position_mgr.has_capacity:
+            # Balance check
+            real_balance = 0.0
+            if self._order_executor and hasattr(self._order_executor, "get_balance"):
+                try:
+                    real_balance = self._order_executor.get_balance()
+                except Exception:
+                    pass
+            if real_balance > 0 and real_balance < 0.30:
+                logger.info(f"[SysH] Balance too low ({real_balance:.2f}$)")
+                self._wait(60)
+                return
+
+            min_score = sh.get("min_buy_score", strat.get("min_buy_score", 55))
+
+            for cand in buy_candidates:
+                total_occupied = self._position_mgr.position_count + len(self._pending_limits)
+                if total_occupied >= max_pos:
+                    break
+                if not self._check_trade_frequency():
+                    break
+                if abs(cand.score) < min_score:
+                    break
+
+                logger.info(f"[SysH] BUY candidate: {cand.symbol} score={cand.score:+.1f} "
+                            f"dir={cand.direction} G={cand.G:.3f}% lev={cand.leverage}x "
+                            f"SL={cand.sl_pct:.2f}% zone={cand.regime_zone}")
+
+                if self._do_buying_system_h(cand):
+                    bought_any = True
+
+        if bought_any:
+            self._wait(5)
+        else:
+            self._wait(sh.get("scan_interval_seconds",
+                               strat.get("scan_interval_seconds", 30)))
+
+    def _do_buying_system_h(self, cand: 'SystemHScanResult') -> bool:
+        """System H pozisyon açma: G bazlı kaldıraç, limit emir (ATR offset)."""
+        symbol = cand.symbol
+        direction = cand.direction
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        sh = self._config.get("system_h", {})
+        strat = self._config.get("strategy", {})
+
+        # 1. Fresh price
+        price = cand.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # 2. Leverage (G bazlı, user max ile sınırlı)
+        leverage = cand.leverage
+        lev_enabled = self._config.get("leverage.enabled", False)
+        if not lev_enabled:
+            leverage = 1
+
+        # Binance max leverage kontrolü
+        if leverage > 1:
+            try:
+                margin_est = 5.0
+                available_max = self._rest.get_max_leverage(symbol, margin_est * leverage)
+                if available_max < leverage:
+                    leverage = available_max
+                if leverage < sh.get("min_leverage", 2):
+                    logger.info(f"[SysH] {symbol} max lev {leverage}x < min, skipping")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
+            except Exception as e:
+                logger.warning(f"[SysH] {symbol} max leverage check failed: {e}")
+
+        # 3. Position sizing: bakiye / portfoy_bolen (A'dan)
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            try:
+                real_balance = self._order_executor.get_balance()
+            except Exception:
+                pass
+
+        divider = sh.get("portfolio_divider", strat.get("portfolio_divider", 12))
+        locked_margin = self._position_mgr.get_total_margin()
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 5.0)
+
+        if wallet >= 12.0:
+            margin_usdt = round(wallet / divider, 2)
+        elif wallet >= 4.0:
+            margin_usdt = 1.0
+        else:
+            margin_usdt = round(wallet / 4, 2)
+
+        if margin_usdt < 0.30:
+            logger.warning(f"[SysH] Margin too low: {margin_usdt}$ (wallet={wallet:.2f}$)")
+            return False
+        if real_balance > 0 and margin_usdt > real_balance * 0.95:
+            margin_usdt = round(real_balance * 0.95, 2)
+
+        logger.info(f"[SysH] {symbol} sizing: wallet={wallet:.2f}$ → "
+                    f"margin={margin_usdt}$ × {leverage}x")
+
+        # 4. Set leverage + margin type
+        if leverage > 1:
+            try:
+                self._rest.set_margin_type(symbol, "ISOLATED")
+            except Exception:
+                pass
+            try:
+                self._rest.set_leverage(symbol, leverage)
+            except Exception as e:
+                logger.warning(f"[SysH] set_leverage failed: {e}")
+
+        # 5. Qty precision + tick size
+        qty_precision = 3
+        min_notional = 5.0
+        si = None
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    qty_precision = si.quantity_precision
+                    min_notional = si.min_notional
+            except Exception:
+                pass
+
+        notional_usdt = margin_usdt * leverage
+        if notional_usdt < min_notional:
+            needed = min_notional / leverage * 1.05
+            if needed > margin_usdt * 2.0:
+                logger.info(f"[SysH] {symbol} min notional needs {needed:.2f}$ > 2x target, skip")
+                self._failed_symbols[symbol] = time.time()
+                return False
+            margin_usdt = round(needed, 2)
+            notional_usdt = margin_usdt * leverage
+
+        size_qty = round(notional_usdt / price, qty_precision) if price > 0 else 0
+
+        # 6. Entry: Limit emir (ATR offset — kısa vadeli gürültü için ATR kullanılır)
+        atr_offset = sh.get("limit_atr_offset", strat.get("limit_atr_offset", 0.15))
+        atr = cand.atr
+        offset_amount = atr * atr_offset
+
+        if side == OrderSide.BUY_LONG:
+            limit_price = price - offset_amount
+        else:
+            limit_price = price + offset_amount
+
+        # Tick size validation
+        if si:
+            limit_price = si.validate_price(limit_price)
+        else:
+            limit_price = round(limit_price, 4)
+
+        timeout_s = sh.get("limit_timeout_seconds",
+                           strat.get("limit_timeout_seconds", 300))
+
+        # 6b. Min SL mesafesi kontrolü (fee+spread koruması)
+        fee_rate = sh.get("fee_rate", 0.0004)
+        fee_roundtrip = fee_rate * 2 * 100
+        spread_est = fee_roundtrip * 0.5
+        min_sl_pct = 3.0 * (fee_roundtrip + spread_est)
+        if cand.sl_pct < min_sl_pct:
+            logger.warning(f"[SysH] {symbol} SL too tight "
+                           f"(SL={cand.sl_pct:.3f}% < min={min_sl_pct:.3f}%). Skipping.")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # 7. Execute order
+        try:
+            if not self._order_executor:
+                logger.error("[SysH] No order executor")
+                return False
+
+            self._order_executor.execute_order(
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.LIMIT,
+                size=size_qty,
+                price=limit_price,
+                leverage=leverage,
+                sl_percent=0,
+                tp_percent=0,
+            )
+        except Exception as e:
+            logger.error(f"[SysH] Order failed for {symbol}: {e}")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+        # 8. Track as pending limit
+        self._pending_limits[symbol] = {
+            "order_id": None,
+            "limit_price": limit_price,
+            "side": side,
+            "direction": direction,
+            "size": size_qty,
+            "atr": atr,
+            "candidate": cand,
+            "leverage": leverage,
+            "lev_enabled": lev_enabled,
+            "margin_usdt": margin_usdt,
+            "placed_time": time.time(),
+            "timeout": timeout_s,
+            "qty_precision": qty_precision,
+            "entry_mode": "SYSTEM_H",
+        }
+
+        logger.info(f"[SysH] Limit order placed: {symbol} {direction} "
+                    f"@ {limit_price} (offset={offset_amount:.6f}) "
+                    f"size={size_qty} lev={leverage}x G={cand.G:.3f}% "
+                    f"SL={cand.sl_pct:.2f}% timeout={timeout_s}s")
+
+        self._trade_timestamps.append(time.time())
+        return True
+
+    def _on_limit_filled_system_h(self, symbol: str, info: dict,
+                                   fill_price: float) -> None:
+        """System H limit order fill: pozisyon aç + server emirleri yerleştir."""
+        cand = info["candidate"]
+
+        self._open_position_system_h(
+            symbol, cand, info["side"], fill_price,
+            info["size"], info["leverage"], info["margin_usdt"])
+
+        if self._risk_manager:
+            self._risk_manager.record_order(
+                info["size"], fill_price,
+                margin_usdt=info["margin_usdt"],
+            )
+
+        if self._order_logger:
+            self._order_logger.log_order(
+                symbol=symbol, side=info["side"].value, order_type="Limit",
+                price=fill_price, size=info["size"],
+                notional_usdt=info["size"] * fill_price,
+                status="filled",
+                trigger_source=f"system_h:{cand.score:+.0f}",
+            )
+
+        self._event_bus.publish(EventType.ORDER_PLACED, {
+            "symbol": symbol, "side": info["side"].value,
+            "size": info["size"], "price": fill_price,
+            "order_type": "SYSTEM_H_LIMIT_FILLED",
+        })
+
+    def _open_position_system_h(self, symbol: str, cand: 'SystemHScanResult',
+                                side: OrderSide, price: float,
+                                size_qty: float, leverage: int,
+                                margin_usdt: float) -> None:
+        """System H pozisyonu aç ve server-side emirleri yerleştir."""
+        sh = self._config.get("system_h", {})
+
+        pos = self._position_mgr.open_position(
+            symbol=symbol,
+            side=side,
+            price=price,
+            size=size_qty,
+            atr=cand.atr,
+            leverage=leverage,
+            margin_usdt=margin_usdt,
+            timeframe=cand.zoom.optimal_tf if cand.zoom else "5m",
+            entry_score=abs(cand.score),
+            entry_confluence=cand.confluence.get("score", 0) if hasattr(cand.confluence, 'get') else 0,
+            entry_adx=cand.adx,
+            entry_rsi=cand.rsi,
+            entry_regime=cand.regime_zone or "",
+            entry_regime_confidence=cand.regime_h.confidence if cand.regime_h else 0,
+            entry_mode="SYSTEM_H",
+            entry_bb_width=cand.G,  # G değeri → SL/trailing override için
+        )
+
+        if not pos:
+            logger.error(f"[SysH] Failed to open position for {symbol}")
+            return
+
+        self._place_initial_orders_system_h(symbol, pos, cand, sh)
+
+    def _place_initial_orders_system_h(self, symbol: str, pos,
+                                        cand: 'SystemHScanResult',
+                                        sh: dict) -> None:
+        """Server-side SL + trailing/TP emirleri (G bazlı)."""
+        rest = self._rest
+        if not rest:
+            return
+
+        pp = 2
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+            except Exception:
+                pass
+
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        entry_price = pos.entry_price
+
+        # 1. SL emri (STOP_MARKET) — G bazlı
+        sl_pct = cand.sl_pct
+        if pos.side == OrderSide.BUY_LONG:
+            sl_price = round(entry_price * (1 - sl_pct / 100), pp)
+        else:
+            sl_price = round(entry_price * (1 + sl_pct / 100), pp)
+
+        try:
+            rest.place_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="STOP_MARKET",
+                quantity=pos.size,
+                stop_price=sl_price,
+                reduce_only=True,
+            )
+            logger.info(f"[SysH SL] {symbol}: STOP_MARKET @ {sl_price} "
+                        f"(SL={sl_pct:.2f}%, G={cand.G:.3f}%)")
+        except Exception as e:
+            logger.error(f"[SysH SL] {symbol}: FAILED: {e}")
+
+        # 2. Rejime göre trailing veya sabit TP
+        zone = cand.regime_zone or "TRENDING"
+
+        if zone in ("TRENDING", "GRAY") and cand.trailing_callback_pct > 0:
+            # Trailing stop (G bazlı)
+            callback_pct = round(cand.trailing_callback_pct, 2)
+            callback_pct = max(0.1, min(callback_pct, 5.0))
+
+            activation_price = None
+            if cand.trailing_trigger_pct > 0:
+                if pos.side == OrderSide.BUY_LONG:
+                    activation_price = round(entry_price * (1 + cand.trailing_trigger_pct / 100), pp)
+                else:
+                    activation_price = round(entry_price * (1 - cand.trailing_trigger_pct / 100), pp)
+
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=pos.size,
+                    callback_rate=callback_pct,
+                    stop_price=activation_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysH Trail] {symbol}: callback={callback_pct}% "
+                            f"activation={activation_price} "
+                            f"(trigger={cand.trailing_trigger_pct:.2f}%×G)")
+                self._server_trailing[symbol] = {
+                    "callback_pct": callback_pct,
+                    "timestamp": time.time(),
+                    "activation_price": activation_price,
+                }
+            except Exception as e:
+                logger.error(f"[SysH Trail] {symbol}: FAILED: {e}")
+
+        elif cand.tp_pct > 0:
+            # Sabit TP (RANGING rejim)
+            if pos.side == OrderSide.BUY_LONG:
+                tp_price = round(entry_price * (1 + cand.tp_pct / 100), pp)
+            else:
+                tp_price = round(entry_price * (1 - cand.tp_pct / 100), pp)
+
+            try:
+                rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    quantity=pos.size,
+                    stop_price=tp_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysH TP] {symbol}: TAKE_PROFIT @ {tp_price} "
+                            f"(TP={cand.tp_pct:.2f}%)")
+            except Exception as e:
+                logger.error(f"[SysH TP] {symbol}: FAILED: {e}")
+
+    def _place_missing_orders_system_h(self, symbol, pos, rest, pp,
+                                        is_long, close_side,
+                                        entry_price, actual_qty,
+                                        entry_regime,
+                                        need_sl, need_trailing):
+        """System H: G bazlı eksik emir onarımı.
+
+        G değeri pos.entry_bb_width alanında saklanır.
+        Rejime göre: TRENDING → trailing, RANGING → sabit TP.
+        """
+        sh = self._config.get("system_h", {})
+        G = getattr(pos, 'entry_bb_width', 0)
+        if G <= 0:
+            G = 0.5  # fallback
+
+        sl_placed = False
+        trail_placed = False
+
+        # SL çarpanı: rejime göre
+        if entry_regime in ("TRENDING",):
+            sl_mult = sh.get("sl_mult_trend", 1.5)
+        else:
+            sl_mult = sh.get("sl_mult_ranging", 2.0)
+
+        sl_pct = G * sl_mult
+
+        # ── SL emri ──
+        if need_sl:
+            if is_long:
+                sl_price = round(entry_price * (1 - sl_pct / 100), pp)
+            else:
+                sl_price = round(entry_price * (1 + sl_pct / 100), pp)
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=actual_qty, stop_price=sl_price,
+                    reduce_only=True,
+                )
+                sl_placed = True
+                logger.info(f"[SysH REPAIR] {symbol}: SL @ {sl_price} "
+                            f"(G={G:.3f}%, {sl_mult}xG={sl_pct:.3f}%)")
+            except Exception as e:
+                logger.error(f"[SysH REPAIR] {symbol}: SL FAILED: {e}")
+
+        # ── Trailing veya TP emri ──
+        if need_trailing:
+            if entry_regime in ("TRENDING", "GRAY"):
+                # Trailing stop (G bazlı)
+                tetik_mult = sh.get("trailing_trigger_g_mult", 2.5)
+                mesafe_mult = sh.get("trailing_callback_g_mult", 0.5)
+                callback_pct = G * mesafe_mult
+                callback_pct = max(0.1, min(callback_pct, 5.0))
+                callback_pct = round(callback_pct, 2)
+
+                tetik_pct = G * tetik_mult
+                if is_long:
+                    activation_price = round(entry_price * (1 + tetik_pct / 100), pp)
+                else:
+                    activation_price = round(entry_price * (1 - tetik_pct / 100), pp)
+
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="TRAILING_STOP_MARKET",
+                        quantity=actual_qty,
+                        callback_rate=callback_pct,
+                        stop_price=activation_price,
+                        reduce_only=True,
+                    )
+                    trail_placed = True
+                    logger.info(f"[SysH REPAIR] {symbol}: Trailing "
+                                f"callback={callback_pct}% activation={activation_price}")
+                except Exception as e:
+                    logger.error(f"[SysH REPAIR] {symbol}: Trailing FAILED: {e}")
+            else:
+                # Ranging: sabit TP
+                tp_mult = sh.get("ranging_tp_g_mult", 3.0)
+                tp_pct = G * tp_mult
+                if is_long:
+                    tp_price = round(entry_price * (1 + tp_pct / 100), pp)
+                else:
+                    tp_price = round(entry_price * (1 - tp_pct / 100), pp)
+
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="TAKE_PROFIT_MARKET",
+                        quantity=actual_qty,
+                        stop_price=tp_price,
+                        reduce_only=True,
+                    )
+                    trail_placed = True
+                    logger.info(f"[SysH REPAIR] {symbol}: TP @ {tp_price} "
+                                f"({tp_mult}xG={tp_pct:.3f}%)")
+                except Exception as e:
+                    logger.error(f"[SysH REPAIR] {symbol}: TP FAILED: {e}")
+
+        return sl_placed, trail_placed
+
+    def get_system_h_results(self) -> list:
+        """GUI erişimi için son System H tarama sonuçları."""
+        return self._last_system_h_results

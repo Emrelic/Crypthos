@@ -22,7 +22,8 @@ PRESETS = {
             "min_leverage": 10, "max_leverage": 25,
             "max_positions": 2, "portfolio_percent": 30, "portfolio_divider": 0,
             "portfolio_min_wallet": 12, "portfolio_fixed_margin": 1.0, "portfolio_micro_divider": 4,
-            "order_verify_interval": 60, "order_verify_max_orders": 2,
+            "order_verify_interval": 30, "order_verify_max_orders": 2,
+            "order_verify_no_cancel": True, "order_verify_fix_duplicates": False, "order_verify_clean_orphans": True,
             # SL
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 40,
             "server_sl_atr_mult": 2.0,
@@ -82,7 +83,8 @@ PRESETS = {
             "min_leverage": 25, "max_leverage": 50,
             "max_positions": 4, "portfolio_percent": 25, "portfolio_divider": 0,
             "portfolio_min_wallet": 12, "portfolio_fixed_margin": 1.0, "portfolio_micro_divider": 4,
-            "order_verify_interval": 60, "order_verify_max_orders": 2,
+            "order_verify_interval": 30, "order_verify_max_orders": 2,
+            "order_verify_no_cancel": True, "order_verify_fix_duplicates": False, "order_verify_clean_orphans": True,
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "server_sl_atr_mult": 2.0,
             "emergency_enabled": True, "emergency_liq_percent": 80,
@@ -134,7 +136,8 @@ PRESETS = {
             "min_leverage": 50, "max_leverage": 100,
             "max_positions": 6, "portfolio_percent": 25, "portfolio_divider": 0,
             "portfolio_min_wallet": 12, "portfolio_fixed_margin": 1.0, "portfolio_micro_divider": 4,
-            "order_verify_interval": 60, "order_verify_max_orders": 2,
+            "order_verify_interval": 30, "order_verify_max_orders": 2,
+            "order_verify_no_cancel": True, "order_verify_fix_duplicates": False, "order_verify_clean_orphans": True,
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "server_sl_atr_mult": 2.0,
             "emergency_enabled": True, "emergency_liq_percent": 80,
@@ -191,7 +194,8 @@ PRESETS = {
             # Pozisyon: 4 cephede, 1/12 portfoy
             "max_positions": 4, "portfolio_percent": 8, "portfolio_divider": 12,
             "portfolio_min_wallet": 12, "portfolio_fixed_margin": 1.0, "portfolio_micro_divider": 4,
-            "order_verify_interval": 60, "order_verify_max_orders": 2,
+            "order_verify_interval": 30, "order_verify_max_orders": 2,
+            "order_verify_no_cancel": True, "order_verify_fix_duplicates": False, "order_verify_clean_orphans": True,
             # SL: pratik liq %70, SL %50 (= %0.35 at 100x)
             "sl_enabled": True, "liq_factor": 70, "sl_liq_percent": 50,
             "server_sl_atr_mult": 2.0,
@@ -307,6 +311,25 @@ class StrategySettingsPanel(ctk.CTkFrame):
         ctk.CTkLabel(top, text="Strateji Ayarlari",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(side="left", padx=10, pady=6)
 
+        # ── Aktif Sistem Secimi ──
+        _ALL_SYSTEMS = ["A", "B", "D", "E", "F", "G", "H"]
+        _init_sys = "A"
+        for sys_key in reversed(_ALL_SYSTEMS[1:]):  # H, G, F, E, D, B (oncelik sirasi)
+            if self.controller.config.get(f"system_{sys_key.lower()}.enabled", False):
+                _init_sys = sys_key
+                break
+        self._system_var = ctk.StringVar(value=_init_sys)
+        _sys_labels = [f"Sys {s}" for s in _ALL_SYSTEMS]
+        self._system_seg = ctk.CTkSegmentedButton(
+            top, values=_sys_labels,
+            variable=self._system_var,
+            command=self._on_system_switch,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self._system_seg.pack(side="left", padx=(10, 5), pady=6)
+        _init_label = f"Sys {_init_sys}"
+        self._system_seg.set(_init_label)
+
         self._mode_var = ctk.StringVar(
             value=self.controller.config.get("strategy.mode", "standard"))
         self._mode_seg = ctk.CTkSegmentedButton(
@@ -395,10 +418,17 @@ class StrategySettingsPanel(ctk.CTkFrame):
         self._refresh_template_list()
 
         # ══════════════════════════════════════════════════════
-        # 3-COLUMN SCROLLABLE LAYOUT
+        # 3-COLUMN SCROLLABLE LAYOUT (System A)
         # ══════════════════════════════════════════════════════
         self._scroll = ctk.CTkScrollableFrame(self)
         self._scroll.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+
+        # System B scrollable frame (hidden by default)
+        self._scroll_b = ctk.CTkScrollableFrame(self)
+        # NOT packed yet — will be shown when System B selected
+        self._sb_entries = {}   # system_b config entries
+        self._sb_cb_vars = {}   # system_b checkbox vars
+        self._build_system_b_panel()
 
         # 3 columns inside scroll
         col_container = ctk.CTkFrame(self._scroll, fg_color="transparent")
@@ -935,6 +965,42 @@ class StrategySettingsPanel(ctk.CTkFrame):
                         "  2 = Standart (1 SL + 1 trailing)\n"
                         "  3 = TP emri de varsa\n\n"
                         "DIKKAT: 2'den asagi indirmeyin!"))
+        self._checkbox(g, "order_verify_no_cancel",
+                       "Eksik emirde sadece ekle (silme)", True,
+                       help_text=(
+                           "EKSIK EMIR DAVRANISI\n"
+                           "─────────────────────\n"
+                           "ACIK: Eksik SL/trailing tespit edilince\n"
+                           "mevcut emirlere DOKUNMADAN sadece\n"
+                           "eksik olani ekler. Guvensiz pencere YOK.\n\n"
+                           "KAPALI: Tum emirleri siler, 1 SL + 1 trailing\n"
+                           "yeniden koyar. Silme-koyma arasinda\n"
+                           "korumasiz pencere olusabilir.\n\n"
+                           "ONERILEN: ACIK (varsayilan)"))
+        self._checkbox(g, "order_verify_fix_duplicates",
+                       "Mukerrer emirleri temizle", False,
+                       help_text=(
+                           "MUKERRER EMIR DAVRANISI\n"
+                           "────────────────────────\n"
+                           "ACIK: 2+ SL veya 2+ trailing tespit\n"
+                           "edilirse fazlalari siler, 1+1 birakir.\n\n"
+                           "KAPALI: Mukerrer emirlere dokunmaz.\n"
+                           "Binance zaten sadece ilk tetikleneni\n"
+                           "calistirir, fazlasi zararsiz.\n\n"
+                           "ONERILEN: KAPALI (varsayilan)\n"
+                           "Temizleme sirasinda korumasiz kalma\n"
+                           "riski vardir."))
+        self._checkbox(g, "order_verify_clean_orphans",
+                       "Orphan emirleri temizle", True,
+                       help_text=(
+                           "ORPHAN EMIR TEMIZLEME\n"
+                           "──────────────────────\n"
+                           "ACIK: Pozisyonu kapanmis coinlerin\n"
+                           "arta kalan SL/trailing emirlerini siler.\n"
+                           "Gereksiz margin baglanmasini onler.\n\n"
+                           "KAPALI: Orphan emirlere dokunmaz.\n"
+                           "Binance'de margin bagli kalir.\n\n"
+                           "ONERILEN: ACIK (varsayilan)"))
 
         # ════════════════ COLUMN 2: SL + Trailing + TP + Sinyal + Zaman + Risk ════════════════
         s = c2  # switch to column 2
@@ -2006,6 +2072,428 @@ class StrategySettingsPanel(ctk.CTkFrame):
             btn.pack(side="left", padx=5)
 
     # ════════════════════════════════════════
+    # SYSTEM A/B SWITCH
+    # ════════════════════════════════════════
+
+    def _on_system_switch(self, value: str) -> None:
+        """Switch between system panels. Only one system active at a time."""
+        # Hide all panels first
+        for attr in ('_scroll', '_scroll_b', '_scroll_d', '_scroll_e',
+                     '_scroll_f', '_scroll_g', '_scroll_h'):
+            w = getattr(self, attr, None)
+            if w:
+                w.pack_forget()
+        self._mode_seg.pack_forget()
+        if hasattr(self, '_preset_frame'):
+            self._preset_frame.pack_forget()
+        if hasattr(self, '_tmpl_frame'):
+            self._tmpl_frame.pack_forget()
+
+        # Extract system letter from "Sys X" format
+        sys_letter = value.replace("Sys ", "").strip()
+
+        if sys_letter == "B":
+            self._scroll_b.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+            self._load_system_b_from_config()
+        elif sys_letter == "D":
+            if not hasattr(self, '_scroll_d'):
+                self._build_system_d_panel()
+            self._scroll_d.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+            self._load_system_d_from_config()
+        elif sys_letter == "E":
+            if not hasattr(self, '_scroll_e'):
+                self._build_system_e_panel()
+            self._scroll_e.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+            self._load_system_e_from_config()
+        elif sys_letter == "F":
+            if not hasattr(self, '_scroll_f'):
+                self._build_system_f_panel()
+            self._scroll_f.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+            self._load_system_f_from_config()
+        elif sys_letter == "G":
+            if not hasattr(self, '_scroll_g'):
+                self._build_system_g_panel()
+            self._scroll_g.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+            self._load_system_g_from_config()
+        elif sys_letter == "H":
+            if not hasattr(self, '_scroll_h'):
+                self._build_system_h_panel()
+            self._scroll_h.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+            self._load_system_h_from_config()
+        else:
+            # System A (default)
+            self._scroll.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+            self._mode_seg.pack(side="left", padx=15, pady=6)
+            self._on_mode_change(self._mode_var.get())
+
+    # ══════════════════════════════════════════════════════════════
+    # ════  SYSTEM D PANEL  ════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════
+
+    def _build_system_d_panel(self) -> None:
+        """System D ayar panelini oluştur (zoom diyafram, yön, rejim, kaldıraç)."""
+        self._scroll_d = ctk.CTkScrollableFrame(self)
+        f = self._scroll_d
+        self._sd_entries: dict[str, ctk.CTkEntry] = {}
+        self._sd_cb_vars: dict[str, ctk.BooleanVar] = {}
+        self._sd_combo_vars: dict[str, ctk.StringVar] = {}
+
+        font_title = ctk.CTkFont(size=13, weight="bold")
+        font = ctk.CTkFont(size=12)
+
+        col_container = ctk.CTkFrame(f, fg_color="transparent")
+        col_container.pack(fill="both", expand=True)
+        col_container.columnconfigure(0, weight=1)
+        col_container.columnconfigure(1, weight=1)
+        col_container.columnconfigure(2, weight=1)
+
+        c1 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c1.grid(row=0, column=0, sticky="nsew", padx=3, pady=0)
+        c2 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c2.grid(row=0, column=1, sticky="nsew", padx=3, pady=0)
+        c3 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c3.grid(row=0, column=2, sticky="nsew", padx=3, pady=0)
+
+        # ── Column 1: Genel + Zoom ──
+        ctk.CTkLabel(c1, text="Genel", font=font_title,
+                     text_color="#FF8A65").pack(anchor="w", padx=4, pady=(4, 0))
+
+        sd_general = [
+            ("coin_sayisi", "Coin Sayisi (top N)", "50"),
+            ("swing_n", "Zigzag N", "10"),
+            ("scan_interval_seconds", "Tarama Araligi (sn)", "30"),
+            ("tf_carpan", "TF Carpani (x)", "12"),
+            ("portfoy_bolen", "Portfoy Bolen (1/N)", "12"),
+            ("max_pozisyon", "Max Pozisyon", "12"),
+        ]
+        for key, label, default in sd_general:
+            row = ctk.CTkFrame(c1, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._sd_entries[key] = e
+
+        ctk.CTkLabel(c1, text="Kaldirac", font=font_title,
+                     text_color="#FFD54F").pack(anchor="w", padx=4, pady=(8, 0))
+        sd_lev = [
+            ("min_kaldirac", "Min Kaldirac", "2"),
+            ("max_kaldirac", "Max Kaldirac", "125"),
+            ("fee_pct", "Fee %", "0.08"),
+            ("slippage_pct", "Slippage %", "0.03"),
+            ("liq_seviyesi", "Liq Seviyesi", "0.7"),
+        ]
+        for key, label, default in sd_lev:
+            row = ctk.CTkFrame(c1, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._sd_entries[key] = e
+
+        # ── Column 2: SL/TP + Trailing ──
+        ctk.CTkLabel(c2, text="Stop Loss (G carpani)", font=font_title,
+                     text_color="#FF5252").pack(anchor="w", padx=4, pady=(4, 0))
+        sd_sl = [
+            ("sl_carpan_trend", "SL Trend (xG)", "1.5"),
+            ("sl_carpan_ranging", "SL Ranging (xG)", "2.0"),
+            ("pratik_liq_carpan_trend", "P.Liq Trend (xG)", "3.0"),
+            ("pratik_liq_carpan_ranging", "P.Liq Ranging (xG)", "4.0"),
+        ]
+        for key, label, default in sd_sl:
+            row = ctk.CTkFrame(c2, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._sd_entries[key] = e
+
+        ctk.CTkLabel(c2, text="TP / Trailing", font=font_title,
+                     text_color="#00E676").pack(anchor="w", padx=4, pady=(8, 0))
+        sd_tp = [
+            ("trailing_tetik_g_carpan", "Trail Tetik (xG)", "2.0"),
+            ("trailing_mesafe_g_carpan", "Trail Mesafe (xG)", "0.5"),
+            ("ranging_tp_g_carpan", "Ranging TP (xG)", "3.0"),
+            ("limit_atr_offset", "Giris Offset (xATR)", "0.1"),
+            ("limit_timeout_seconds", "Limit Timeout (sn)", "60"),
+            ("time_limit_minutes", "Max Tutma (dk)", "480"),
+        ]
+        for key, label, default in sd_tp:
+            row = ctk.CTkFrame(c2, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._sd_entries[key] = e
+
+        # ── Column 3: Yön + Rejim + Risk ──
+        ctk.CTkLabel(c3, text="Yon Tespiti", font=font_title,
+                     text_color="#4FC3F7").pack(anchor="w", padx=4, pady=(4, 0))
+        sd_dir = [
+            ("makro_agirlik", "Makro Agirlik", "0.5"),
+            ("orta_agirlik", "Orta Agirlik", "0.3"),
+            ("mikro_agirlik", "Mikro Agirlik", "0.2"),
+            ("yon_belirsiz_esik", "Belirsiz Esik", "0.1"),
+            ("max_funding_rate", "Max FR", "0.001"),
+        ]
+        for key, label, default in sd_dir:
+            row = ctk.CTkFrame(c3, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._sd_entries[key] = e
+
+        ctk.CTkLabel(c3, text="Rejim", font=font_title,
+                     text_color="#CE93D8").pack(anchor="w", padx=4, pady=(8, 0))
+        sd_regime = [
+            ("adx_trend_esik", "ADX Trend Esik", "25"),
+            ("adx_ranging_esik", "ADX Ranging Esik", "20"),
+            ("er_trend_esik", "ER Trend Esik", "0.3"),
+        ]
+        for key, label, default in sd_regime:
+            row = ctk.CTkFrame(c3, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._sd_entries[key] = e
+
+        ctk.CTkLabel(c3, text="Risk", font=font_title,
+                     text_color="#FF8A65").pack(anchor="w", padx=4, pady=(8, 0))
+
+        # Checkboxes
+        sd_checks = [
+            ("yon_mutabakat_modu", "Mutabakat Modu (3/3)"),
+            ("time_limit_enabled", "Zaman Limiti"),
+            ("cooldown_enabled", "Loss Cooldown"),
+            ("yon_denge_enabled", "Yon Dengesi"),
+        ]
+        for key, label in sd_checks:
+            var = ctk.BooleanVar()
+            cb = ctk.CTkCheckBox(c3, text=label, variable=var, font=font)
+            cb.pack(anchor="w", padx=8, pady=1)
+            self._sd_cb_vars[key] = var
+
+        # Yön denge oranı combo
+        row = ctk.CTkFrame(c3, fg_color="transparent")
+        row.pack(fill="x", padx=4, pady=1)
+        ctk.CTkLabel(row, text="Yon Denge Orani", font=font, width=160).pack(side="left")
+        self._sd_combo_vars["yon_denge_oran"] = ctk.StringVar(value="2-1")
+        combo = ctk.CTkComboBox(row, values=["1-1", "2-1", "3-1", "4-1"],
+                                variable=self._sd_combo_vars["yon_denge_oran"],
+                                width=70, font=font)
+        combo.pack(side="right", padx=4)
+
+        row2 = ctk.CTkFrame(c3, fg_color="transparent")
+        row2.pack(fill="x", padx=4, pady=1)
+        ctk.CTkLabel(row2, text="Cooldown (sn)", font=font, width=160).pack(side="left")
+        e = ctk.CTkEntry(row2, width=60, font=font)
+        e.pack(side="right", padx=4)
+        self._sd_entries["cooldown_seconds"] = e
+
+    def _load_system_d_from_config(self) -> None:
+        """Config'den System D ayarlarını panele yükle."""
+        sd = self.controller.config.get("system_d", {})
+        for key, entry in self._sd_entries.items():
+            val = sd.get(key, "")
+            entry.delete(0, "end")
+            entry.insert(0, str(val))
+        for key, var in self._sd_cb_vars.items():
+            var.set(sd.get(key, False))
+        for key, var in self._sd_combo_vars.items():
+            var.set(sd.get(key, "2-1"))
+
+    def _save_system_d_to_config(self) -> None:
+        """System D ayarlarını config'e kaydet."""
+        c = self.controller.config
+        for key, entry in self._sd_entries.items():
+            raw = entry.get().strip()
+            if not raw:
+                continue
+            try:
+                if "." in raw:
+                    c.set(f"system_d.{key}", float(raw))
+                else:
+                    c.set(f"system_d.{key}", int(raw))
+            except ValueError:
+                c.set(f"system_d.{key}", raw)
+        for key, var in self._sd_cb_vars.items():
+            c.set(f"system_d.{key}", var.get())
+        for key, var in self._sd_combo_vars.items():
+            c.set(f"system_d.{key}", var.get())
+
+    def _build_system_b_panel(self) -> None:
+        """System B ayar panelini oluştur (dalga analizi, MTF, entry, kaldıraç)."""
+        f = self._scroll_b
+
+        col_container = ctk.CTkFrame(f, fg_color="transparent")
+        col_container.pack(fill="both", expand=True)
+        col_container.columnconfigure(0, weight=1)
+        col_container.columnconfigure(1, weight=1)
+        col_container.columnconfigure(2, weight=1)
+
+        c1 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c1.grid(row=0, column=0, sticky="nsew", padx=3, pady=0)
+        c2 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c2.grid(row=0, column=1, sticky="nsew", padx=3, pady=0)
+        c3 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c3.grid(row=0, column=2, sticky="nsew", padx=3, pady=0)
+
+        # ═══ COLUMN 1: Veri & Rejim ═══
+        g = self._sb_section(c1, "Veri Toplama (MTF)")
+        self._sb_field(g, "buyuk_tf", "Büyük TF", "1h")
+        self._sb_field(g, "buyuk_tf_mum", "Büyük TF Mum Sayısı", "168")
+        self._sb_field(g, "kucuk_tf", "Küçük TF", "5m")
+        self._sb_field(g, "kucuk_tf_mum", "Küçük TF Mum Sayısı", "288")
+        self._sb_field(g, "coin_sayisi", "Coin Sayısı", "50")
+
+        g = self._sb_section(c1, "Rejim Tespiti (ER & Hurst)")
+        self._sb_field(g, "er_makro_ranging", "ER Makro Ranging", "0.15")
+        self._sb_field(g, "er_makro_trending", "ER Makro Trending", "0.35")
+        self._sb_field(g, "er_mikro_ranging", "ER Mikro Ranging", "0.2")
+        self._sb_field(g, "er_mikro_trending", "ER Mikro Trending", "0.4")
+        self._sb_field(g, "hurst_ranging_esik", "Hurst Ranging Eşik", "0.45")
+        self._sb_field(g, "hurst_trending_esik", "Hurst Trending Eşik", "0.55")
+        self._sb_field(g, "rejim_degisim_teyit", "Rejim Değişim Teyit", "3")
+        self._sb_field(g, "yakin_yon_mum_sayisi", "Yakın Yön Mum Sayısı", "72")
+
+        g = self._sb_section(c1, "Zigzag & Dalga")
+        self._sb_field(g, "swing_n", "Swing N", "10")
+        self._sb_field(g, "min_dalga_sayisi", "Min Dalga Sayısı", "2")
+        self._sb_field(g, "min_dalga_boyu", "Min Dalga Boyu (%)", "0.1")
+        self._sb_field(g, "cv_max_esik", "CV Max Eşik", "0.6")
+        self._sb_field(g, "dalga_pozisyon_bekle", "Dalga Poz: Bekle", "0.30")
+        self._sb_field(g, "dalga_pozisyon_limit", "Dalga Poz: Limit", "0.60")
+        self._sb_field(g, "dalga_pozisyon_gir", "Dalga Poz: Gir", "0.90")
+
+        # ═══ COLUMN 2: Entry & SL/Trailing ═══
+        g = self._sb_section(c2, "Giriş Teyidi (Entry)")
+        self._sb_field(g, "rsi_periyot", "RSI Periyot", "14")
+        self._sb_field(g, "rsi_long_esik", "RSI Long Eşik (Trend)", "40")
+        self._sb_field(g, "rsi_short_esik", "RSI Short Eşik (Trend)", "60")
+        self._sb_field(g, "rsi_ranging_long_esik", "RSI Long (Ranging)", "35")
+        self._sb_field(g, "rsi_ranging_short_esik", "RSI Short (Ranging)", "65")
+        self._sb_field(g, "volume_ma_periyot", "Volume MA Periyot", "20")
+        self._sb_field(g, "volume_azalma_carpani", "Volume Azalma Çarpanı", "0.8")
+        self._sb_field(g, "volume_climax_carpani", "Volume Climax Çarpanı", "1.5")
+        self._sb_field(g, "min_entry_skor", "Min Entry Skor (2/3)", "2")
+
+        g = self._sb_section(c2, "SL & Trailing (G Bazlı)")
+        self._sb_field(g, "sl_carpan", "SL Çarpanı (×G)", "1.5")
+        self._sb_field(g, "tetik_carpan", "Tetik Çarpanı (×G)", "2.5")
+        self._sb_field(g, "trail_carpan", "Trail Çarpanı (×G)", "0.5")
+        self._sb_field(g, "slippage_buffer", "Slippage Buffer (%)", "0.1")
+        self._sb_field(g, "trailing_min_callback", "Min Callback (%)", "0.1")
+        self._sb_field(g, "trailing_max_callback", "Max Callback (%)", "5.0")
+        self._sb_field(g, "min_rr_oran", "Min R:R Oranı", "1.3")
+
+        g = self._sb_section(c2, "Kaldıraç Çarpanları")
+        self._sb_field(g, "zayif_kaldirac_carpani", "Zayıf Rejim", "0.5")
+        self._sb_field(g, "yon_celiskisi_carpani", "Yön Çelişkisi", "0.5")
+        self._sb_field(g, "cv_orta_carpani", "CV Orta (0.3-0.6)", "0.7")
+        self._sb_field(g, "entry_tek_teyit_carpani", "Tek Teyit", "0.7")
+        self._sb_field(g, "funding_carpani", "Funding Karşıt", "0.7")
+
+        # ═══ COLUMN 3: Pozisyon & Risk & Ranging ═══
+        g = self._sb_section(c3, "Pozisyon Boyutu")
+        self._sb_field(g, "portfoy_bolen", "Portföy Bölen (1/N)", "12")
+        self._sb_field(g, "max_pozisyon", "Max Pozisyon", "6")
+        self._sb_field(g, "min_kaldirac", "Min Kaldıraç", "2")
+        self._sb_field(g, "max_ayni_yon", "Max Aynı Yön", "4")
+        self._sb_field(g, "fee_rate", "Fee Rate", "0.0004")
+        self._sb_field(g, "max_funding_rate", "Max Funding Rate", "0.001")
+        self._sb_field(g, "funding_uyari_esik", "Funding Uyarı Eşik", "0.0005")
+        self._sb_field(g, "max_spread_sl_oran", "Max Spread/SL Oranı", "0.1")
+
+        g = self._sb_section(c3, "Risk Yönetimi")
+        self._sb_field(g, "loss_cooldown_dakika", "Zarar Cooldown (dk)", "30")
+        self._sb_field(g, "profit_cooldown_dakika", "Kâr Cooldown (dk)", "0")
+        self._sb_field(g, "max_ardisik_kayip", "Max Ardışık Kayıp", "2")
+        self._sb_check(g, "gunluk_kayip_limiti_enabled", "Günlük Kayıp Limiti", False)
+        self._sb_field(g, "max_gunluk_kayip_yuzde", "Max Günlük Kayıp (%)", "20")
+
+        g = self._sb_section(c3, "Limit Emir")
+        self._sb_field(g, "limit_buffer_yuzde", "Limit Buffer (%)", "0.05")
+        self._sb_field(g, "limit_timeout_dakika", "Limit Timeout (dk)", "15")
+        self._sb_check(g, "hemen_gir_market", "Market Emir (>%90 dalga)", True)
+        self._sb_field(g, "min_dolum_orani", "Min Dolum Oranı", "0.5")
+
+        g = self._sb_section(c3, "Ranging Modu")
+        self._sb_field(g, "ranging_bant_alt_percentile", "Bant Alt Percentile", "20")
+        self._sb_field(g, "ranging_bant_ust_percentile", "Bant Üst Percentile", "80")
+        self._sb_field(g, "ranging_long_giris_seviye", "Long Giriş Seviye", "0.20")
+        self._sb_field(g, "ranging_short_giris_seviye", "Short Giriş Seviye", "0.80")
+        self._sb_field(g, "ranging_long_cikis_seviye", "Long Çıkış Seviye", "0.60")
+        self._sb_field(g, "ranging_short_cikis_seviye", "Short Çıkış Seviye", "0.40")
+        self._sb_field(g, "min_bant_genisligi", "Min Bant Genişliği (%)", "0.3")
+        self._sb_field(g, "breakout_mum_sayisi", "Breakout Mum Sayısı", "5")
+        self._sb_field(g, "breakout_teyit_mumlar", "Breakout Teyit Mumlar", "3")
+
+    def _sb_section(self, parent, title: str) -> ctk.CTkFrame:
+        """System B ayar bölümü oluştur."""
+        frame = ctk.CTkFrame(parent, fg_color="#1a1a2e", corner_radius=8)
+        frame.pack(fill="x", padx=2, pady=(4, 2))
+        ctk.CTkLabel(frame, text=title,
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#FF9800").pack(anchor="w", padx=8, pady=(4, 2))
+        return frame
+
+    def _sb_field(self, parent, key: str, label: str, default: str) -> None:
+        """System B sayısal alan."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=1)
+        ctk.CTkLabel(row, text=label, width=180, anchor="w",
+                     font=ctk.CTkFont(size=11)).pack(side="left")
+        entry = ctk.CTkEntry(row, width=80, height=24,
+                             font=ctk.CTkFont(size=11))
+        entry.pack(side="left", padx=4)
+        entry.insert(0, default)
+        self._sb_entries[key] = entry
+
+    def _sb_check(self, parent, key: str, label: str, default: bool) -> None:
+        """System B checkbox."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=1)
+        var = ctk.BooleanVar(value=default)
+        cb = ctk.CTkCheckBox(row, text=label, variable=var,
+                             font=ctk.CTkFont(size=11))
+        cb.pack(side="left")
+        self._sb_cb_vars[key] = var
+
+    def _load_system_b_from_config(self) -> None:
+        """System B config değerlerini GUI'ye yükle."""
+        sb = self.controller.config.get("system_b", {})
+        for key, entry in self._sb_entries.items():
+            val = sb.get(key)
+            if val is not None:
+                entry.delete(0, "end")
+                entry.insert(0, str(val))
+        for key, var in self._sb_cb_vars.items():
+            val = sb.get(key)
+            if val is not None:
+                var.set(val)
+
+    def _save_system_b_to_config(self) -> None:
+        """System B config değerlerini kaydet."""
+        sb = {}
+        sb["enabled"] = True
+        for key, entry in self._sb_entries.items():
+            raw = entry.get().strip()
+            if not raw:
+                continue
+            try:
+                if "." in raw:
+                    sb[key] = float(raw)
+                else:
+                    sb[key] = int(raw)
+            except ValueError:
+                sb[key] = raw
+        for key, var in self._sb_cb_vars.items():
+            sb[key] = var.get()
+        self.controller.config.set("system_b", sb)
+
+    # ════════════════════════════════════════
     # MODE & PRESETS
     # ════════════════════════════════════════
 
@@ -2131,6 +2619,37 @@ class StrategySettingsPanel(ctk.CTkFrame):
 
     def _save(self, show_feedback: bool = True) -> None:
         c = self.controller.config
+
+        raw_sys = self._system_seg.get() if hasattr(self, '_system_seg') else "Sys A"
+        sys_letter = raw_sys.replace("Sys ", "").strip()
+
+        # Tum sistemleri kapat — sadece secili olan acilacak
+        _all_sys_keys = ["system_b", "system_d", "system_e",
+                         "system_f", "system_g", "system_h"]
+        for key in _all_sys_keys:
+            c.set(f"{key}.enabled", False)
+
+        # Secili sistemi kaydet ve ac
+        _sys_save_map = {
+            "B": (self._save_system_b_to_config, "system_b", "System B kaydedildi!", "#FF9800"),
+            "D": (self._save_system_d_to_config, "system_d", "System D kaydedildi!", "#FF8A65"),
+            "E": (self._save_system_e_to_config, "system_e", "System E kaydedildi!", "#FF6D00"),
+            "F": (self._save_system_f_to_config, "system_f", "System F kaydedildi!", "#E53935"),
+            "G": (self._save_system_g_to_config, "system_g", "System G kaydedildi!", "#7C4DFF"),
+            "H": (self._save_system_h_to_config, "system_h", "System H kaydedildi!", "#00BCD4"),
+        }
+
+        if sys_letter in _sys_save_map:
+            save_fn, config_key, msg, color = _sys_save_map[sys_letter]
+            if callable(save_fn):
+                save_fn()
+            c.set(f"{config_key}.enabled", True)
+            c.save()
+            if show_feedback:
+                self._show_feedback(msg, color)
+            return
+
+        # System A: tum diger sistemler zaten kapatildi
 
         # Collect all values
         strat = {
@@ -2442,3 +2961,593 @@ class StrategySettingsPanel(ctk.CTkFrame):
         _save_templates(templates)
         self._refresh_template_list()
         self._show_feedback(f"Sablon '{name}' silindi", "#FF1744")
+
+    # ══════════════════════════════════════════════════════════════
+    # ════  SYSTEM E PANEL  ════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════
+
+    def _build_system_e_panel(self) -> None:
+        """System E ayar paneli: yüksek kaldıraç, yön kesinliği, emergency SL, trailing."""
+        self._scroll_e = ctk.CTkScrollableFrame(self)
+        f = self._scroll_e
+        self._se_entries: dict[str, ctk.CTkEntry] = {}
+        self._se_cb_vars: dict[str, ctk.BooleanVar] = {}
+        self._se_combo_vars: dict[str, ctk.StringVar] = {}
+
+        font_title = ctk.CTkFont(size=13, weight="bold")
+        font = ctk.CTkFont(size=12)
+        font_desc = ctk.CTkFont(size=11)
+
+        # Açıklama
+        desc_frame = ctk.CTkFrame(f, fg_color="#2a1a00", border_color="#FF6D00",
+                                  border_width=1, corner_radius=6)
+        desc_frame.pack(fill="x", padx=5, pady=(4, 6))
+        ctk.CTkLabel(desc_frame,
+                     text="System E: Yuksek Kaldirac Yon Kesinligi",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color="#FF6D00").pack(anchor="w", padx=8, pady=(4, 0))
+        ctk.CTkLabel(desc_frame,
+                     text="5 TF (5m, 15m, 1h, 4h, 1d) tamami ayni yone sinyal vermeli.\n"
+                          "Max kaldirac, SL yok, sadece emergency (%80 liq) + trailing (%50 tetik).\n"
+                          "Hizli giris, kar alip kacma stratejisi.",
+                     font=font_desc, text_color="#FFAB40",
+                     justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+
+        col_container = ctk.CTkFrame(f, fg_color="transparent")
+        col_container.pack(fill="both", expand=True)
+        col_container.columnconfigure(0, weight=1)
+        col_container.columnconfigure(1, weight=1)
+        col_container.columnconfigure(2, weight=1)
+
+        c1 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c1.grid(row=0, column=0, sticky="nsew", padx=3, pady=0)
+        c2 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c2.grid(row=0, column=1, sticky="nsew", padx=3, pady=0)
+        c3 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c3.grid(row=0, column=2, sticky="nsew", padx=3, pady=0)
+
+        # ── Column 1: Genel + Tarama ──
+        ctk.CTkLabel(c1, text="Genel", font=font_title,
+                     text_color="#FF6D00").pack(anchor="w", padx=4, pady=(4, 0))
+
+        se_general = [
+            ("coin_sayisi", "Coin Sayisi (top N)", "50"),
+            ("mum_sayisi", "Mum Sayisi (per TF)", "200"),
+            ("scan_interval_seconds", "Tarama Araligi (sn)", "30"),
+            ("portfoy_bolen", "Portfoy Bolen (1/N)", "12"),
+            ("max_pozisyon", "Max Pozisyon", "12"),
+        ]
+        for key, label, default in se_general:
+            row = ctk.CTkFrame(c1, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=170).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._se_entries[key] = e
+
+        ctk.CTkLabel(c1, text="Sinyal Filtreleri", font=font_title,
+                     text_color="#00E676").pack(anchor="w", padx=4, pady=(8, 0))
+
+        se_signal = [
+            ("min_tf_uyum", "Min TF Uyum (5=tumu)", "5"),
+            ("min_sinyal_gucu", "Min Sinyal Gucu (0-1)", "0.5"),
+            ("max_funding_rate", "Max Funding Rate", "0.001"),
+            ("adx_trend_esik", "ADX Trend Esik", "20"),
+            ("volume_ma_periyot", "Volume MA Periyot", "20"),
+        ]
+        for key, label, default in se_signal:
+            row = ctk.CTkFrame(c1, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=170).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._se_entries[key] = e
+
+        # ── Column 2: Kaldıraç + Koruma ──
+        ctk.CTkLabel(c2, text="Kaldirac", font=font_title,
+                     text_color="#FFD54F").pack(anchor="w", padx=4, pady=(4, 0))
+
+        se_lev = [
+            ("max_kaldirac", "Max Kaldirac", "125"),
+            ("liq_carpani", "Liq Carpani", "0.70"),
+            ("emergency_liq_pct", "Emergency Liq %", "80"),
+            ("fee_rate", "Fee Rate", "0.0004"),
+        ]
+        for key, label, default in se_lev:
+            row = ctk.CTkFrame(c2, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=170).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._se_entries[key] = e
+
+        ctk.CTkLabel(c2, text="Trailing Stop", font=font_title,
+                     text_color="#00E676").pack(anchor="w", padx=4, pady=(8, 0))
+
+        se_trail = [
+            ("trailing_tetik_pct", "Tetik % (karda)", "50"),
+            ("trailing_callback_pct", "Callback % (max 5)", "10"),
+        ]
+        for key, label, default in se_trail:
+            row = ctk.CTkFrame(c2, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=170).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._se_entries[key] = e
+
+        # Uyarı kutusu
+        warn_frame = ctk.CTkFrame(c2, fg_color="#3a0f0f", border_color="#FF5252",
+                                  border_width=1, corner_radius=4)
+        warn_frame.pack(fill="x", padx=4, pady=(8, 0))
+        ctk.CTkLabel(warn_frame,
+                     text="SL YOK — sadece emergency ve\n"
+                          "trailing stop korumasi aktif.\n"
+                          "Binance max trailing callback: %5",
+                     font=font_desc, text_color="#FF8A80",
+                     justify="left").pack(padx=6, pady=4)
+
+        # ── Column 3: İndikatörler + Yön Dengesi ──
+        ctk.CTkLabel(c3, text="Indikatorler", font=font_title,
+                     text_color="#CE93D8").pack(anchor="w", padx=4, pady=(4, 0))
+
+        se_ind = [
+            ("ema_fast", "EMA Fast", "9"),
+            ("ema_slow", "EMA Slow", "21"),
+            ("macd_fast", "MACD Fast", "8"),
+            ("macd_slow", "MACD Slow", "17"),
+            ("macd_signal", "MACD Signal", "9"),
+            ("rsi_periyot", "RSI Periyot", "14"),
+            ("adx_periyot", "ADX Periyot", "14"),
+        ]
+        for key, label, default in se_ind:
+            row = ctk.CTkFrame(c3, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=170).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._se_entries[key] = e
+
+        ctk.CTkLabel(c3, text="Yon Dengesi", font=font_title,
+                     text_color="#4FC3F7").pack(anchor="w", padx=4, pady=(8, 0))
+
+        # Yön dengesi checkbox
+        yd_var = ctk.BooleanVar(value=True)
+        self._se_cb_vars["yon_denge_enabled"] = yd_var
+        ctk.CTkCheckBox(c3, text="Yon Dengesi Aktif", variable=yd_var,
+                        font=font).pack(anchor="w", padx=4, pady=2)
+
+        se_yon = [
+            ("max_ayni_yon", "Max Ayni Yon", "8"),
+        ]
+        for key, label, default in se_yon:
+            row = ctk.CTkFrame(c3, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=170).pack(side="left")
+            e = ctk.CTkEntry(row, width=60, font=font)
+            e.pack(side="right", padx=4)
+            self._se_entries[key] = e
+
+        # Yön oran combobox
+        row = ctk.CTkFrame(c3, fg_color="transparent")
+        row.pack(fill="x", padx=4, pady=1)
+        ctk.CTkLabel(row, text="Yon Oran", font=font, width=170).pack(side="left")
+        yon_var = ctk.StringVar(value="2-1")
+        self._se_combo_vars["yon_denge_oran"] = yon_var
+        ctk.CTkComboBox(row, values=["1-1", "2-1", "3-1", "4-1"],
+                        variable=yon_var, width=70,
+                        font=font).pack(side="right", padx=4)
+
+    def _load_system_e_from_config(self) -> None:
+        """Config'den System E ayarlarını panele yükle."""
+        se = self.controller.config.get("system_e", {})
+        for key, entry in self._se_entries.items():
+            val = se.get(key, "")
+            entry.delete(0, "end")
+            entry.insert(0, str(val))
+        for key, var in self._se_cb_vars.items():
+            var.set(se.get(key, False))
+        for key, var in self._se_combo_vars.items():
+            var.set(se.get(key, "2-1"))
+
+    def _save_system_e_to_config(self) -> None:
+        """System E ayarlarını config'e kaydet."""
+        c = self.controller.config
+        for key, entry in self._se_entries.items():
+            raw = entry.get().strip()
+            if not raw:
+                continue
+            try:
+                if "." in raw:
+                    c.set(f"system_e.{key}", float(raw))
+                else:
+                    c.set(f"system_e.{key}", int(raw))
+            except ValueError:
+                c.set(f"system_e.{key}", raw)
+        for key, var in self._se_cb_vars.items():
+            c.set(f"system_e.{key}", var.get())
+        for key, var in self._se_combo_vars.items():
+            c.set(f"system_e.{key}", var.get())
+
+    # ══════════════════════════════════════════════════════════════
+    # ════  SYSTEM G PANEL  ══════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════
+
+    def _build_system_g_panel(self) -> None:
+        """System G ayar paneli: optimizasyon + pozisyon parametreleri."""
+        self._scroll_g = ctk.CTkScrollableFrame(self)
+        f = self._scroll_g
+        self._sg_entries: dict[str, ctk.CTkEntry] = {}
+        self._sg_cb_vars: dict[str, ctk.BooleanVar] = {}
+
+        font_title = ctk.CTkFont(size=13, weight="bold")
+        font = ctk.CTkFont(size=12)
+
+        # ── Title ──
+        ctk.CTkLabel(f, text="System G - Coin Bazli Optimizasyon",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color="#7C4DFF").pack(anchor="w", padx=10, pady=(10, 5))
+
+        ctk.CTkLabel(f, text="Her coin icin 240 kombinasyon test edip en iyi "
+                     "kaldirac/TP/SL'yi otomatik bulan sistem.",
+                     font=ctk.CTkFont(size=11),
+                     text_color="#90A4AE").pack(anchor="w", padx=10, pady=(0, 10))
+
+        # ── Sinyal Ayarlari ──
+        ctk.CTkLabel(f, text="Sinyal Ayarlari", font=font_title,
+                     text_color="#7C4DFF").pack(anchor="w", padx=10, pady=(5, 3))
+
+        signal_defs = [
+            ("coin_sayisi", "Coin Sayisi:", "50"),
+            ("min_tf_uyum", "Min TF Uyum:", "3"),
+            ("min_sinyal_gucu", "Min Sinyal Gucu:", "0.6"),
+            ("max_funding_rate", "Max FR:", "0.001"),
+            ("vol_tf_min_count", "Min Hacim TF:", "2"),
+            ("vol_tf_threshold", "Hacim Esik:", "1.5"),
+        ]
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=2)
+        for key, label, default in signal_defs:
+            ctk.CTkLabel(row, text=label, font=font,
+                         text_color="#B0BEC5").pack(side="left", padx=(0, 2))
+            var = ctk.StringVar(value=default)
+            entry = ctk.CTkEntry(row, textvariable=var, width=50, height=28, font=font)
+            entry.pack(side="left", padx=(0, 8))
+            self._sg_entries[key] = entry
+
+        # MACD momentum
+        self._sg_macd_mom = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(f, text="MACD Momentum Zorunlu",
+                        variable=self._sg_macd_mom, font=font,
+                        checkbox_width=18, checkbox_height=18,
+                        ).pack(anchor="w", padx=10, pady=3)
+        self._sg_cb_vars["macd_momentum_required"] = self._sg_macd_mom
+
+        # ── Optimizasyon Ayarlari ──
+        ctk.CTkLabel(f, text="Optimizasyon Ayarlari", font=font_title,
+                     text_color="#7C4DFF").pack(anchor="w", padx=10, pady=(10, 3))
+
+        opt_defs = [
+            ("opt_days_back", "Backtest Gun:", "30"),
+            ("opt_cache_ttl", "Cache Saat:", "4"),
+            ("opt_min_trades", "Min Trade:", "5"),
+            ("opt_max_liq_rate", "Max Liq Orani:", "0.50"),
+        ]
+        row2 = ctk.CTkFrame(f, fg_color="transparent")
+        row2.pack(fill="x", padx=10, pady=2)
+        for key, label, default in opt_defs:
+            ctk.CTkLabel(row2, text=label, font=font,
+                         text_color="#B0BEC5").pack(side="left", padx=(0, 2))
+            var = ctk.StringVar(value=default)
+            entry = ctk.CTkEntry(row2, textvariable=var, width=50, height=28, font=font)
+            entry.pack(side="left", padx=(0, 8))
+            self._sg_entries[key] = entry
+
+        # Skor agirliklari
+        ctk.CTkLabel(f, text="Skor Agirliklari (toplam 1.0)", font=font,
+                     text_color="#90A4AE").pack(anchor="w", padx=10, pady=(5, 2))
+        row3 = ctk.CTkFrame(f, fg_color="transparent")
+        row3.pack(fill="x", padx=10, pady=2)
+        weight_defs = [
+            ("w_roi", "ROI:", "0.35"),
+            ("w_wr", "WinRate:", "0.25"),
+            ("w_dd", "MaxDD:", "0.20"),
+            ("w_liq", "LiqRate:", "0.15"),
+            ("w_tc", "TradeCount:", "0.05"),
+        ]
+        for key, label, default in weight_defs:
+            ctk.CTkLabel(row3, text=label, font=font,
+                         text_color="#B0BEC5").pack(side="left", padx=(0, 2))
+            var = ctk.StringVar(value=default)
+            entry = ctk.CTkEntry(row3, textvariable=var, width=40, height=28, font=font)
+            entry.pack(side="left", padx=(0, 6))
+            self._sg_entries[key] = entry
+
+        # ── Pozisyon Ayarlari ──
+        ctk.CTkLabel(f, text="Pozisyon Ayarlari", font=font_title,
+                     text_color="#7C4DFF").pack(anchor="w", padx=10, pady=(10, 3))
+
+        pos_defs = [
+            ("portfolio_divider", "Portfoy Bolen:", "12"),
+            ("max_pozisyon", "Max Pozisyon:", "12"),
+            ("max_per_coin", "Coin Basina Max:", "1"),
+            ("max_hold_hours", "Max Bekleme (saat):", "24"),
+            ("cooldown_after_liq", "Liq Cooldown (dk):", "60"),
+        ]
+        row4 = ctk.CTkFrame(f, fg_color="transparent")
+        row4.pack(fill="x", padx=10, pady=2)
+        for key, label, default in pos_defs:
+            ctk.CTkLabel(row4, text=label, font=font,
+                         text_color="#B0BEC5").pack(side="left", padx=(0, 2))
+            var = ctk.StringVar(value=default)
+            entry = ctk.CTkEntry(row4, textvariable=var, width=45, height=28, font=font)
+            entry.pack(side="left", padx=(0, 8))
+            self._sg_entries[key] = entry
+
+        # ── Info ──
+        ctk.CTkLabel(f, text="Kaldirac/TP/SL test araliklari config.json'dan okunur.\n"
+                     "Leverages: [25,50,75,100,125,150]\n"
+                     "TP%: [0.3,0.5,0.7,1.0,1.5,2.0,2.5,3.0]\n"
+                     "SL: [no_sl, 0.5%, 0.7%, 1.0%, 1.5%]",
+                     font=ctk.CTkFont(size=11),
+                     text_color="#546E7A", justify="left",
+                     ).pack(anchor="w", padx=10, pady=(15, 5))
+
+    def _load_system_g_from_config(self) -> None:
+        """Config'den System G ayarlarini yukle."""
+        c = self.controller.config
+        mapping = {
+            "coin_sayisi": ("system_g.coin_sayisi", "50"),
+            "min_tf_uyum": ("system_g.min_tf_uyum", "3"),
+            "min_sinyal_gucu": ("system_g.min_sinyal_gucu", "0.6"),
+            "max_funding_rate": ("system_g.max_funding_rate", "0.001"),
+            "vol_tf_min_count": ("system_g.vol_tf_min_count", "2"),
+            "vol_tf_threshold": ("system_g.vol_tf_threshold", "1.5"),
+            "opt_days_back": ("system_g.optimization.days_back", "30"),
+            "opt_cache_ttl": ("system_g.optimization.cache_ttl_hours", "4"),
+            "opt_min_trades": ("system_g.optimization.min_trades_required", "5"),
+            "opt_max_liq_rate": ("system_g.optimization.max_liq_rate", "0.50"),
+            "w_roi": ("system_g.optimization.score_weights.roi", "0.35"),
+            "w_wr": ("system_g.optimization.score_weights.win_rate", "0.25"),
+            "w_dd": ("system_g.optimization.score_weights.max_drawdown", "0.20"),
+            "w_liq": ("system_g.optimization.score_weights.liq_rate", "0.15"),
+            "w_tc": ("system_g.optimization.score_weights.trade_count", "0.05"),
+            "portfolio_divider": ("system_g.position.portfolio_divider", "12"),
+            "max_pozisyon": ("system_g.position.max_pozisyon", "12"),
+            "max_per_coin": ("system_g.position.max_per_coin", "1"),
+            "max_hold_hours": ("system_g.position.max_hold_hours", "24"),
+            "cooldown_after_liq": ("system_g.position.cooldown_after_liq_minutes", "60"),
+        }
+        for key, (cfg_key, default) in mapping.items():
+            val = str(c.get(cfg_key, default))
+            if key in self._sg_entries:
+                self._sg_entries[key].delete(0, "end")
+                self._sg_entries[key].insert(0, val)
+
+        self._sg_cb_vars["macd_momentum_required"].set(
+            c.get("system_g.macd_momentum_required", True))
+
+    def _save_system_g_to_config(self) -> None:
+        """GUI'den System G ayarlarini config'e kaydet."""
+        c = self.controller.config
+        direct_map = {
+            "coin_sayisi": "system_g.coin_sayisi",
+            "min_tf_uyum": "system_g.min_tf_uyum",
+            "min_sinyal_gucu": "system_g.min_sinyal_gucu",
+            "max_funding_rate": "system_g.max_funding_rate",
+            "vol_tf_min_count": "system_g.vol_tf_min_count",
+            "vol_tf_threshold": "system_g.vol_tf_threshold",
+            "opt_days_back": "system_g.optimization.days_back",
+            "opt_cache_ttl": "system_g.optimization.cache_ttl_hours",
+            "opt_min_trades": "system_g.optimization.min_trades_required",
+            "opt_max_liq_rate": "system_g.optimization.max_liq_rate",
+            "w_roi": "system_g.optimization.score_weights.roi",
+            "w_wr": "system_g.optimization.score_weights.win_rate",
+            "w_dd": "system_g.optimization.score_weights.max_drawdown",
+            "w_liq": "system_g.optimization.score_weights.liq_rate",
+            "w_tc": "system_g.optimization.score_weights.trade_count",
+            "portfolio_divider": "system_g.position.portfolio_divider",
+            "max_pozisyon": "system_g.position.max_pozisyon",
+            "max_per_coin": "system_g.position.max_per_coin",
+            "max_hold_hours": "system_g.position.max_hold_hours",
+            "cooldown_after_liq": "system_g.position.cooldown_after_liq_minutes",
+        }
+        float_keys = {"min_sinyal_gucu", "max_funding_rate", "vol_tf_threshold",
+                       "opt_max_liq_rate", "w_roi", "w_wr", "w_dd", "w_liq", "w_tc"}
+        int_keys = {"coin_sayisi", "min_tf_uyum", "vol_tf_min_count", "opt_days_back",
+                     "opt_cache_ttl", "opt_min_trades", "portfolio_divider",
+                     "max_pozisyon", "max_per_coin", "max_hold_hours", "cooldown_after_liq"}
+
+        for key, cfg_key in direct_map.items():
+            if key not in self._sg_entries:
+                continue
+            raw = self._sg_entries[key].get().strip()
+            try:
+                if key in float_keys:
+                    c.set(cfg_key, float(raw))
+                elif key in int_keys:
+                    c.set(cfg_key, int(raw))
+                else:
+                    c.set(cfg_key, raw)
+            except ValueError:
+                pass
+
+        c.set("system_g.macd_momentum_required",
+              self._sg_cb_vars["macd_momentum_required"].get())
+
+    # ══════════════════════════════════════════════════════════════
+    # ════  SYSTEM F PANEL (stub — ayarlar Son Kursun panelinde)  ═
+    # ══════════════════════════════════════════════════════════════
+
+    def _build_system_f_panel(self) -> None:
+        """System F (Son Kursun) ayar paneli — temel ayarlar."""
+        self._scroll_f = ctk.CTkScrollableFrame(self)
+        f = self._scroll_f
+        self._sf_entries: dict[str, ctk.CTkEntry] = {}
+
+        ctk.CTkLabel(f, text="System F — Son Kursun",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color="#E53935").pack(anchor="w", padx=8, pady=(6, 2))
+        ctk.CTkLabel(f, text="Ayarlar config.json > system_f blogundan yonetilir.",
+                     font=ctk.CTkFont(size=11),
+                     text_color="gray").pack(anchor="w", padx=8, pady=(0, 6))
+
+    def _load_system_f_from_config(self) -> None:
+        pass
+
+    def _save_system_f_to_config(self) -> None:
+        pass
+
+    # ══════════════════════════════════════════════════════════════
+    # ════  SYSTEM H PANEL (stub — ayarlar config.json'dan)  ═════
+    # ══════════════════════════════════════════════════════════════
+
+    def _build_system_h_panel(self) -> None:
+        """System H (Hibrit) ayar paneli — A+B+D+F entegrasyon."""
+        self._scroll_h = ctk.CTkScrollableFrame(self)
+        f = self._scroll_h
+        self._sh_entries: dict[str, ctk.CTkEntry] = {}
+        self._sh_cb_vars: dict[str, ctk.BooleanVar] = {}
+        self._sh_combo_vars: dict[str, ctk.StringVar] = {}
+
+        font = ctk.CTkFont(size=11)
+        font_title = ctk.CTkFont(size=12, weight="bold")
+
+        ctk.CTkLabel(f, text="System H — Hibrit (A+B+D+F)",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color="#00BCD4").pack(anchor="w", padx=8, pady=(6, 2))
+
+        # 3-column layout
+        col_container = ctk.CTkFrame(f, fg_color="transparent")
+        col_container.pack(fill="both", expand=True)
+        col_container.columnconfigure(0, weight=1)
+        col_container.columnconfigure(1, weight=1)
+        col_container.columnconfigure(2, weight=1)
+
+        c1 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c1.grid(row=0, column=0, sticky="nsew", padx=3)
+        c2 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c2.grid(row=0, column=1, sticky="nsew", padx=3)
+        c3 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c3.grid(row=0, column=2, sticky="nsew", padx=3)
+
+        def _field(parent, label, key, default, width=60):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160, anchor="w").pack(side="left")
+            e = ctk.CTkEntry(row, width=width, height=24, font=font)
+            e.insert(0, str(default))
+            e.pack(side="right", padx=4)
+            self._sh_entries[key] = e
+
+        def _check(parent, label, key, default=False):
+            var = ctk.BooleanVar(value=default)
+            ctk.CTkCheckBox(parent, text=label, variable=var, font=font).pack(anchor="w", padx=8, pady=1)
+            self._sh_cb_vars[key] = var
+
+        def _section(parent, title, color="#00BCD4"):
+            ctk.CTkLabel(parent, text=title, font=font_title,
+                         text_color=color).pack(anchor="w", padx=4, pady=(6, 2))
+
+        # ─── COL 1: Genel + Zoom ───
+        _section(c1, "Genel Ayarlar")
+        _field(c1, "Coin sayisi:", "coin_sayisi", 50)
+        _field(c1, "Tarama TF:", "scan_timeframe", "5m", 60)
+        _field(c1, "Kline limit:", "kline_limit", 200)
+        _field(c1, "Max finalist:", "max_finalists", 5)
+        _field(c1, "Tarama arali (sn):", "scan_interval_seconds", 30)
+        _field(c1, "Max pozisyon:", "max_positions", 12)
+        _field(c1, "Min skor:", "min_buy_score", 55)
+        _field(c1, "Portfoy bolen:", "portfolio_divider", 12)
+
+        _section(c1, "Zoom Diyafram (D'den)", "#26C6DA")
+        _field(c1, "Swing N:", "swing_n", 10)
+        _field(c1, "Zoom kline limit:", "zoom_kline_limit", 200)
+        _field(c1, "TF carpan (x12):", "tf_multiplier", 12)
+        _field(c1, "Min dalga sayisi:", "min_wave_count", 4)
+        _field(c1, "Max CV:", "max_cv", 1.5)
+        _field(c1, "Max ATR %:", "max_atr_percent", 5.0)
+
+        # ─── COL 2: Kaldirac + SL/TP ───
+        _section(c2, "Kaldirac (G Bazli)")
+        _field(c2, "Min kaldirac:", "min_leverage", 2)
+        _field(c2, "Binance max:", "binance_max_leverage", 125)
+        _field(c2, "Fee %:", "fee_pct", 0.08)
+        _field(c2, "Slippage %:", "slippage_pct", 0.03)
+        _field(c2, "Liq seviyesi:", "liq_seviyesi", 0.7)
+        _field(c2, "Fee rate:", "fee_rate", 0.0004)
+
+        _section(c2, "SL / TP / Trailing (G Bazli)", "#FF8A65")
+        _field(c2, "SL carpan (trend):", "sl_mult_trend", 1.5)
+        _field(c2, "SL carpan (ranging):", "sl_mult_ranging", 2.0)
+        _field(c2, "Liq carpan (trend):", "liq_mult_trend", 3.0)
+        _field(c2, "Liq carpan (ranging):", "liq_mult_ranging", 4.0)
+        _field(c2, "Trail tetik (xG):", "trailing_trigger_g_mult", 2.5)
+        _field(c2, "Trail mesafe (xG):", "trailing_callback_g_mult", 0.5)
+        _field(c2, "Ranging TP (xG):", "ranging_tp_g_mult", 3.0)
+        _field(c2, "BB periyot:", "bb_period", 20)
+        _field(c2, "BB std:", "bb_std", 2.0)
+        _field(c2, "Limit ATR offset:", "limit_atr_offset", 0.15)
+        _field(c2, "Limit timeout (sn):", "limit_timeout_seconds", 300)
+
+        # ─── COL 3: Rejim + P(win)/EV + Yon Denge ───
+        _section(c3, "ER + Hurst Rejim (B'den)", "#CE93D8")
+        _field(c3, "ER makro (ranging):", "er_macro_ranging", 0.15)
+        _field(c3, "ER makro (trending):", "er_macro_trending", 0.35)
+        _field(c3, "ER mikro (ranging):", "er_micro_ranging", 0.20)
+        _field(c3, "ER mikro (trending):", "er_micro_trending", 0.40)
+        _field(c3, "Hurst (ranging):", "hurst_ranging", 0.45)
+        _field(c3, "Hurst (trending):", "hurst_trending", 0.55)
+        _field(c3, "Yon mum sayisi:", "yon_mum_sayisi", 72)
+        _field(c3, "Rejim hysteresis:", "regime_hysteresis", 3)
+
+        _section(c3, "P(win)/EV (F'den)", "#00BCD4")
+        ctk.CTkLabel(c3, text="EV skor carpani olarak kullanilir\n"
+                              "(hard filtre degil, max 1.3x boost)",
+                     font=ctk.CTkFont(size=10), text_color="gray",
+                     justify="left").pack(anchor="w", padx=8)
+
+        _section(c3, "Yon Dengesi", "#FFD54F")
+        _check(c3, "Yon dengesi aktif", "direction_balance_enabled", True)
+        row = ctk.CTkFrame(c3, fg_color="transparent")
+        row.pack(fill="x", padx=4, pady=1)
+        ctk.CTkLabel(row, text="Denge orani:", font=font, width=160, anchor="w").pack(side="left")
+        self._sh_combo_vars["direction_balance_ratio"] = ctk.StringVar(value="2-1")
+        ctk.CTkComboBox(row, values=["1-1", "2-1", "3-1", "4-1", "5-1"],
+                        variable=self._sh_combo_vars["direction_balance_ratio"],
+                        width=70, font=font).pack(side="right", padx=4)
+        _field(c3, "Max ayni yon:", "max_same_direction", 8)
+
+    def _load_system_h_from_config(self) -> None:
+        sh = self.controller.config.get("system_h", {})
+        for key, entry in self._sh_entries.items():
+            val = sh.get(key)
+            if val is not None:
+                entry.delete(0, "end")
+                entry.insert(0, str(val))
+        for key, var in self._sh_cb_vars.items():
+            val = sh.get(key)
+            if val is not None:
+                var.set(val)
+        for key, var in self._sh_combo_vars.items():
+            val = sh.get(key)
+            if val is not None:
+                var.set(str(val))
+
+    def _save_system_h_to_config(self) -> None:
+        c = self.controller.config
+        for key, entry in self._sh_entries.items():
+            raw = entry.get().strip()
+            if not raw:
+                continue
+            try:
+                if "." in raw:
+                    c.set(f"system_h.{key}", float(raw))
+                else:
+                    c.set(f"system_h.{key}", int(raw))
+            except ValueError:
+                c.set(f"system_h.{key}", raw)
+        for key, var in self._sh_cb_vars.items():
+            c.set(f"system_h.{key}", var.get())
+        for key, var in self._sh_combo_vars.items():
+            c.set(f"system_h.{key}", var.get())

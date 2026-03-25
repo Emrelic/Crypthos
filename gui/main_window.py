@@ -9,10 +9,19 @@ from gui.panels.market_panel import MarketPanel
 from gui.panels.activity_panel import ActivityPanel
 from gui.panels.settings_panel import SettingsPanel
 from gui.panels.scanner_panel import ScannerPanel
+from gui.panels.system_b_panel import SystemBPanel
+from gui.panels.system_c_panel import SystemCPanel
+from gui.panels.system_d_panel import SystemDPanel
+from gui.panels.system_e_panel import SystemEPanel
+from gui.panels.system_f_panel import SystemFPanel
 from gui.panels.strategy_settings_panel import StrategySettingsPanel
 from gui.panels.indicator_analysis_panel import IndicatorAnalysisPanel
 from gui.panels.indicator_detail_panel import IndicatorDetailPanel
 from gui.panels.trade_report_panel import TradeReportPanel
+from gui.panels.backtest_panel import BacktestPanel
+from gui.panels.heatmap_panel import HeatmapPanel
+from gui.panels.system_g_panel import SystemGPanel
+from gui.panels.system_h_panel import SystemHPanel
 
 
 class MainWindow(ctk.CTk):
@@ -38,7 +47,14 @@ class MainWindow(ctk.CTk):
         self._tabview = ctk.CTkTabview(self)
         self._tabview.pack(fill="both", expand=True, padx=10, pady=(5, 10))
 
-        tab_scanner = self._tabview.add("Tarayici")
+        tab_scanner = self._tabview.add("System A")
+        tab_system_b = self._tabview.add("System B")
+        tab_system_c = self._tabview.add("System C")
+        tab_system_d = self._tabview.add("System D")
+        tab_system_e = self._tabview.add("System E")
+        tab_system_f = self._tabview.add("Son Kursun")
+        tab_system_g = self._tabview.add("System G")
+        tab_system_h = self._tabview.add("System H")
         tab_quick = self._tabview.add("Hizli Emir")
         tab_market = self._tabview.add("Piyasa")
         tab_strategy = self._tabview.add("Strateji")
@@ -46,10 +62,19 @@ class MainWindow(ctk.CTk):
         tab_analysis = self._tabview.add("Grafik Analiz")
         tab_ind_detail = self._tabview.add("Indikator Detay")
         tab_report = self._tabview.add("Islem Raporu")
+        tab_backtest = self._tabview.add("Backtest")
+        tab_heatmap = self._tabview.add("TF Harita")
         tab_activity = self._tabview.add("Aktivite")
         tab_settings = self._tabview.add("Ayarlar")
 
         self._scanner_panel = ScannerPanel(tab_scanner, controller)
+        self._system_b_panel = SystemBPanel(tab_system_b, controller)
+        self._system_c_panel = SystemCPanel(tab_system_c, controller)
+        self._system_d_panel = SystemDPanel(tab_system_d, controller)
+        self._system_e_panel = SystemEPanel(tab_system_e, controller)
+        self._system_f_panel = SystemFPanel(tab_system_f, controller)
+        self._system_g_panel = SystemGPanel(tab_system_g, controller)
+        self._system_h_panel = SystemHPanel(tab_system_h, controller)
         self._quick_panel = QuickOrderPanel(tab_quick, controller)
         self._market_panel = MarketPanel(tab_market, controller)
         self._strategy_panel = StrategyPanel(tab_strategy, controller)
@@ -59,6 +84,8 @@ class MainWindow(ctk.CTk):
         self._ind_detail_panel = IndicatorDetailPanel(tab_ind_detail, controller)
         self._ind_detail_panel.pack(fill="both", expand=True)
         self._report_panel = TradeReportPanel(tab_report, controller)
+        self._backtest_panel = BacktestPanel(tab_backtest, controller)
+        self._heatmap_panel = HeatmapPanel(tab_heatmap, controller)
         self._activity_panel = ActivityPanel(tab_activity, controller)
         self._settings_panel = SettingsPanel(tab_settings, controller)
 

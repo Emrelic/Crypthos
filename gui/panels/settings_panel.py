@@ -182,6 +182,9 @@ class SettingsPanel(ctk.CTkFrame):
                     str(risk.get("daily_loss_limit_usdt", 5.0)))
         self._field(scroll, "max_drawdown", "Max Drawdown %",
                     str(risk.get("max_drawdown_percent", 20.0)))
+        self._checkbox(scroll, "consecutive_pause_enabled",
+                      "Ardisik Kayip Duraklatma",
+                      risk.get("consecutive_loss_pause_enabled", True))
         self._field(scroll, "max_consecutive", "Max Ardisik Kayip",
                     str(risk.get("max_consecutive_losses", 5)))
 
@@ -357,6 +360,8 @@ class SettingsPanel(ctk.CTkFrame):
               float(self._entries["daily_loss_limit"].get() or 5.0))
         c.set("risk.max_drawdown_percent",
               float(self._entries["max_drawdown"].get() or 20.0))
+        c.set("risk.consecutive_loss_pause_enabled",
+              self._entries["consecutive_pause_enabled"].get())
         c.set("risk.max_consecutive_losses",
               int(self._entries["max_consecutive"].get() or 5))
 

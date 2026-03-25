@@ -271,16 +271,128 @@ class PositionManager:
         pos.entry_mode = entry_mode
         pos.mr_tp_price = mr_tp_price
 
+        # System F mode: gercek SL (1.5xATR), entry_bb_width alaninda sl_pct sakli
+        if entry_mode == "SYSTEM_F":
+            sf = self._config.get("system_f", {})
+            sf_sl_pct = entry_bb_width / 100.0  # entry_bb_width stores sl_pct (%)
+            fee = sf.get("fee_rate", 0.0004)
+            if sf_sl_pct > 0 and price > 0:
+                if side == OrderSide.BUY_LONG:
+                    pos.initial_sl = price * (1 - sf_sl_pct)
+                else:
+                    pos.initial_sl = price * (1 + sf_sl_pct)
+                pos.trailing_stop = pos.initial_sl
+                logger.info(f"  [SysF] SL: {sf_sl_pct*100:.3f}% → {pos.initial_sl:.6f}")
+
+        # System E mode: SL yok, sadece emergency (SL override yapma)
+        elif entry_mode == "SYSTEM_E":
+            # Emergency price zaten hesaplandı (yukarıda), SL'yi devre dışı bırak
+            # initial_sl'yi emergency seviyesine çek (software SL'yi engellemek için)
+            pos.initial_sl = pos.emergency_close_price
+            pos.trailing_stop = pos.emergency_close_price
+            logger.info(f"  [SysE] No SL — emergency only @ {pos.emergency_close_price:.6f}")
+
+        # System D mode: G bazlı SL (G değeri entry_bb_width alanında saklanır)
+        elif entry_mode == "SYSTEM_D":
+            sd = self._config.get("system_d", {})
+            G_val = entry_bb_width  # G değeri bb_width alanında
+            if G_val > 0 and price > 0:
+                if entry_regime in ("TREND",):
+                    sl_carpan = sd.get("sl_carpan_trend", 1.5)
+                else:
+                    sl_carpan = sd.get("sl_carpan_ranging", 2.0)
+                slippage = sd.get("slippage_pct", 0.03) / 100
+                fee = sd.get("fee_pct", 0.08) / 100
+                sd_sl_pct = (sl_carpan * G_val) / 100 + fee + slippage
+                sd_sl_pct = max(sd_sl_pct, fee * 2)
+                if side == OrderSide.BUY_LONG:
+                    pos.initial_sl = price * (1 - sd_sl_pct)
+                else:
+                    pos.initial_sl = price * (1 + sd_sl_pct)
+                pos.trailing_stop = pos.initial_sl
+                logger.info(f"  [SysD] SL override: {sl_carpan}xG={G_val:.3f}% → "
+                            f"SL={pos.initial_sl:.6f} ({sd_sl_pct*100:.3f}%)")
+
+        # System B mode: G bazlı SL (G değeri entry_bb_width alanında saklanır)
+        # SL ve trailing zaten _place_initial_trailing_system_b tarafından Binance'e gönderiliyor
+        # Burada sadece software SL'yi doğru ayarlıyoruz
+        elif entry_mode == "SYSTEM_B":
+            sb = self._config.get("system_b", {})
+            G_val = entry_bb_width  # G değeri bb_width alanında iletiliyor
+            if G_val > 0 and price > 0:
+                sl_carpan = sb.get("sl_carpan", 1.5)
+                sb_sl_pct = (sl_carpan * G_val) / 100 + sb.get("slippage_buffer", 0.1) / 100
+                sb_sl_pct = max(sb_sl_pct, 0.001)
+                if side == OrderSide.BUY_LONG:
+                    pos.initial_sl = price * (1 - sb_sl_pct)
+                else:
+                    pos.initial_sl = price * (1 + sb_sl_pct)
+                pos.trailing_stop = pos.initial_sl
+                logger.info(f"  [SysB] SL override: {sl_carpan}xG={G_val:.3f}% → "
+                            f"SL={pos.initial_sl:.6f} ({sb_sl_pct*100:.3f}%)")
+
+        # System G mode: optimize edilmis SL (sl_pct entry_bb_width alaninda sakli)
+        # Server-side SL + TP zaten _place_initial_orders_system_g'de gonderiliyor
+        # Burada sadece software SL'yi dogru ayarliyoruz (yedek)
+        elif entry_mode == "SYSTEM_G":
+            sg_sl_pct = entry_bb_width / 100.0  # entry_bb_width stores sl_pct (%)
+            if sg_sl_pct > 0 and price > 0:
+                fee = self._config.get("system_g.fee_rate", 0.0004)
+                total_sl_pct = sg_sl_pct + fee * 2  # fee-aware
+                if side == OrderSide.BUY_LONG:
+                    pos.initial_sl = price * (1 - total_sl_pct)
+                else:
+                    pos.initial_sl = price * (1 + total_sl_pct)
+                pos.trailing_stop = pos.initial_sl
+                logger.info(f"  [SysG] SL override: {sg_sl_pct*100:.3f}% → "
+                            f"SL={pos.initial_sl:.6f} ({total_sl_pct*100:.3f}% fee-aware)")
+            else:
+                # no_sl mode: SL'yi emergency seviyesine cek (System A karismasin)
+                pos.initial_sl = pos.emergency_close_price
+                pos.trailing_stop = pos.emergency_close_price
+                logger.info(f"  [SysG] No SL — emergency only @ {pos.emergency_close_price:.6f}")
+
+        # System H mode: G bazlı SL (G değeri entry_bb_width alanında saklanır)
+        elif entry_mode == "SYSTEM_H":
+            sh = self._config.get("system_h", {})
+            G_val = entry_bb_width  # G değeri bb_width alanında
+            if G_val > 0 and price > 0:
+                if entry_regime in ("TRENDING",):
+                    sl_carpan = sh.get("sl_mult_trend", 1.5)
+                else:
+                    sl_carpan = sh.get("sl_mult_ranging", 2.0)
+                slippage = sh.get("slippage_pct", 0.03) / 100
+                fee = sh.get("fee_pct", 0.08) / 100
+                sh_sl_pct = (sl_carpan * G_val) / 100 + fee + slippage
+                sh_sl_pct = max(sh_sl_pct, fee * 2)
+                if side == OrderSide.BUY_LONG:
+                    pos.initial_sl = price * (1 - sh_sl_pct)
+                else:
+                    pos.initial_sl = price * (1 + sh_sl_pct)
+                pos.trailing_stop = pos.initial_sl
+                logger.info(f"  [SysH] SL override: {sl_carpan}xG={G_val:.3f}% → "
+                            f"SL={pos.initial_sl:.6f} ({sh_sl_pct*100:.3f}%)")
+
         # MR mode: override SL to tighter value (1.5×ATR instead of 2×ATR)
-        if entry_mode == "MEAN_REVERSION" and atr > 0 and price > 0:
+        # Fee-aware: SL mesafesi ATR + fee + slippage dahil hesaplanır
+        elif entry_mode == "MEAN_REVERSION" and atr > 0 and price > 0:
             mr_sl_mult = strat.get("mr_sl_atr_mult", 1.5)
             mr_sl_pct = (atr * mr_sl_mult) / price
+            fee_pct_val = strat.get("fee_pct", 0.10) / 100.0  # 0.001
+            slippage_pct_val = fee_pct_val * strat.get("slippage_mult", 0.5)
+            # SL mesafesi = ATR bazlı + fee + slippage (fee dahil gerçekçi SL)
+            mr_sl_pct_total = mr_sl_pct + fee_pct_val + slippage_pct_val
+            # Minimum SL: en az 2× fee (fee'den küçük SL anlamsız)
+            min_sl_pct = fee_pct_val * 2
+            mr_sl_pct_total = max(mr_sl_pct_total, min_sl_pct)
             if side == OrderSide.BUY_LONG:
-                pos.initial_sl = price * (1 - mr_sl_pct)
+                pos.initial_sl = price * (1 - mr_sl_pct_total)
             else:
-                pos.initial_sl = price * (1 + mr_sl_pct)
+                pos.initial_sl = price * (1 + mr_sl_pct_total)
             pos.trailing_stop = pos.initial_sl
-            logger.info(f"  [MR] SL override: {mr_sl_mult}xATR = {pos.initial_sl:.6f} "
+            logger.info(f"  [MR] SL override: {mr_sl_mult}xATR+fee = {pos.initial_sl:.6f} "
+                        f"(ATR={mr_sl_pct*100:.3f}% + fee={fee_pct_val*100:.3f}% + "
+                        f"slip={slippage_pct_val*100:.3f}%) "
                         f"| TP: BB middle = {mr_tp_price:.6f}")
 
         self._positions[symbol] = pos
@@ -317,10 +429,10 @@ class PositionManager:
                 tp_atr_mult = strat.get("adx_regime_ranging_tp_atr", 3.0)
                 if atr > 0 and price > 0:
                     if side == OrderSide.BUY_LONG:
-                        pos.tp = price * (1 + (atr * tp_atr_mult / price))
+                        pos.initial_tp = price * (1 + (atr * tp_atr_mult / price))
                     else:
-                        pos.tp = price * (1 - (atr * tp_atr_mult / price))
-                    tp = pos.tp
+                        pos.initial_tp = price * (1 - (atr * tp_atr_mult / price))
+                    tp = pos.initial_tp
                     logger.info(f"  [ADX RANGING] TP={tp_atr_mult}xATR @ {tp:.6f}")
         trailing_activate_pct = atr_pct * activate_mult  # 7xATR yuzde hareket
         trailing_distance_pct = atr_pct * distance_mult  # 1xATR geri gelme yuzde
@@ -366,7 +478,31 @@ class PositionManager:
             if current_price < pos.lowest_price:
                 pos.lowest_price = current_price
 
-        # === SAVAS MODU (Battle Mode) ===
+        # === SYSTEM H MODE (en yuksek oncelik) ===
+        if pos.entry_mode == "SYSTEM_H":
+            return self._check_system_h(pos, current_price)
+
+        # === SYSTEM G MODE ===
+        if pos.entry_mode == "SYSTEM_G":
+            return self._check_system_g(pos, current_price)
+
+        # === SYSTEM F MODE (SL + staged TP) ===
+        if pos.entry_mode == "SYSTEM_F":
+            return self._check_system_f(pos, current_price)
+
+        # === SYSTEM E MODE (sadece emergency) ===
+        if pos.entry_mode == "SYSTEM_E":
+            return self._check_system_e(pos, current_price)
+
+        # === SYSTEM D MODE ===
+        if pos.entry_mode == "SYSTEM_D":
+            return self._check_system_d(pos, current_price)
+
+        # === SYSTEM B MODE ===
+        if pos.entry_mode == "SYSTEM_B":
+            return self._check_system_b(pos, current_price)
+
+        # === SAVAS MODU (Battle Mode) — sadece System A ===
         battle_mode = self._config.get("strategy.battle_mode", False)
         if battle_mode and pos.leverage > 1:
             return self._check_battle_mode(pos, current_price, confluence, divergences)
@@ -492,10 +628,16 @@ class PositionManager:
         if self._check_emergency_close(pos, price):
             return self.EXIT_EMERGENCY
 
-        # === BELOW FEE BREAKEVEN: Fight mode - only emergency closes ===
+        # === BELOW FEE BREAKEVEN: Fight mode ===
         if net_roi < 0:
-            # We're losing money. Only emergency close saves us.
-            # No SL, no trailing, no confluence exit. HOLD and pray.
+            # Software SL still active — controlled %35 ROI loss is better than
+            # waiting for emergency at %56 ROI loss. Server SL at 2×ATR is the
+            # wider crash safety net; software SL is the tighter trading logic.
+            if strat.get("sl_enabled", True):
+                if self._check_stop_loss(pos, price):
+                    logger.info(f"[SAVAS] {pos.symbol} software SL triggered in loss "
+                                f"(net_roi={net_roi:.1f}%). Controlled exit.")
+                    return self.EXIT_SL
             return "HOLD"
 
         # === ABOVE FEE BREAKEVEN: Smart exit mode ===
@@ -549,14 +691,14 @@ class PositionManager:
         """Battle mode trailing: very wide distance, lets profits run.
         Uses 2x the normal ATR activation to be more patient."""
         lev = pos.leverage
-        fee_roi = 0.001 * lev * 100
         strat = self._config.get("strategy", {})
+        fee_roi = strat.get("fee_pct", 0.10) / 100.0 * lev * 100
         trailing_mode = strat.get("trailing_mode", "roi")
 
         if trailing_mode == "atr" and pos.atr_at_entry > 0:
             atr = pos.atr_at_entry
             # Battle mode: 2x normal activation, 2x normal distance (more patient)
-            normal_activate = strat.get("trailing_atr_activate_mult", 7.0)
+            normal_activate = strat.get("trailing_atr_activate_mult", 4.0)
             normal_distance = strat.get("trailing_atr_distance_mult", 1.0)
             activate_mult = normal_activate * 2.0
             distance_mult = normal_distance * 2.0
@@ -625,7 +767,240 @@ class PositionManager:
         else:
             return price >= pos.trailing_stop
 
+    # ──── SYSTEM E MODE ────
+
+    def _check_system_e(self, pos: ActivePosition, price: float) -> str:
+        """System E exit logic.
+
+        System E: SL yok, sadece emergency.
+        Trailing + emergency server-side çalışır.
+        Software sadece emergency yedek kontrol yapar.
+        Time limit yok.
+        """
+        strat = self._config.get("strategy", {})
+
+        # === EMERGENCY (always active — tek çıkış yolu) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        return "HOLD"
+
+    # ──── SYSTEM F MODE (Son Kursun) ────
+
+    def _check_system_f(self, pos: ActivePosition, price: float) -> str:
+        """System F v2 exit logic: Emergency + SL + Dinamik TP.
+
+        Server-side: SL + Emergency + Trailing (birincil)
+        Software-side (yedek):
+        0. Emergency anti-liquidation
+        1. Software SL
+        2. Dinamik TP: mr_tp_price alaninda saklanan hedef fiyata ulasinca kapat
+           mr_tp_price = 0 ise config'deki target_roi_pct kullanilir (fallback)
+        """
+        strat = self._config.get("strategy", {})
+        sf = self._config.get("system_f", {})
+
+        # === 0. EMERGENCY (always active) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        # === 1. SOFTWARE SL (yedek — server SL birincil) ===
+        if strat.get("sl_enabled", True):
+            if self._check_stop_loss(pos, price):
+                return self.EXIT_SL
+
+        # === 2. DINAMIK TP — swing forward bazli hedef fiyat ===
+        pnl_pct = self._get_pnl_pct(pos, price)
+
+        # Dinamik TP: mr_tp_price alaninda saklanan hedef fiyat
+        dynamic_tp = pos.mr_tp_price
+        if dynamic_tp > 0:
+            tp_reached = False
+            if pos.side == OrderSide.BUY_LONG and price >= dynamic_tp:
+                tp_reached = True
+            elif pos.side == OrderSide.SELL_SHORT and price <= dynamic_tp:
+                tp_reached = True
+
+            if tp_reached:
+                logger.info(f"[SysF] {pos.symbol} DINAMIK TP! fiyat={price:.6f} "
+                            f"hedef={dynamic_tp:.6f} ROI={pnl_pct:+.1f}% "
+                            f"→ TAMAMINI KAPAT (trailing yedek)")
+                return self.EXIT_TP
+        else:
+            # Fallback: config'deki sabit ROI hedefi
+            target_roi = sf.get("target_roi_pct", 100.0)
+            if pnl_pct >= target_roi:
+                logger.info(f"[SysF] {pos.symbol} ROI HEDEF! ROI={pnl_pct:+.1f}% "
+                            f">= {target_roi}% → TAMAMINI KAPAT")
+                return self.EXIT_TP
+
+        return "HOLD"
+
     # ──── MEAN REVERSION MODE ────
+
+    def _check_system_h(self, pos: ActivePosition, price: float) -> str:
+        """System H exit logic.
+
+        Server-side: SL (STOP_MARKET) + trailing/TP Binance'de çalışır.
+        Software tarafı:
+        0. Emergency anti-liquidation
+        1. Software SL (yedek, server SL dolmazsa)
+        2. Signal exit (A'dan — confluence reversal, kademeli eşik)
+        3. Time limit (8 saat, kârda kapat, zararda server'a bırak)
+        """
+        strat = self._config.get("strategy", {})
+        sh = self._config.get("system_h", {})
+
+        # === 0. EMERGENCY (always active) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        # === 1. SOFTWARE SL (yedek — server SL birincil) ===
+        if strat.get("sl_enabled", True):
+            if self._check_stop_loss(pos, price):
+                return self.EXIT_SL
+
+        # === 2. SIGNAL EXIT (A'dan — confluence reversal) ===
+        # System H, A'nın sinyal çıkış mantığını koruyor
+        if strat.get("signal_exit_enabled", True):
+            # Bu check dışarıdan confluence ile çağrılıyor (check_position'da)
+            # Burada sadece time limit kontrolü yapılır
+            pass
+
+        # === 3. TIME LIMIT ===
+        time_limit_minutes = sh.get("time_limit_minutes",
+                                     strat.get("time_limit_minutes", 480))
+        time_limit_enabled = sh.get("time_limit_enabled",
+                                     strat.get("time_limit_enabled", True))
+        if time_limit_enabled and time_limit_minutes > 0:
+            elapsed_min = (time.time() - pos.entry_time) / 60
+            if elapsed_min >= time_limit_minutes:
+                pnl = self._get_pnl_pct(pos, price)
+                if pnl >= 0:
+                    logger.info(f"[SysH] {pos.symbol} time limit {time_limit_minutes}m, "
+                                f"karda → kapat (PnL={pnl:+.2f}%)")
+                    return self.EXIT_TIME
+                # Zararda: server SL/trailing kapatacak
+
+        return "HOLD"
+
+    # ──── SYSTEM G MODE ────
+
+    def _check_system_g(self, pos: ActivePosition, price: float) -> str:
+        """System G exit logic.
+
+        Server-side: Emergency (STOP_MARKET) + SL (optional STOP_MARKET) + TP (TAKE_PROFIT_MARKET)
+        Software tarafı sadece yedek:
+        0. Emergency anti-liquidation
+        1. Software SL (yedek, server SL dolmazsa)
+        2. Time limit (max_hold_hours, kârda kapat, zararda server'a bırak)
+        """
+        strat = self._config.get("strategy", {})
+        sg = self._config.get("system_g", {})
+        pos_cfg = sg.get("position", {})
+
+        # === 0. EMERGENCY (always active) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        # === 1. SOFTWARE SL (yedek — server SL birincil) ===
+        if strat.get("sl_enabled", True):
+            if self._check_stop_loss(pos, price):
+                return self.EXIT_SL
+
+        # === 2. TIME LIMIT ===
+        max_hold_hours = pos_cfg.get("max_hold_hours", 24)
+        if max_hold_hours > 0:
+            elapsed_min = (time.time() - pos.entry_time) / 60
+            if elapsed_min >= max_hold_hours * 60:
+                pnl = self._get_pnl_pct(pos, price)
+                if pnl >= 0:
+                    logger.info(f"[SysG] {pos.symbol} time limit {max_hold_hours}h, "
+                                f"karda → kapat (PnL={pnl:+.2f}%)")
+                    return self.EXIT_TIME
+                # Zararda: server SL veya TP kapatacak, biz kapatmiyoruz
+
+        return "HOLD"
+
+    def _check_system_d(self, pos: ActivePosition, price: float) -> str:
+        """System D exit logic.
+
+        System D pozisyonlarında SL + trailing/TP Binance'de server-side çalışır.
+        Software tarafı sadece:
+        0. Emergency anti-liquidation
+        1. Software SL (yedek, server SL dolmazsa)
+        2. Time limit
+        """
+        strat = self._config.get("strategy", {})
+        sd = self._config.get("system_d", {})
+
+        # === 0. EMERGENCY (always active) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        # === 1. SOFTWARE SL (yedek — server SL birincil) ===
+        if strat.get("sl_enabled", True):
+            if self._check_stop_loss(pos, price):
+                return self.EXIT_SL
+
+        # === 2. TIME LIMIT ===
+        time_limit_enabled = sd.get("time_limit_enabled", True)
+        time_limit_minutes = sd.get("time_limit_minutes", 480)
+        if time_limit_enabled and time_limit_minutes > 0:
+            elapsed_min = (time.time() - pos.entry_time) / 60
+            if elapsed_min >= time_limit_minutes:
+                pnl = self._get_pnl_pct(pos, price)
+                if pnl >= 0:
+                    logger.info(f"[SysD] {pos.symbol} time limit {time_limit_minutes}m, "
+                                f"karda → kapat (PnL={pnl:+.2f}%)")
+                    return self.EXIT_TIME
+                # Zararda: server SL veya trailing kapatacak, biz kapatmıyoruz
+
+        return "HOLD"
+
+    def _check_system_b(self, pos: ActivePosition, price: float) -> str:
+        """System B exit logic.
+
+        System B pozisyonlarında SL + trailing/TP Binance'de server-side çalışır.
+        Software tarafı sadece:
+        0. Emergency anti-liquidation
+        1. Software SL (yedek, server SL dolmazsa)
+        2. Time limit (opsiyonel)
+        """
+        strat = self._config.get("strategy", {})
+        sb = self._config.get("system_b", {})
+
+        # === 0. EMERGENCY (always active) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        # === 1. SOFTWARE SL (yedek) ===
+        if strat.get("sl_enabled", True):
+            if self._check_stop_loss(pos, price):
+                return self.EXIT_SL
+
+        # === 2. TIME LIMIT (System B: 8 saat varsayılan) ===
+        time_limit_minutes = sb.get("time_limit_minutes", 480)
+        if time_limit_minutes > 0:
+            elapsed_min = (time.time() - pos.entry_time) / 60
+            if elapsed_min >= time_limit_minutes:
+                pnl = self._get_pnl_pct(pos, price)
+                if pnl >= 0:
+                    logger.info(f"[SysB] {pos.symbol} time limit {time_limit_minutes}m, "
+                                f"kârda → kapat (PnL={pnl:+.2f}%)")
+                    return self.EXIT_TIME
+                else:
+                    # Zararda: SL sıkılaştır (breakeven'a yaklaştır)
+                    # Ama kapama — server SL veya trailing kapatacak
+                    pass
+
+        return "HOLD"
 
     def _check_mean_reversion(self, pos: ActivePosition, price: float,
                                indicator_values: dict, confluence: dict,
@@ -654,9 +1029,29 @@ class PositionManager:
             if self._check_stop_loss(pos, price):
                 return self.EXIT_SL
 
-        # === 2. MR TRAILING STOP (or BB middle TP fallback) ===
+        # === 2a. BB MIDDLE GÜNCELLEME (canlı indikatörlerden) ===
+        # BB bandları zamanla kayar — TP hedefini güncel tut
+        if indicator_values and pos.mr_tp_price > 0:
+            new_bb_middle = indicator_values.get("BB_Middle", 0)
+            if new_bb_middle > 0:
+                pos.mr_tp_price = new_bb_middle
+
+        # === 2b. BB MIDDLE TP (birincil MR hedefi — HER ZAMAN aktif) ===
+        # MR felsefesi: "fiyat ortalamaya döner" → BB middle = doğal çıkış noktası
+        if pos.mr_tp_price > 0:
+            if pos.side == OrderSide.BUY_LONG and price >= pos.mr_tp_price:
+                logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
+                            f"(target={pos.mr_tp_price:.6f})")
+                return self.EXIT_MR_TP
+            elif pos.side == OrderSide.SELL_SHORT and price <= pos.mr_tp_price:
+                logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
+                            f"(target={pos.mr_tp_price:.6f})")
+                return self.EXIT_MR_TP
+
+        # === 2c. MR TRAILING (ikincil — BB middle'ı geçerse bonus kârı yakalar) ===
+        # Trailing sadece fiyat BB middle'ın ötesine geçtiğinde devreye girer.
+        # MR tezi aşılmış demektir → trend başlıyor olabilir → trailing ile takip et.
         if strat.get("mr_trailing_enabled", True):
-            # Software trailing: activate at N×ATR profit, callback M×ATR
             atr = pos.atr_at_entry
             if atr > 0:
                 mr_activate_mult = strat.get("mr_trailing_activate_atr", 1.5)
@@ -664,19 +1059,16 @@ class PositionManager:
                 activate_dist = atr * mr_activate_mult
                 callback_dist = atr * mr_callback_mult
 
-                # Update highest/lowest tracking
                 if pos.side == OrderSide.BUY_LONG:
                     profit_move = price - pos.entry_price
                     if profit_move >= activate_dist:
-                        # Trailing activated — update trailing stop
                         new_trail = price - callback_dist
                         if new_trail > pos.trailing_stop:
-                            if pos.trailing_stop == 0:
+                            if pos.trailing_stop == 0 or pos.trailing_stop == pos.initial_sl:
                                 logger.info(f"[MR TRAIL] {pos.symbol} trailing activated @ {price:.6f} "
                                             f"(profit={profit_move/atr:.1f}xATR >= {mr_activate_mult}xATR)")
                             pos.trailing_stop = new_trail
-                        # Check trailing stop hit
-                        if pos.trailing_stop > 0 and price <= pos.trailing_stop:
+                        if pos.trailing_stop > 0 and pos.trailing_stop != pos.initial_sl and price <= pos.trailing_stop:
                             logger.info(f"[MR TRAIL] {pos.symbol} trailing stop hit @ {price:.6f} "
                                         f"(trail={pos.trailing_stop:.6f})")
                             return self.EXIT_TRAILING
@@ -685,25 +1077,14 @@ class PositionManager:
                     if profit_move >= activate_dist:
                         new_trail = price + callback_dist
                         if pos.trailing_stop == 0 or new_trail < pos.trailing_stop:
-                            if pos.trailing_stop == 0:
+                            if pos.trailing_stop == 0 or pos.trailing_stop == pos.initial_sl:
                                 logger.info(f"[MR TRAIL] {pos.symbol} trailing activated @ {price:.6f} "
                                             f"(profit={profit_move/atr:.1f}xATR >= {mr_activate_mult}xATR)")
                             pos.trailing_stop = new_trail
-                        if pos.trailing_stop > 0 and price >= pos.trailing_stop:
+                        if pos.trailing_stop > 0 and pos.trailing_stop != pos.initial_sl and price >= pos.trailing_stop:
                             logger.info(f"[MR TRAIL] {pos.symbol} trailing stop hit @ {price:.6f} "
                                         f"(trail={pos.trailing_stop:.6f})")
                             return self.EXIT_TRAILING
-        else:
-            # Fallback: BB middle TP (eski sistem)
-            if pos.mr_tp_price > 0:
-                if pos.side == OrderSide.BUY_LONG and price >= pos.mr_tp_price:
-                    logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
-                                f"(target={pos.mr_tp_price:.6f})")
-                    return self.EXIT_MR_TP
-                elif pos.side == OrderSide.SELL_SHORT and price <= pos.mr_tp_price:
-                    logger.info(f"[MR] {pos.symbol} BB middle TP hit @ {price:.6f} "
-                                f"(target={pos.mr_tp_price:.6f})")
-                    return self.EXIT_MR_TP
 
         # === 3. REGIME SWITCH DETECTION (MR → TREND) ===
         # If price breaks through opposite BB + volume surging + ADX rising
@@ -902,8 +1283,8 @@ class PositionManager:
     def _update_trailing(self, pos: ActivePosition, price: float) -> None:
         if pos.leverage >= 1:
             lev = pos.leverage
-            fee_roi = 0.001 * lev * 100
             strat = self._config.get("strategy", {})
+            fee_roi = strat.get("fee_pct", 0.10) / 100.0 * lev * 100
             trailing_mode = strat.get("trailing_mode", "roi")
 
             if trailing_mode == "atr" and pos.atr_at_entry > 0:
@@ -978,7 +1359,7 @@ class PositionManager:
         else:
             # Fallback: ATR mode olmadığında da aynı parametreleri kullan (tutarlılık)
             atr = pos.atr_at_entry
-            activation_mult = strat.get("trailing_atr_activate_mult", 7.0)
+            activation_mult = strat.get("trailing_atr_activate_mult", 4.0)
             trail_mult = strat.get("trailing_atr_distance_mult", 1.0)
 
             if pos.side == OrderSide.BUY_LONG:
@@ -997,8 +1378,8 @@ class PositionManager:
                         pos.trailing_stop = new_trail
 
     def _check_trailing(self, pos: ActivePosition, price: float) -> bool:
-        """Trailing stop tetiklendi mi? 7×ATR'de aktive olur, 1×ATR geri cekilmede kapatir.
-        Min kar = 6×ATR. Risk/Reward 1:3."""
+        """Trailing stop tetiklendi mi? 4×ATR'de aktive olur, 1×ATR geri cekilmede kapatir.
+        Min kar = 3×ATR. Risk/Reward 1:1.5."""
         if not pos.trailing_active:
             return False
 
@@ -1120,7 +1501,7 @@ class PositionManager:
         roi = 0.0
         if current_price > 0 and pos.entry_price > 0:
             lev = max(pos.leverage, 1)
-            fee_roi = 0.001 * lev * 100
+            fee_roi = strat.get("fee_pct", 0.10) / 100.0 * lev * 100
             if pos.side == OrderSide.BUY_LONG:
                 roi = (current_price - pos.entry_price) / pos.entry_price * lev * 100
             else:
@@ -1224,7 +1605,7 @@ class PositionManager:
             # If near breakeven and config says extend, give 2x more time
             if strat.get("time_limit_extend_breakeven", True):
                 lev = max(pos.leverage, 1)
-                fee_roi = 0.001 * lev * 100
+                fee_roi = strat.get("fee_pct", 0.10) / 100.0 * lev * 100
                 if pos.side == OrderSide.BUY_LONG:
                     roi = (price - pos.entry_price) / pos.entry_price * lev * 100
                 else:
@@ -1341,4 +1722,7 @@ class PositionManager:
             "entry_adx": pos.entry_adx,
             "entry_rsi": pos.entry_rsi,
             "roi_percent": roi,
+            "entry_mode": pos.entry_mode,
+            "entry_bb_width": pos.entry_bb_width,
+            "regime_switched": pos.regime_switched,
         }

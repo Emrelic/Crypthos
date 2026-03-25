@@ -125,7 +125,9 @@ class RiskManager:
             return False, f"Max drawdown reached: {current_dd:.1f}% >= {max_dd:.1f}%"
 
         # Consecutive loss pause
-        if self._consecutive_losses >= self._max_consecutive_before_pause:
+        pause_enabled = self._config.get(
+            "risk.consecutive_loss_pause_enabled", True)
+        if pause_enabled and self._consecutive_losses >= self._max_consecutive_before_pause:
             return False, (
                 f"Paused: {self._consecutive_losses} consecutive losses. "
                 f"Reset exposure or deactivate to continue."

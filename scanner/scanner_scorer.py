@@ -63,12 +63,13 @@ class ScannerScorer:
         self._regime = MarketRegimeDetector()
         self._divergence = DivergenceDetector(lookback=20)
 
-        # Score weights
-        self._w_confluence = 0.35
-        self._w_regime = 0.20
-        self._w_volume = 0.15
-        self._w_trend = 0.15
-        self._w_risk = 0.15
+        # Score weights — 4 orthogonal components
+        # Confluence = filter only (direction + eligibility), NOT in score
+        # Each indicator key feeds into exactly ONE component
+        self._w_trend = 0.30       # ADX_slope, Donchian, EMA_gap, MACD accel
+        self._w_entry = 0.25       # Volume_ratio, BB_Width, BB_Width_slope, ROC
+        self._w_risk = 0.25        # ATR sweet spot, divergences
+        self._w_sentiment = 0.20   # FR, OI, OB, liquidity
 
     def score_symbol(self, symbol: str, klines: pd.DataFrame,
                      volume_24h: float = 0, price_change_pct: float = 0,
@@ -293,7 +294,7 @@ class ScannerScorer:
         if r.adx <= ranging_cfg.get("max_adx", 18):
             zone = "RANGING"
             min_conf = ranging_cfg.get("min_confluence", 4.0)
-            min_adx = strat.get("min_adx", 25)  # Same ADX minimum for all zones
+            min_adx = ranging_cfg.get("min_adx", 0)  # Ranging zone: no ADX floor
             if ranging_cfg.get("enabled", True):
                 max_rsi_long = ranging_cfg.get("max_rsi_buy", 35)
                 min_rsi_short = ranging_cfg.get("min_rsi_sell", 65)
@@ -357,6 +358,18 @@ class ScannerScorer:
         checks["Trend"] = (trend_passed, trend_dir[:2], f"={'UP' if r.direction=='LONG' else 'DN'}?")
         if not trend_passed and not first_fail:
             first_fail = f"trend_against_{r.direction.lower()}"
+
+        # 8b. ADX Slope filter: trend rejiminde ADX düşüyorsa girme
+        # ADX > 25 ama ADX_slope <= 0 → trend zayıflıyor, giriş zamanlama hatası riski
+        adx_slope = r.indicator_values.get("ADX_slope", 0)
+        if zone == "TRENDING" and adx_slope <= 0:
+            slope_passed = False
+            checks["ADXslp"] = (False, f"{adx_slope:.1f}", ">0")
+            if not first_fail:
+                first_fail = f"adx_slope_declining ({adx_slope:.1f})"
+        else:
+            slope_passed = True
+            checks["ADXslp"] = (True, f"{adx_slope:.1f}", ">0")
 
         # Apply zone-specific filter flags
         use_macd = strat.get("macd_filter", True)
@@ -433,115 +446,184 @@ class ScannerScorer:
                 return "RANGING"
 
     def _compute_score(self, r: ScanResult) -> float:
-        """Compute composite score (0-100, negative for SHORT)."""
-        conf_score = self._score_confluence(r)
-        regime_score = self._score_regime(r)
-        volume_score = self._score_volume(r)
-        trend_score = self._score_trend(r)
-        risk_score = self._score_risk(r)
+        """Compute composite score (0-100, negative for SHORT).
+
+        Architecture: Confluence is ONLY a filter (direction + eligibility).
+        Score uses 4 orthogonal components with ZERO indicator overlap:
+          1. Trend Momentum (30%): ADX_slope, Donchian, EMA_gap, MACD accel
+          2. Entry Quality  (25%): Volume_ratio, BB_Width, BB_Width_slope, ROC
+          3. Risk Profile   (25%): ATR sweet spot, divergences
+          4. Sentiment      (20%): FR, OI, OB, liquidity
+
+        Confluence indicators (used ONLY in filter, NOT here):
+          MACD value/cross, ADX value, DI+/DI-, EMA/SMA cross,
+          RSI, BB_%B, S/R, OBV, CMF, CVD, VWAP binary
+        """
+        trend = self._score_trend_momentum(r)
+        entry = self._score_entry_quality(r)
+        risk = self._score_risk_profile(r)
+        sentiment = self._score_market_sentiment(r)
 
         raw = (
-            self._w_confluence * conf_score +
-            self._w_regime * regime_score +
-            self._w_volume * volume_score +
-            self._w_trend * trend_score +
-            self._w_risk * risk_score
+            self._w_trend * trend +
+            self._w_entry * entry +
+            self._w_risk * risk +
+            self._w_sentiment * sentiment
         )
 
-        # Funding rate, Open Interest & Order Book bonus/penalty (max ±12 points)
-        sentiment = self._score_sentiment(r)
-        raw += sentiment
+        raw = max(0.0, min(raw, 100.0))
 
-        # Cap at 100
-        raw = min(raw, 100.0)
-
-        # Negative for SHORT direction
         if r.direction == "SHORT":
             raw = -raw
 
         return round(raw, 1)
 
-    def _score_confluence(self, r: ScanResult) -> float:
-        """Score 0-100 based on confluence signal strength."""
-        conf = r.confluence
-        raw_score = abs(conf.get("score", 0))
-        strength = conf.get("strength", 0)
-        bullish = conf.get("bullish_count", 0)
-        total = conf.get("total_indicators", 1)
+    # ──────────────────────────────────────────────────────────
+    # Component 1: TREND MOMENTUM (30%)
+    # Is the trend strong and accelerating?
+    # ──────────────────────────────────────────────────────────
+    def _score_trend_momentum(self, r: ScanResult) -> float:
+        """Score 0-100: trend strength & acceleration.
 
-        # Normalize: confluence score of 4.0 = 50, 8.0 = 80, 12+ = 100
-        base = min(raw_score / 12.0 * 100, 100)
+        Indicators (exclusive — NOT used in confluence):
+          ADX_slope          — trend strengthening/weakening (derivative of ADX)
+          DC_Upper/DC_Lower  — Donchian channel position (breakout proximity)
+          EMA_gap_expanding  — MA separation growing (trend health)
+          MACD_histogram_prev — histogram acceleration (derivative)
+        """
+        score = 50.0
 
-        # Bonus for high agreement ratio
-        agreement = bullish / total if r.direction == "LONG" else \
-            conf.get("bearish_count", 0) / total
-        agreement_bonus = agreement * 20
+        # 1. ADX Slope — trend strengthening? (±12)
+        adx_slope = r.indicator_values.get("ADX_slope", 0)
+        if adx_slope > 1.0:
+            score += 12
+        elif adx_slope > 0.3:
+            score += 8
+        elif adx_slope > 0:
+            score += 3
+        elif adx_slope < -1.0:
+            score -= 12
+        elif adx_slope < -0.3:
+            score -= 6
 
-        return min(base + agreement_bonus, 100)
+        # 2. Donchian Channel Position — breakout proximity (±15)
+        price = r.indicator_values.get("Price", 0)
+        dc_upper = r.indicator_values.get("DC_Upper", 0)
+        dc_lower = r.indicator_values.get("DC_Lower", 0)
+        if dc_upper > dc_lower and price > 0:
+            dc_range = dc_upper - dc_lower
+            dc_pos = (price - dc_lower) / dc_range
+            if r.direction == "LONG":
+                if dc_pos >= 0.8:
+                    score += 15
+                elif dc_pos >= 0.6:
+                    score += 10
+                elif dc_pos >= 0.4:
+                    score += 4
+                elif dc_pos < 0.2:
+                    score -= 8
+            else:  # SHORT
+                if dc_pos <= 0.2:
+                    score += 15
+                elif dc_pos <= 0.4:
+                    score += 10
+                elif dc_pos <= 0.6:
+                    score += 4
+                elif dc_pos > 0.8:
+                    score -= 8
 
-    def _score_regime(self, r: ScanResult) -> float:
-        """Score 0-100 based on regime alignment with direction."""
-        regime = r.regime.get("regime", "UNKNOWN")
-        trend_dir = r.regime.get("trend_direction", "NONE")
-        confidence = r.regime.get("confidence", 0)
-
-        if r.direction == "LONG":
-            if regime == "TRENDING" and trend_dir == "UP":
-                base = 100
-            elif regime == "BREAKOUT":
-                base = 80
-            elif regime == "TRENDING" and trend_dir == "DOWN":
-                base = 20  # counter-trend
-            elif regime == "RANGING":
-                base = 50
-            else:
-                base = 30
-        else:  # SHORT
-            if regime == "TRENDING" and trend_dir == "DOWN":
-                base = 100
-            elif regime == "VOLATILE":
-                base = 70
-            elif regime == "BREAKOUT":
-                base = 60
-            elif regime == "TRENDING" and trend_dir == "UP":
-                base = 20
-            else:
-                base = 40
-
-        return base * confidence
-
-    def _score_volume(self, r: ScanResult) -> float:
-        """Score 0-100 based on volume confirmation.
-        Orthogonality audit: OBV + CMF + CVD (orderflow)."""
-        score = 50.0  # base
-        obv_slope = r.indicator_values.get("OBV_slope", 0)
-        cmf = r.indicator_values.get("CMF", 0)
-        cvd_norm = r.indicator_values.get("CVD_normalized", 0)
-
-        if r.direction == "LONG":
-            if obv_slope > 0:
-                score += 15
-            if cmf > 0.1:
-                score += 15
-            elif cmf > 0:
-                score += 5
-            if cvd_norm > 0.3:
-                score += 15  # strong buy flow
-            elif cvd_norm > 0.1:
-                score += 8
+        # 3. EMA Gap Expanding — MA separation growing? (±8)
+        if r.indicator_values.get("EMA_gap_expanding", False):
+            score += 8
         else:
-            if obv_slope < 0:
-                score += 15
-            if cmf < -0.1:
-                score += 15
-            elif cmf < 0:
-                score += 5
-            if cvd_norm < -0.3:
-                score += 15  # strong sell flow
-            elif cvd_norm < -0.1:
-                score += 8
+            score -= 3
 
-        return min(score, 100)
+        # 4. MACD Acceleration — histogram change direction (±8)
+        #    Confluence uses histogram VALUE; here we use the CHANGE (derivative)
+        macd_h = r.indicator_values.get("MACD_histogram", 0)
+        macd_h_prev = r.indicator_values.get("MACD_histogram_prev", None)
+        if macd_h_prev is not None:
+            macd_accel = macd_h - macd_h_prev
+            if r.direction == "LONG" and macd_accel > 0:
+                score += 8
+            elif r.direction == "SHORT" and macd_accel < 0:
+                score += 8
+            elif r.direction == "LONG" and macd_accel < -0.001:
+                score -= 5
+            elif r.direction == "SHORT" and macd_accel > 0.001:
+                score -= 5
+
+        return max(0.0, min(score, 100.0))
+
+    # ──────────────────────────────────────────────────────────
+    # Component 2: ENTRY QUALITY (25%)
+    # Is this a good entry point?
+    # ──────────────────────────────────────────────────────────
+    def _score_entry_quality(self, r: ScanResult) -> float:
+        """Score 0-100: entry point quality.
+
+        Indicators (exclusive — NOT used in confluence):
+          Volume_ratio   — current vs average volume (magnitude, not direction)
+          BB_Width       — Bollinger bandwidth (volatility level, not %B position)
+          BB_Width_slope — bandwidth change (volatility expanding/contracting)
+          price_change_pct — 24h price ROC (entry timing)
+        """
+        score = 50.0
+
+        # 1. Volume Ratio — market conviction (±12)
+        vol_ratio = r.indicator_values.get("Volume_ratio", 1.0)
+        if vol_ratio > 2.0:
+            score += 12
+        elif vol_ratio > 1.3:
+            score += 8
+        elif vol_ratio > 1.0:
+            score += 3
+        elif vol_ratio < 0.5:
+            score -= 12
+        elif vol_ratio < 0.7:
+            score -= 5
+
+        # 2. BB Width — volatility sweet spot (±10)
+        bb_width = r.indicator_values.get("BB_Width", 0)
+        if bb_width > 0:
+            if 1.5 <= bb_width <= 3.5:
+                score += 10   # ideal range: room to move, not chaotic
+            elif bb_width < 1.0:
+                score += 3    # tight squeeze — could break either way
+            elif bb_width > 6.0:
+                score -= 10   # very wide — chaotic, unpredictable
+            elif bb_width > 4.5:
+                score -= 5    # wide — less predictable
+
+        # 3. BB Width Slope — expanding from squeeze? (±6)
+        bb_slope = r.indicator_values.get("BB_Width_slope", 0)
+        if bb_width > 0 and bb_width < 3.0 and bb_slope > 0:
+            score += 6    # expanding from squeeze = breakout starting
+        elif bb_slope < -0.3:
+            score -= 3    # contracting = momentum dying
+
+        # 4. Price ROC — moderate momentum, not overextended (±8)
+        pct = r.price_change_pct
+        if r.direction == "LONG":
+            if 0.5 <= pct <= 3.0:
+                score += 8    # healthy upward momentum
+            elif 0 < pct < 0.5:
+                score += 3    # slight positive
+            elif pct > 5.0:
+                score -= 8    # overextended — late entry risk
+            elif pct < -2.0:
+                score -= 5    # falling price for LONG = risky
+        else:  # SHORT
+            if -3.0 <= pct <= -0.5:
+                score += 8
+            elif -0.5 < pct < 0:
+                score += 3
+            elif pct < -5.0:
+                score -= 8
+            elif pct > 2.0:
+                score -= 5
+
+        return max(0.0, min(score, 100.0))
 
     def _calculate_gray_zone_confirmation(self, r: ScanResult, cfg: dict) -> float:
         """Calculate gray zone confirmation score (0.0-1.0)."""
@@ -653,164 +735,118 @@ class ScannerScorer:
         
         return min(total_score, 1.0)
 
-    def _score_trend(self, r: ScanResult) -> float:
-        """Score 0-100 based on trend strength indicators.
-        Orthogonality audit: 3 independent signals (ADX, MACD, SMA200)."""
-        score = 0.0
-        adx = r.indicator_values.get("ADX", 0)
-        plus_di = r.indicator_values.get("ADX_plus_DI", 0)
-        minus_di = r.indicator_values.get("ADX_minus_DI", 0)
-        macd_h = r.indicator_values.get("MACD_histogram", 0)
-        price = r.indicator_values.get("Price", 0)
-        sma200 = r.indicator_values.get("SMA_slow", 0)
+    # ──────────────────────────────────────────────────────────
+    # Component 3: RISK PROFILE (25%)
+    # Is the trade setup safe?
+    # ──────────────────────────────────────────────────────────
+    def _score_risk_profile(self, r: ScanResult) -> float:
+        """Score 0-100: risk/reward quality.
 
-        # ADX strength (boosted: was 30, now 35)
-        if adx > 30:
-            score += 35
-        elif adx > 20:
-            score += 18
+        Indicators (exclusive):
+          ATR (vs calculated target) — volatility vs leverage safety
+          Divergences — price/indicator divergence signals
+        """
+        score = 55.0
 
-        # DI alignment (boosted: was 20, now 25)
-        if r.direction == "LONG" and plus_di > minus_di:
-            score += 25
-        elif r.direction == "SHORT" and minus_di > plus_di:
-            score += 25
-
-        # MACD histogram (boosted: was 15, now 20)
-        if r.direction == "LONG" and macd_h > 0:
-            score += 20
-        elif r.direction == "SHORT" and macd_h < 0:
-            score += 20
-
-        # Price vs SMA200 (boosted: was 15, now 20)
-        if price > 0 and sma200 > 0:
-            if r.direction == "LONG" and price > sma200:
-                score += 20
-            elif r.direction == "SHORT" and price < sma200:
-                score += 20
-
-        return min(score, 100)
-
-    def _score_risk(self, r: ScanResult) -> float:
-        """Score 0-100 based on risk quality (ATR, divergences)."""
-        score = 60.0
-
-        # ATR% in sweet spot: target_ATR = (1/L) × liq_factor × sl_liq_pct / 2
+        # 1. ATR Sweet Spot (±20)
         strat = self._config.get("strategy", {})
         max_lev = strat.get("max_leverage", 20)
         liq_factor = strat.get("liq_factor", 70) / 100.0
         sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
         atr_pct = r.atr_percent
         safe_atr = (1.0 / max(max_lev, 1)) * 100 * liq_factor * sl_liq_pct / 2.0
-        if atr_pct <= safe_atr * 0.8:
-            score += 20  # ATR hedefin altında — ideal
+
+        if atr_pct <= safe_atr * 0.7:
+            score += 20   # comfortably below target — ideal
+        elif atr_pct <= safe_atr * 0.9:
+            score += 12   # good range
         elif atr_pct <= safe_atr:
-            score += 10  # ATR hedefe yakın — kabul edilebilir
-        elif atr_pct > safe_atr * 4:
-            score -= 30  # too volatile
+            score += 5    # acceptable
+        elif atr_pct > safe_atr * 3:
+            score -= 20   # very volatile
         if atr_pct < 0.05:
-            score -= 20  # no movement
+            score -= 15   # no movement — bad for any strategy
 
-        # Divergence check
+        # 2. Divergence Support (±15)
         for d in r.divergences:
-            if r.direction == "LONG" and d.get("type") == "REGULAR_BULLISH":
-                score += 20  # bullish divergence supports long
-            elif r.direction == "LONG" and d.get("type") == "REGULAR_BEARISH":
-                score -= 20  # bearish divergence warns against long
-            elif r.direction == "SHORT" and d.get("type") == "REGULAR_BEARISH":
-                score += 20
-            elif r.direction == "SHORT" and d.get("type") == "REGULAR_BULLISH":
-                score -= 20
-
-        return max(0, min(score, 100))
-
-    def _score_sentiment(self, r: ScanResult) -> float:
-        """Score bonus/penalty from funding rate + open interest + order book (max +/-14 pts).
-
-        Funding Rate Logic:
-          - High positive funding → longs are crowded → favors SHORT
-          - High negative funding → shorts are crowded → favors LONG
-          - Extreme funding (>0.1%) → strong contrarian signal
-
-        Open Interest Logic:
-          - OI rising + our direction aligned with price trend → confirmation bonus
-          - OI falling against our direction → caution penalty
-        """
-        bonus = 0.0
-        fr = r.funding_rate  # e.g. 0.0001 = 0.01%, 0.001 = 0.1%
-
-        # --- Funding Rate ---
-        if fr != 0:
-            fr_pct = fr * 100  # convert to percentage (0.0001 -> 0.01%)
-
+            dtype = d.get("type", "")
             if r.direction == "LONG":
-                if fr_pct > 0.05:
-                    # Positive funding = longs pay shorts = crowd is long
-                    # Penalize going with the crowd
-                    bonus -= min(fr_pct * 20, 5.0)  # max -5 pts
-                elif fr_pct < -0.05:
-                    # Negative funding = shorts pay longs = crowd is short
-                    # Bonus for contrarian long
-                    bonus += min(abs(fr_pct) * 20, 5.0)  # max +5 pts
-            else:  # SHORT
+                if dtype == "REGULAR_BULLISH":
+                    score += 15
+                elif dtype == "REGULAR_BEARISH":
+                    score -= 15
+            else:
+                if dtype == "REGULAR_BEARISH":
+                    score += 15
+                elif dtype == "REGULAR_BULLISH":
+                    score -= 15
+
+        return max(0.0, min(score, 100.0))
+
+    # ──────────────────────────────────────────────────────────
+    # Component 4: MARKET SENTIMENT (20%)
+    # Are external market forces aligned?
+    # ──────────────────────────────────────────────────────────
+    def _score_market_sentiment(self, r: ScanResult) -> float:
+        """Score 0-100: external market forces.
+
+        Indicators (exclusive — not derived from price/volume candles):
+          funding_rate   — contrarian crowding signal
+          oi_change_pct  — new money flow
+          ob_imbalance   — order book pressure
+          ob_liquidity   — execution safety
+          ob_wall_signal — wall protection
+        """
+        score = 50.0
+
+        # 1. Funding Rate — contrarian (±10)
+        fr = r.funding_rate
+        if fr != 0:
+            fr_pct = fr * 100
+            if r.direction == "LONG":
                 if fr_pct < -0.05:
-                    # Negative funding = crowd is short, penalize
-                    bonus -= min(abs(fr_pct) * 20, 5.0)
+                    score += min(abs(fr_pct) * 30, 10.0)
                 elif fr_pct > 0.05:
-                    # Positive funding = crowd is long, bonus for short
-                    bonus += min(fr_pct * 20, 5.0)
+                    score -= min(fr_pct * 30, 10.0)
+            else:  # SHORT
+                if fr_pct > 0.05:
+                    score += min(fr_pct * 30, 10.0)
+                elif fr_pct < -0.05:
+                    score -= min(abs(fr_pct) * 30, 10.0)
 
-        # --- Open Interest Change ---
-        oi_chg = r.oi_change_pct  # e.g. 5.0 = 5% increase
-
+        # 2. Open Interest — money flow (±8)
+        oi_chg = r.oi_change_pct
+        price_chg = r.price_change_pct
         if oi_chg != 0:
-            price_chg = r.price_change_pct  # 24h price change %
-
             if r.direction == "LONG":
                 if oi_chg > 2 and price_chg > 0:
-                    # OI rising + price rising = new money flowing in bullish
-                    bonus += min(oi_chg * 0.5, 3.0)
+                    score += min(oi_chg * 0.8, 8.0)
                 elif oi_chg > 2 and price_chg < -1:
-                    # OI rising + price falling = bearish pressure building
-                    bonus -= min(oi_chg * 0.5, 3.0)
-                elif oi_chg < -2 and price_chg > 0:
-                    # OI falling + price rising = short squeeze, weak rally
-                    bonus -= 1.0
+                    score -= min(oi_chg * 0.8, 8.0)
             else:  # SHORT
                 if oi_chg > 2 and price_chg < 0:
-                    # OI rising + price falling = new short money confirmed
-                    bonus += min(oi_chg * 0.5, 3.0)
+                    score += min(oi_chg * 0.8, 8.0)
                 elif oi_chg > 2 and price_chg > 1:
-                    # OI rising + price rising = bullish, bad for short
-                    bonus -= min(oi_chg * 0.5, 3.0)
-                elif oi_chg < -2 and price_chg < 0:
-                    # OI falling + price falling = long liquidation, weak
-                    bonus -= 1.0
+                    score -= min(oi_chg * 0.8, 8.0)
 
-        # --- Order Book Imbalance ---
-        ob_imb = r.ob_imbalance  # -1 to +1
-
+        # 3. Order Book Imbalance (±8)
+        ob_imb = r.ob_imbalance
         if ob_imb != 0:
             if r.direction == "LONG":
-                # Positive imbalance = more bids = buying pressure = good for long
-                bonus += ob_imb * 5.0  # max ±5 pts
-            else:  # SHORT
-                # Negative imbalance = more asks = selling pressure = good for short
-                bonus += -ob_imb * 5.0
+                score += ob_imb * 8.0
+            else:
+                score += -ob_imb * 8.0
 
-        # --- Wall Bonus: wall blocking the OTHER direction favors us ---
-        # UP_BLOCKED = big sell wall above → price can't go up → good for SHORT
-        # DOWN_BLOCKED = big buy wall below → price can't go down → good for LONG
-        if r.ob_wall_signal == "UP_BLOCKED" and r.direction == "SHORT":
-            bonus += 2.0
-        elif r.ob_wall_signal == "DOWN_BLOCKED" and r.direction == "LONG":
-            bonus += 2.0
+        # 4. Wall Protection (±4)
+        if r.ob_wall_signal == "DOWN_BLOCKED" and r.direction == "LONG":
+            score += 4
+        elif r.ob_wall_signal == "UP_BLOCKED" and r.direction == "SHORT":
+            score += 4
 
-        # Liquidity quality bonus: high liquidity = safer trade
+        # 5. Liquidity Quality (±4)
         if r.ob_liquidity >= 70:
-            bonus += 2.0
-        elif r.ob_liquidity < 30 and r.ob_liquidity > 0:
-            bonus -= 2.0
+            score += 4
+        elif 0 < r.ob_liquidity < 30:
+            score -= 4
 
-        # Clamp total sentiment to +-14
-        return max(-14.0, min(14.0, bonus))
+        return max(0.0, min(score, 100.0))
