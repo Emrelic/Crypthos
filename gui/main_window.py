@@ -22,6 +22,7 @@ from gui.panels.backtest_panel import BacktestPanel
 from gui.panels.heatmap_panel import HeatmapPanel
 from gui.panels.system_g_panel import SystemGPanel
 from gui.panels.system_h_panel import SystemHPanel
+from gui.panels.system_i_panel import SystemIPanel
 
 
 class MainWindow(ctk.CTk):
@@ -55,6 +56,7 @@ class MainWindow(ctk.CTk):
         tab_system_f = self._tabview.add("Son Kursun")
         tab_system_g = self._tabview.add("System G")
         tab_system_h = self._tabview.add("System H")
+        tab_system_i = self._tabview.add("System I")
         tab_quick = self._tabview.add("Hizli Emir")
         tab_market = self._tabview.add("Piyasa")
         tab_strategy = self._tabview.add("Strateji")
@@ -75,6 +77,7 @@ class MainWindow(ctk.CTk):
         self._system_f_panel = SystemFPanel(tab_system_f, controller)
         self._system_g_panel = SystemGPanel(tab_system_g, controller)
         self._system_h_panel = SystemHPanel(tab_system_h, controller)
+        self._system_i_panel = SystemIPanel(tab_system_i, controller)
         self._quick_panel = QuickOrderPanel(tab_quick, controller)
         self._market_panel = MarketPanel(tab_market, controller)
         self._strategy_panel = StrategyPanel(tab_strategy, controller)

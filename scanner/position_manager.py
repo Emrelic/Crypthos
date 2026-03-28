@@ -352,6 +352,32 @@ class PositionManager:
                 pos.trailing_stop = pos.emergency_close_price
                 logger.info(f"  [SysG] No SL — emergency only @ {pos.emergency_close_price:.6f}")
 
+        # System I mode: G bazlı SL (G değeri entry_bb_width alanında saklanır)
+        elif entry_mode == "SYSTEM_I":
+            si_cfg = self._config.get("system_i", {})
+            lev_cfg = si_cfg.get("leverage", {})
+            G_val = entry_bb_width  # G değeri bb_width alanında
+            if G_val > 0 and price > 0:
+                # GRAY rejim: regime_confidence'a göre çöz (>0.5 = trend-like)
+                effective_regime = entry_regime
+                if entry_regime == "GRAY":
+                    effective_regime = "TRENDING" if entry_regime_confidence > 0.5 else "RANGING"
+                if effective_regime in ("TRENDING",):
+                    sl_carpan = lev_cfg.get("trend_sl_g_mult", 1.5)
+                else:
+                    sl_carpan = lev_cfg.get("ranging_sl_g_mult", 2.0)
+                fee = lev_cfg.get("fee_pct", 0.08) / 100
+                slippage = fee * 0.5
+                si_sl_pct = (sl_carpan * G_val) / 100 + fee + slippage
+                si_sl_pct = max(si_sl_pct, fee * 2)
+                if side == OrderSide.BUY_LONG:
+                    pos.initial_sl = price * (1 - si_sl_pct)
+                else:
+                    pos.initial_sl = price * (1 + si_sl_pct)
+                pos.trailing_stop = pos.initial_sl
+                logger.info(f"  [SysI] SL override: {sl_carpan}xG={G_val:.3f}% → "
+                            f"SL={pos.initial_sl:.6f} ({si_sl_pct*100:.3f}%)")
+
         # System H mode: G bazlı SL (G değeri entry_bb_width alanında saklanır)
         elif entry_mode == "SYSTEM_H":
             sh = self._config.get("system_h", {})
@@ -478,9 +504,13 @@ class PositionManager:
             if current_price < pos.lowest_price:
                 pos.lowest_price = current_price
 
-        # === SYSTEM H MODE (en yuksek oncelik) ===
+        # === SYSTEM I MODE (en yuksek oncelik) ===
+        if pos.entry_mode == "SYSTEM_I":
+            return self._check_system_i(pos, current_price, confluence, divergences)
+
+        # === SYSTEM H MODE ===
         if pos.entry_mode == "SYSTEM_H":
-            return self._check_system_h(pos, current_price)
+            return self._check_system_h(pos, current_price, confluence, divergences)
 
         # === SYSTEM G MODE ===
         if pos.entry_mode == "SYSTEM_G":
@@ -838,20 +868,147 @@ class PositionManager:
 
         return "HOLD"
 
+    # ──── SYSTEM I MODE ────
+
+    def _check_system_i(self, pos: ActivePosition, price: float,
+                        confluence: dict = None, divergences: list = None) -> str:
+        """System I exit logic — 8-level priority cascade.
+
+        Server-side: SL (STOP_MARKET) + trailing/TP Binance'de çalışır.
+        Software tarafı:
+        0. Emergency anti-liquidation
+        1. Software SL (yedek, server SL dolmazsa)
+        2. Signal exit (confluence reversal, kademeli eşik)
+        3. TP target (sabit TP — ranging/gray)
+        4. Trailing stop (software yedek kontrol)
+        5. ROI-based TP (opsiyonel)
+        6. Divergence (opsiyonel)
+        7. Regime shift
+        8. Time limit
+        """
+        strat = self._config.get("strategy", {})
+        si_cfg = self._config.get("system_i", {})
+        opt = si_cfg.get("optional_features", {})
+        confluence = confluence or {}
+        divergences = divergences or []
+
+        # === 0. EMERGENCY (always active) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        # === 1. SOFTWARE SL (yedek — server SL birincil) ===
+        if strat.get("sl_enabled", True):
+            if self._check_stop_loss(pos, price):
+                return self.EXIT_SL
+
+        # === 2. SIGNAL EXIT (confluence reversal) ===
+        if opt.get("signal_exit_enabled", strat.get("signal_exit_enabled", True)):
+            if self._check_confluence_reversal(pos, confluence, price):
+                return self.EXIT_CONFLUENCE
+
+        # === 3. TP TARGET (sabit TP — server-side birincil, software yedek) ===
+        # TP server-side'da aktif, ama software da kontrol etsin
+        G_val = getattr(pos, 'entry_bb_width', 0)
+        tp_cfg = si_cfg.get("tp", {})
+        entry_regime = getattr(pos, 'entry_regime', '')
+
+        # Ranging: sabit TP kontrolü
+        if entry_regime == "RANGING" and G_val > 0:
+            ranging_tp_mult = tp_cfg.get("ranging_tp_g_mult", 2.0)
+            tp_pct = ranging_tp_mult * G_val / 100
+            if tp_pct > 0:
+                if pos.side == OrderSide.BUY_LONG:
+                    tp_price = pos.entry_price * (1 + tp_pct)
+                    if price >= tp_price:
+                        logger.info(f"[SysI] {pos.symbol} TP hit (RANGING): "
+                                    f"price={price:.6f} >= tp={tp_price:.6f}")
+                        return self.EXIT_TP
+                else:
+                    tp_price = pos.entry_price * (1 - tp_pct)
+                    if price <= tp_price:
+                        logger.info(f"[SysI] {pos.symbol} TP hit (RANGING): "
+                                    f"price={price:.6f} <= tp={tp_price:.6f}")
+                        return self.EXIT_TP
+
+        # === 4. G BAZLI TRAILING (software yedek kontrol) ===
+        if G_val > 0 and strat.get("trailing_enabled", True):
+            self._update_trailing(pos, price)
+            if self._check_trailing(pos, price):
+                return self.EXIT_TRAILING_RENEW
+
+        # === 5. ROI-BASED TP (opsiyonel) ===
+        if tp_cfg.get("roi_based_tp_enabled", False):
+            roi_target = tp_cfg.get("roi_based_tp_pct", 50.0)
+            pnl = self._get_pnl_pct(pos, price)
+            if pnl >= roi_target:
+                logger.info(f"[SysI] {pos.symbol} ROI TP: PnL={pnl:+.2f}% >= {roi_target}%")
+                return self.EXIT_TP
+
+        # === 6. DIVERGENCE (opsiyonel) ===
+        if opt.get("divergence_exit_enabled", False):
+            if strat.get("divergence_exit_enabled", False):
+                pnl = self._get_pnl_pct(pos, price)
+                if pnl > 0 and divergences:
+                    for div in divergences:
+                        if div.get("type") == "bearish" and pos.side == OrderSide.BUY_LONG:
+                            logger.info(f"[SysI] {pos.symbol} divergence exit (kârda)")
+                            return self.EXIT_DIVERGENCE
+                        elif div.get("type") == "bullish" and pos.side == OrderSide.SELL_SHORT:
+                            logger.info(f"[SysI] {pos.symbol} divergence exit (kârda)")
+                            return self.EXIT_DIVERGENCE
+
+        # === 7. REGIME SHIFT ===
+        if opt.get("regime_switch_exit_enabled", True):
+            current_regime = getattr(pos, 'current_regime', '')
+            if current_regime and entry_regime and current_regime != entry_regime:
+                pnl = self._get_pnl_pct(pos, price)
+                # TRENDING → RANGING veya tersi: kârda kapat, zararda server'a bırak
+                if pnl >= 0:
+                    logger.info(f"[SysI] {pos.symbol} regime shift: "
+                                f"{entry_regime} → {current_regime}, kârda → kapat "
+                                f"(PnL={pnl:+.2f}%)")
+                    return self.EXIT_REGIME_SHIFT if hasattr(self, 'EXIT_REGIME_SHIFT') else "REGIME_SHIFT"
+
+        # === 8. TIME LIMIT ===
+        time_limit_hours = opt.get("time_limit_hours",
+                                    si_cfg.get("time_limit_hours", 8))
+        time_limit_enabled = opt.get("time_limit_enabled", True)
+        if time_limit_enabled and time_limit_hours > 0:
+            elapsed_min = (time.time() - pos.entry_time) / 60
+            elapsed_hours = elapsed_min / 60
+            if elapsed_hours >= time_limit_hours:
+                pnl = self._get_pnl_pct(pos, price)
+                if pnl >= 0:
+                    logger.info(f"[SysI] {pos.symbol} time limit {time_limit_hours}h, "
+                                f"kârda → kapat (PnL={pnl:+.2f}%)")
+                    return self.EXIT_TIME
+                elif elapsed_hours >= time_limit_hours * 2:
+                    # 2x süre geçti, zararda da kapat (sonsuz beklemeyi önle)
+                    logger.warning(f"[SysI] {pos.symbol} time limit 2x ({time_limit_hours*2}h), "
+                                   f"zararda da kapat (PnL={pnl:+.2f}%)")
+                    return self.EXIT_TIME
+
+        return "HOLD"
+
     # ──── MEAN REVERSION MODE ────
 
-    def _check_system_h(self, pos: ActivePosition, price: float) -> str:
-        """System H exit logic.
+    def _check_system_h(self, pos: ActivePosition, price: float,
+                        confluence: dict = None, divergences: list = None) -> str:
+        """System H exit logic — A'nın zengin çıkış sinyalleri + G bazlı trailing.
 
         Server-side: SL (STOP_MARKET) + trailing/TP Binance'de çalışır.
         Software tarafı:
         0. Emergency anti-liquidation
         1. Software SL (yedek, server SL dolmazsa)
         2. Signal exit (A'dan — confluence reversal, kademeli eşik)
-        3. Time limit (8 saat, kârda kapat, zararda server'a bırak)
+        3. G bazlı trailing renewal (software tarafı kontrol)
+        4. Time limit (8 saat, kârda kapat, zararda server'a bırak)
         """
         strat = self._config.get("strategy", {})
         sh = self._config.get("system_h", {})
+        confluence = confluence or {}
+        divergences = divergences or []
 
         # === 0. EMERGENCY (always active) ===
         if strat.get("emergency_enabled", True):
@@ -864,13 +1021,20 @@ class PositionManager:
                 return self.EXIT_SL
 
         # === 2. SIGNAL EXIT (A'dan — confluence reversal) ===
-        # System H, A'nın sinyal çıkış mantığını koruyor
         if strat.get("signal_exit_enabled", True):
-            # Bu check dışarıdan confluence ile çağrılıyor (check_position'da)
-            # Burada sadece time limit kontrolü yapılır
-            pass
+            if self._check_confluence_reversal(pos, confluence, price):
+                return self.EXIT_CONFLUENCE
 
-        # === 3. TIME LIMIT ===
+        # === 3. G BAZLI TRAILING RENEWAL (software kontrol) ===
+        # G bazlı trailing: server-side trailing birincil, software yedek kontrol
+        # entry_bb_width alanında G değeri saklanıyor
+        G_val = getattr(pos, 'entry_bb_width', 0)
+        if G_val > 0 and strat.get("trailing_enabled", True):
+            self._update_trailing(pos, price)
+            if self._check_trailing(pos, price):
+                return self.EXIT_TRAILING_RENEW
+
+        # === 4. TIME LIMIT ===
         time_limit_minutes = sh.get("time_limit_minutes",
                                      strat.get("time_limit_minutes", 480))
         time_limit_enabled = sh.get("time_limit_enabled",

@@ -277,6 +277,12 @@ class AppController:
             return self.scanner.get_system_h_results()
         return []
 
+    def get_system_i_results(self) -> list:
+        """Return System I scan results."""
+        if self.scanner:
+            return self.scanner.get_system_i_results()
+        return []
+
     def place_breakeven_tp_all(self) -> list[dict]:
         """Tüm pozisyonlara breakeven TP emri gönder (SL'ye dokunmaz)."""
         if self.scanner:

@@ -312,7 +312,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
                      font=ctk.CTkFont(size=16, weight="bold")).pack(side="left", padx=10, pady=6)
 
         # ── Aktif Sistem Secimi ──
-        _ALL_SYSTEMS = ["A", "B", "D", "E", "F", "G", "H"]
+        _ALL_SYSTEMS = ["A", "B", "D", "E", "F", "G", "H", "I"]
         _init_sys = "A"
         for sys_key in reversed(_ALL_SYSTEMS[1:]):  # H, G, F, E, D, B (oncelik sirasi)
             if self.controller.config.get(f"system_{sys_key.lower()}.enabled", False):
@@ -2079,7 +2079,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
         """Switch between system panels. Only one system active at a time."""
         # Hide all panels first
         for attr in ('_scroll', '_scroll_b', '_scroll_d', '_scroll_e',
-                     '_scroll_f', '_scroll_g', '_scroll_h'):
+                     '_scroll_f', '_scroll_g', '_scroll_h', '_scroll_i'):
             w = getattr(self, attr, None)
             if w:
                 w.pack_forget()
@@ -2120,6 +2120,11 @@ class StrategySettingsPanel(ctk.CTkFrame):
                 self._build_system_h_panel()
             self._scroll_h.pack(fill="both", expand=True, padx=5, pady=(2, 2))
             self._load_system_h_from_config()
+        elif sys_letter == "I":
+            if not hasattr(self, '_scroll_i'):
+                self._build_system_i_panel()
+            self._scroll_i.pack(fill="both", expand=True, padx=5, pady=(2, 2))
+            self._load_system_i_from_config()
         else:
             # System A (default)
             self._scroll.pack(fill="both", expand=True, padx=5, pady=(2, 2))
@@ -2625,7 +2630,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
 
         # Tum sistemleri kapat — sadece secili olan acilacak
         _all_sys_keys = ["system_b", "system_d", "system_e",
-                         "system_f", "system_g", "system_h"]
+                         "system_f", "system_g", "system_h", "system_i"]
         for key in _all_sys_keys:
             c.set(f"{key}.enabled", False)
 
@@ -2637,6 +2642,7 @@ class StrategySettingsPanel(ctk.CTkFrame):
             "F": (self._save_system_f_to_config, "system_f", "System F kaydedildi!", "#E53935"),
             "G": (self._save_system_g_to_config, "system_g", "System G kaydedildi!", "#7C4DFF"),
             "H": (self._save_system_h_to_config, "system_h", "System H kaydedildi!", "#00BCD4"),
+            "I": (self._save_system_i_to_config, "system_i", "System I kaydedildi!", "#9C27B0"),
         }
 
         if sys_letter in _sys_save_map:
@@ -3551,3 +3557,258 @@ class StrategySettingsPanel(ctk.CTkFrame):
             c.set(f"system_h.{key}", var.get())
         for key, var in self._sh_combo_vars.items():
             c.set(f"system_h.{key}", var.get())
+
+    # ══════════════════════════════════════════════════════════════
+    # ════  SYSTEM I PANEL  ═══════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════
+
+    def _build_system_i_panel(self) -> None:
+        """System I (Unified) ayar paneli — tum sistemlerin en iyi yapilarini birlestir."""
+        self._scroll_i = ctk.CTkScrollableFrame(self)
+        f = self._scroll_i
+        self._si_entries: dict[str, ctk.CTkEntry] = {}
+        self._si_cb_vars: dict[str, ctk.BooleanVar] = {}
+        self._si_combo_vars: dict[str, ctk.StringVar] = {}
+
+        font = ctk.CTkFont(size=11)
+        font_title = ctk.CTkFont(size=12, weight="bold")
+        _color = "#9C27B0"
+
+        ctk.CTkLabel(f, text="System I — Unified (A+B+D+F+G Birlestirme)",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=_color).pack(anchor="w", padx=8, pady=(6, 2))
+
+        # 3-column layout
+        col_container = ctk.CTkFrame(f, fg_color="transparent")
+        col_container.pack(fill="both", expand=True)
+        col_container.columnconfigure(0, weight=1)
+        col_container.columnconfigure(1, weight=1)
+        col_container.columnconfigure(2, weight=1)
+
+        c1 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c1.grid(row=0, column=0, sticky="nsew", padx=3)
+        c2 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c2.grid(row=0, column=1, sticky="nsew", padx=3)
+        c3 = ctk.CTkFrame(col_container, fg_color="transparent")
+        c3.grid(row=0, column=2, sticky="nsew", padx=3)
+
+        def _field(parent, label, key, default, width=60):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160, anchor="w").pack(side="left")
+            e = ctk.CTkEntry(row, width=width, height=24, font=font)
+            e.insert(0, str(default))
+            e.pack(side="right", padx=4)
+            self._si_entries[key] = e
+
+        def _check(parent, label, key, default=False):
+            var = ctk.BooleanVar(value=default)
+            ctk.CTkCheckBox(parent, text=label, variable=var, font=font).pack(anchor="w", padx=8, pady=1)
+            self._si_cb_vars[key] = var
+
+        def _section(parent, title, color=_color):
+            ctk.CTkLabel(parent, text=title, font=font_title,
+                         text_color=color).pack(anchor="w", padx=4, pady=(6, 2))
+
+        def _combo(parent, label, key, values, default):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=1)
+            ctk.CTkLabel(row, text=label, font=font, width=160, anchor="w").pack(side="left")
+            var = ctk.StringVar(value=default)
+            ctk.CTkComboBox(row, values=values, variable=var,
+                            width=80, font=font).pack(side="right", padx=4)
+            self._si_combo_vars[key] = var
+
+        # ─── COL 1: Genel + Timeframe + Zoom ───
+        _section(c1, "Genel Ayarlar")
+        _field(c1, "Coin sayisi:", "coin_sayisi", 50)
+        _field(c1, "Tarama arali (sn):", "scan_interval_seconds", 60)
+        _field(c1, "Derin analiz arali:", "deep_analysis_interval_seconds", 120)
+        _field(c1, "Derin analiz top N:", "deep_analysis_top_n", 15)
+        _field(c1, "Max finalist:", "max_finalists", 5)
+        _field(c1, "Min skor:", "min_buy_score", 55)
+        _field(c1, "Kline limit:", "kline_limit", 200)
+
+        _section(c1, "Timeframe Yapisi", "#CE93D8")
+        _combo(c1, "TF katman sayisi:", "timeframe.tf_count", ["2", "3"], "2")
+        _field(c1, "Teyit TF carpan:", "timeframe.confirm_tf_multiplier", 12)
+        _combo(c1, "Giris TF modu:", "timeframe.entry_tf_mode", ["auto", "same", "manual"], "auto")
+        _field(c1, "Giris TF bolen:", "timeframe.entry_tf_divisor", 3)
+        _field(c1, "Giris TF (manuel):", "timeframe.entry_tf_manual", "5m", 60)
+        _combo(c1, "TF yuvarlama:", "timeframe.tf_rounding", ["up", "down", "nearest"], "up")
+        _field(c1, "Mid TF carpan:", "timeframe.mid_multiplier", 4)
+        _combo(c1, "Zoom min TF:", "timeframe.zoom_min_tf",
+               ["1m", "3m", "5m", "15m", "30m"], "5m")
+        _combo(c1, "Zoom max TF:", "timeframe.zoom_max_tf",
+               ["4h", "8h", "12h", "1d"], "1d")
+
+        _section(c1, "Zoom Diyafram", "#26C6DA")
+        _field(c1, "Min dalga sayisi:", "filters.min_wave_count", 3)
+        _field(c1, "Max CV:", "filters.max_cv", 1.5)
+        _field(c1, "Max ATR %:", "filters.max_atr_percent", 5.0)
+
+        # ─── COL 2: Yon + Kaldirac + SL/TP ───
+        _section(c2, "Yon Belirleme (3 Indikator)")
+        _field(c2, "EMA hizli:", "direction.ema_fast", 9)
+        _field(c2, "EMA yavas:", "direction.ema_slow", 21)
+        _field(c2, "EMA gap min %:", "direction.ema_gap_min_pct", 0.05)
+        _field(c2, "MACD hizli:", "direction.macd_fast", 8)
+        _field(c2, "MACD yavas:", "direction.macd_slow", 17)
+        _field(c2, "MACD sinyal:", "direction.macd_signal", 9)
+        _field(c2, "RSI periyot:", "direction.rsi_period", 14)
+        _field(c2, "RSI LONG esik:", "direction.rsi_long_threshold", 55)
+        _field(c2, "RSI SHORT esik:", "direction.rsi_short_threshold", 45)
+
+        _section(c2, "Kaldirac (G Bazli)", "#FF8A65")
+        _field(c2, "Min kaldirac:", "leverage.min_leverage", 2)
+        _field(c2, "Max kaldirac:", "leverage.max_leverage", 125)
+        _field(c2, "Fee %:", "leverage.fee_pct", 0.08)
+        _field(c2, "Slippage %:", "leverage.slippage_pct", 0.04)
+        _field(c2, "Liq guvenlik:", "leverage.liq_safety_factor", 0.7)
+        _field(c2, "SL carpan (trend):", "leverage.trend_sl_g_mult", 1.5)
+        _field(c2, "SL carpan (rang.):", "leverage.ranging_sl_g_mult", 2.0)
+        _field(c2, "Liq carpan (trend):", "leverage.trend_liq_g_mult", 3.0)
+        _field(c2, "Liq carpan (rang.):", "leverage.ranging_liq_g_mult", 4.0)
+        _field(c2, "CV esik:", "leverage.cv_threshold", 0.4)
+        _field(c2, "CV carpan:", "leverage.cv_multiplier", 0.7)
+        _field(c2, "Zayif sinyal carp.:", "leverage.weak_signal_multiplier", 0.7)
+        _field(c2, "Gray teyitli carp.:", "leverage.gray_zone_confirmed_mult", 0.7)
+        _field(c2, "Gray belirsiz carp.:", "leverage.gray_zone_uncertain_mult", 0.5)
+
+        _section(c2, "TP / Trailing", "#4CAF50")
+        _combo(c2, "Trend TP modu:", "tp.trend_tp_mode",
+               ["trailing_only", "single", "ladder", "ev_optimized"], "trailing_only")
+        _combo(c2, "Ranging TP modu:", "tp.ranging_tp_mode",
+               ["single", "trailing_only"], "single")
+        _field(c2, "Trail tetik (xG):", "tp.trailing_trigger_g_mult", 2.5)
+        _field(c2, "Trail mesafe (xG):", "tp.trailing_callback_g_mult", 0.5)
+        _combo(c2, "Ranging TP hedef:", "tp.ranging_tp_target",
+               ["bb_middle", "g_based"], "bb_middle")
+        _field(c2, "Ranging TP (xG):", "tp.ranging_tp_g_mult", 2.0)
+        _field(c2, "Tek TP (xG):", "tp.single_tp_g_mult", 2.5)
+        _check(c2, "Kademeli TP aktif", "tp.ladder_enabled", False)
+        _field(c2, "TP1 (xG):", "tp.ladder_tp1_g_mult", 2.0)
+        _field(c2, "TP1 kapat %:", "tp.ladder_tp1_close_pct", 30)
+        _field(c2, "TP2 (xG):", "tp.ladder_tp2_g_mult", 3.5)
+        _field(c2, "TP2 kapat %:", "tp.ladder_tp2_close_pct", 30)
+        _check(c2, "ROI bazli TP", "tp.roi_based_tp_enabled", False)
+        _field(c2, "ROI TP %:", "tp.roi_based_tp_pct", 50.0)
+
+        # ─── COL 3: Rejim + Filtreler + Pozisyon + Opsiyonel ───
+        _section(c3, "Rejim (ER + Hurst)", "#CE93D8")
+        _field(c3, "ER trending:", "regime.er_trending", 0.35)
+        _field(c3, "ER ranging:", "regime.er_ranging", 0.20)
+        _field(c3, "Hurst trending:", "regime.hurst_trending", 0.55)
+        _field(c3, "Hurst ranging:", "regime.hurst_ranging", 0.45)
+        _field(c3, "Hysteresis sayisi:", "regime.hysteresis_count", 2)
+        _check(c3, "Gray zone islem", "regime.gray_zone_trading_enabled", True)
+
+        _section(c3, "Giris Ayarlari", "#00BCD4")
+        _combo(c3, "Trend giris:", "entry.trend_entry_type",
+               ["market", "limit"], "market")
+        _combo(c3, "Ranging giris:", "entry.ranging_entry_type",
+               ["limit", "market"], "limit")
+        _field(c3, "Limit ATR offset:", "entry.limit_atr_offset", 0.1)
+        _field(c3, "Limit timeout (sn):", "entry.limit_timeout_seconds", 300)
+        _check(c3, "Limit sonrasi sinyal kontrol", "entry.limit_recheck_signal", True)
+
+        _section(c3, "Pozisyon Yonetimi", "#FFD54F")
+        _field(c3, "Min pozisyon ($):", "position_sizing.min_position_usd", 1.0)
+        _field(c3, "Min bolen:", "position_sizing.min_divider", 4)
+        _field(c3, "Max bolen:", "position_sizing.max_divider", 12)
+        _field(c3, "Max pozisyon:", "position_sizing.max_positions", 12)
+        _field(c3, "MR max pozisyon:", "position_sizing.mr_max_positions", 2)
+        _field(c3, "Trend max poz.:", "position_sizing.trend_max_positions", 10)
+        _field(c3, "Max ayni yon:", "position_sizing.max_same_direction", 8)
+
+        _section(c3, "Filtreler", "#EF5350")
+        _field(c3, "FR max:", "filters.funding_rate_max", 0.001)
+        _field(c3, "Max spread %:", "filters.max_spread_pct", 0.05)
+        _field(c3, "Min derinlik ($):", "filters.min_depth_usd", 50000)
+        _field(c3, "Min hacim orani:", "filters.min_volume_ratio", 1.5)
+        _field(c3, "Max wall imbalance:", "filters.max_wall_imbalance", 0.3)
+
+        _section(c3, "Opsiyonel Yapilar", "#78909C")
+        _check(c3, "Sinyal cikis", "optional_features.signal_exit_enabled", True)
+        _field(c3, "Sinyal esik (kar):", "optional_features.signal_exit_threshold", 4.0)
+        _field(c3, "Sinyal esik (zarar):", "optional_features.signal_deep_exit_threshold", 8.0)
+        _field(c3, "Min tutma (sn):", "optional_features.signal_min_hold_seconds", 180)
+        _check(c3, "Divergence cikis", "optional_features.divergence_exit_enabled", False)
+        _check(c3, "Rejim degisim cikis", "optional_features.regime_switch_exit_enabled", True)
+        _check(c3, "Zaman limiti", "optional_features.time_limit_enabled", True)
+        _field(c3, "Max sure (saat):", "optional_features.time_limit_hours", 8)
+        _check(c3, "BTC korelasyon", "optional_features.btc_correlation_enabled", True)
+        _field(c3, "BTC beta esik:", "optional_features.btc_beta_threshold", 0.5)
+        _combo(c3, "BTC aksiyon:", "optional_features.btc_action",
+               ["block", "reduce", "warn"], "block")
+        _check(c3, "Yon dengesi", "optional_features.direction_balance_enabled", True)
+        _combo(c3, "Denge orani:", "optional_features.direction_balance_ratio",
+               ["1-1", "2-1", "3-1", "4-1", "5-1"], "2-1")
+        _check(c3, "Coin ban", "optional_features.coin_ban_enabled", True)
+        _field(c3, "Gunluk kayip limiti:", "optional_features.coin_daily_loss_limit", 3)
+        _field(c3, "Ban suresi (saat):", "optional_features.coin_daily_ban_hours", 24)
+        _check(c3, "Kayip cooldown", "optional_features.loss_cooldown_enabled", True)
+        _field(c3, "Cooldown (sn):", "optional_features.loss_cooldown_seconds", 600)
+        _check(c3, "EV dogrulama", "optional_features.ev_validation_enabled", True)
+        _check(c3, "EV hard gate", "optional_features.ev_hard_gate_enabled", False)
+
+        _section(c3, "Backtest Optimizer", "#7C4DFF")
+        _check(c3, "Optimizer aktif", "backtest_optimizer.enabled", True)
+        _combo(c3, "Optimizer rolu:", "backtest_optimizer.role",
+               ["advisor", "gatekeeper"], "advisor")
+        _field(c3, "Gatekeeper min skor:", "backtest_optimizer.gatekeeper_min_score", 0.3)
+        _field(c3, "Cache suresi (saat):", "backtest_optimizer.cache_hours", 4)
+        _check(c3, "Tabloda goster", "backtest_optimizer.show_in_table", True)
+
+    def _load_system_i_from_config(self) -> None:
+        """Config degerlerini System I paneline yukle."""
+        si = self.controller.config.get("system_i", {})
+
+        def _get_nested(data, dotted_key):
+            parts = dotted_key.split(".")
+            val = data
+            for p in parts:
+                if isinstance(val, dict):
+                    val = val.get(p)
+                else:
+                    return None
+            return val
+
+        for key, entry in self._si_entries.items():
+            val = _get_nested(si, key)
+            if val is not None:
+                entry.delete(0, "end")
+                entry.insert(0, str(val))
+        for key, var in self._si_cb_vars.items():
+            val = _get_nested(si, key)
+            if val is not None:
+                var.set(val)
+        for key, var in self._si_combo_vars.items():
+            val = _get_nested(si, key)
+            if val is not None:
+                var.set(str(val))
+
+    def _save_system_i_to_config(self) -> None:
+        """System I panel degerlerini config'e kaydet."""
+        c = self.controller.config
+        for key, entry in self._si_entries.items():
+            raw = entry.get().strip()
+            if not raw:
+                continue
+            try:
+                if "." in raw and not raw.replace(".", "", 1).lstrip("-").isdigit():
+                    c.set(f"system_i.{key}", raw)
+                elif "." in raw:
+                    c.set(f"system_i.{key}", float(raw))
+                else:
+                    c.set(f"system_i.{key}", int(raw))
+            except ValueError:
+                c.set(f"system_i.{key}", raw)
+        for key, var in self._si_cb_vars.items():
+            c.set(f"system_i.{key}", var.get())
+        for key, var in self._si_combo_vars.items():
+            raw = var.get()
+            try:
+                c.set(f"system_i.{key}", int(raw))
+            except ValueError:
+                c.set(f"system_i.{key}", raw)

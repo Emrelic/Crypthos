@@ -237,6 +237,28 @@ class SystemHScanner:
         """system_h config'den oku."""
         return self._config.get(f"system_h.{key}", default)
 
+    def cleanup_caches(self, active_symbols: set[str] = None) -> None:
+        """Artık taranmayan sembollerin cache'lerini temizle.
+        Her scan döngüsünde çağrılmalı (state_machine'den)."""
+        if active_symbols is not None:
+            stale_regime = [k for k in self._regime_cache if k not in active_symbols]
+            for k in stale_regime:
+                del self._regime_cache[k]
+                self._regime_history.pop(k, None)
+
+            stale_opt = [k for k in self._opt_cache if k not in active_symbols]
+            for k in stale_opt:
+                del self._opt_cache[k]
+
+        # Completed ama okunmamış futures temizle
+        done_futures = [k for k, f in self._opt_futures.items() if f.done()]
+        for k in done_futures:
+            try:
+                self._opt_futures[k].result()
+            except Exception:
+                pass
+            del self._opt_futures[k]
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # FAZ 1: Skorlama (A'nın mevcut sistemi — sabit TF)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -398,7 +420,66 @@ class SystemHScanner:
             return
 
         # 2c. TP & trailing parametreleri (G bazlı)
+        # NOT: regime_zone henüz boş olabilir (Phase 3 sonrası recalc_after_regime çağrılmalı)
         self._set_exit_params(result, klines_by_tf, sh)
+
+    def recalc_after_regime(self, result: SystemHScanResult,
+                            klines_by_tf: dict[str, list]) -> None:
+        """Phase 3 (ER+Hurst) sonrası kaldıraç ve exit params'ı doğru rejimle yeniden hesapla.
+
+        enrich_with_zoom Phase 2'de çalışırken regime_zone henüz boştu.
+        Phase 3 regime_zone'u set ettikten sonra bu metot çağrılarak
+        kaldıraç çarpanları ve TP/trailing parametreleri düzeltilir.
+        """
+        if not result.zoom or result.zoom.optimal_G < 0.01:
+            return
+        if not result.regime_zone:
+            return
+
+        sh = self._config.get("system_h", {})
+        zoom = result.zoom
+
+        # Kaldıracı doğru rejim çarpanlarıyla yeniden hesapla
+        result.leverage_calc = self._calculate_leverage_from_g(
+            zoom.optimal_G, result.regime_zone, sh,
+            wave_count=zoom.wave_count, cv=zoom.cv, I=zoom.optimal_I,
+        )
+        lc = result.leverage_calc
+        result.G = lc.G
+        result.I = lc.I
+        result.sl_pct = lc.sl_pct
+        result.leverage = lc.max_leverage
+
+        # Min kaldıraç kontrolü
+        min_lev = sh.get("min_leverage", 2)
+        if result.leverage < min_lev:
+            result.reject_reason = f"leverage_low_{result.leverage}x"
+            result.eligible = False
+            return
+
+        # User max kaldıraç sınırı
+        user_max = self._config.get("strategy.max_leverage", 20)
+        if result.leverage > user_max:
+            result.leverage = user_max
+
+        # Exit params'ı doğru rejimle yeniden hesapla
+        self._set_exit_params(result, klines_by_tf, sh)
+
+        # R:R filtresi (B'den — minimum risk:reward kontrolü)
+        min_rr = sh.get("min_rr", 1.3)
+        if result.I > 0 and result.sl_pct > 0:
+            trail_cost = result.trailing_callback_pct if result.trailing_callback_pct > 0 else 0
+            expected_profit = result.I * 0.8 - trail_cost
+            if expected_profit > 0:
+                rr = expected_profit / result.sl_pct
+                if rr < min_rr:
+                    result.eligible = False
+                    result.reject_reason = f"rr_low_{rr:.2f}<{min_rr}"
+                    return
+
+        logger.debug(f"[H Recalc] {result.symbol}: regime_zone={result.regime_zone} "
+                     f"lev={result.leverage}x SL={result.sl_pct:.3f}% "
+                     f"TP={result.tp_pct:.3f}% trail={result.trailing_trigger_pct:.3f}%")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # FAZ 3: ER + Hurst Rejim Tespiti (B'den, ADX yerine)
@@ -620,44 +701,55 @@ class SystemHScanner:
         prob.avg_forward = float(np.mean(forward_pcts))
         prob.p90_retrace = float(np.percentile(retrace_pcts, 90))
 
-        # P(win)/P(loss) hesapla (F'den — çok döngülü)
+        # P(win)/P(loss) hesapla — swing çiftleri ile doğrudan simülasyon
+        # Her swing çiftinde (forward + retrace) gerçek trade sonucunu hesapla:
+        # forward >= TP → win, retrace >= SL → loss, ikisi de değilse → nötr
         sl_pct = result.sl_pct
         tp_pct = result.tp_pct if result.tp_pct > 0 else prob.avg_forward
 
         if sl_pct > 0 and tp_pct > 0:
-            tp_hits = sum(1 for f in forward_pcts if f >= tp_pct)
-            p_fwd_tp = tp_hits / len(forward_pcts)
+            # Forward-retrace çiftleri oluştur (ardışık swing bacakları)
+            n_pairs = min(len(forward_pcts), len(retrace_pcts))
+            wins = 0
+            losses = 0
+            neutrals = 0
+            for pi in range(n_pairs):
+                fwd = forward_pcts[pi]
+                ret = retrace_pcts[pi]
+                tp_reached = fwd >= tp_pct
+                sl_reached = ret >= sl_pct
+                if tp_reached and not sl_reached:
+                    wins += 1
+                elif sl_reached and not tp_reached:
+                    losses += 1
+                elif tp_reached and sl_reached:
+                    # Aynı swing'de ikisi de ulaşılıyor — konservatif: %50/%50
+                    wins += 0.5
+                    losses += 0.5
+                else:
+                    neutrals += 1
 
-            sl_hits = sum(1 for r in retrace_pcts if r >= sl_pct)
-            p_ret_sl = sl_hits / len(retrace_pcts)
+            total_decided = wins + losses
+            if total_decided > 0:
+                prob.p_win = wins / (wins + losses + neutrals)
+                prob.p_loss = losses / (wins + losses + neutrals)
 
-            p_win_c = p_fwd_tp
-            p_loss_c = (1 - p_fwd_tp) * p_ret_sl
-
-            denom = p_win_c + p_loss_c
-            if denom > 0:
-                prob.p_win = p_win_c / denom
-                prob.p_loss = p_loss_c / denom
-
-                # EV = P(win) × TP - P(loss) × SL (% ROI olarak)
-                leverage = result.leverage or 1
-                ev_roi = prob.p_win * tp_pct * leverage - prob.p_loss * sl_pct * leverage
+                # EV = P(win) × TP - P(loss) × SL (leverage-free, saf %)
+                ev_roi = prob.p_win * tp_pct - prob.p_loss * sl_pct
                 prob.ev_pct = round(ev_roi, 2)
 
         result.probability = prob
 
         # EV skor çarpanı hesapla (hard filtre DEĞİL, çarpan)
+        # EV artık leverage-free (saf %): tipik değerler -2% ile +5% arası
         if prob.ev_pct > 0:
             # Pozitif EV → skoru yukarı it (max 1.3x)
-            result.ev_multiplier = 1.0 + min(prob.ev_pct / 100.0, 0.3)
-        elif prob.ev_pct < -10:
-            # Çok negatif EV → skoru aşağı çek (min 0.7x)
-            result.ev_multiplier = max(0.7, 1.0 + prob.ev_pct / 100.0)
+            result.ev_multiplier = 1.0 + min(prob.ev_pct / 15.0, 0.3)
+        elif prob.ev_pct < -1.0:
+            # Negatif EV → skoru aşağı çek (min 0.7x)
+            result.ev_multiplier = max(0.7, 1.0 + prob.ev_pct / 10.0)
         else:
             result.ev_multiplier = 1.0
-
-        # EV çarpanını skora uygula (Faz 1 skoruna — final skor Faz 5'te üzerine yazılır)
-        result.score = round(result.score * result.ev_multiplier, 1)
 
         # EV Hard Gate (opsiyonel — config'den açılır)
         ev_gate = sh.get("ev_hard_gate_enabled", False)
@@ -743,7 +835,8 @@ class SystemHScanner:
         else:
             decreasing = [t for t in eligible_tfs if t.g_artis_hizi < 0]
             if decreasing:
-                best = max(decreasing, key=lambda t: t.minutes)
+                # Dirsek: G'nin ilk düşmeye başladığı (en kısa) TF
+                best = min(decreasing, key=lambda t: t.minutes)
                 result.dirsek_index = eligible_tfs.index(best) if best in eligible_tfs else 0
             else:
                 candidates_with_rate = [t for t in eligible_tfs if t.g_artis_hizi != 0]
@@ -852,7 +945,7 @@ class SystemHScanner:
 
             calc.G = G_eff
             calc.g_adjusted = True
-            calc.sl_pct = G_eff * sl_mult
+            calc.sl_pct = G_eff * sl_mult + fee_total
             calc.pratik_liq_pct = G_eff * liq_mult
             calc.teorik_liq_pct = teorik_liq_eff
             calc.max_leverage = binance_max
@@ -860,12 +953,24 @@ class SystemHScanner:
             logger.debug(f"[H Ters G] G_raw={G:.4f}% → G_eff={G_eff:.4f}% "
                          f"(lev {raw_leverage}x → {binance_max}x)")
         else:
-            calc.sl_pct = G * sl_mult
+            calc.sl_pct = G * sl_mult + fee_total
             calc.pratik_liq_pct = G * liq_mult
             calc.teorik_liq_pct = teorik_liq
             calc.max_leverage = raw_leverage
 
         calc.max_leverage = max(1, calc.max_leverage)
+
+        # Kaldıraç ceza çarpanları (B'den — belirsizlik durumlarında kaldıracı düşür)
+        penalty = 1.0
+        # 1. GRAY/UNDECIDED rejimde muhafazakâr ol
+        if regime_zone == "GRAY":
+            penalty *= sh.get("penalty_gray_regime", 0.7)
+        # 2. Dalga tutarsızlığı yüksekse
+        if cv > sh.get("penalty_cv_threshold", 0.5):
+            penalty *= sh.get("penalty_high_cv", 0.7)
+        if penalty < 1.0:
+            calc.max_leverage = max(1, int(calc.max_leverage * penalty))
+
         return calc
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -878,11 +983,19 @@ class SystemHScanner:
         G = result.leverage_calc.G
         zone = result.regime_zone
 
-        if zone == "TRENDING" or zone == "GRAY":
+        if zone == "TRENDING":
             # Trend: trailing stop, TP yok
             result.tp_pct = 0.0
             result.trailing_trigger_pct = G * sh.get("trailing_trigger_g_mult", 2.5)
             result.trailing_callback_pct = G * sh.get("trailing_callback_g_mult", 0.5)
+        elif zone == "GRAY":
+            # GRAY (belirsiz rejim): muhafazakâr sabit TP + dar trailing yedek
+            # Rejim belirsizken trailing tek başına riskli — sabit TP ile sınırla
+            gray_tp_g_mult = sh.get("gray_tp_g_mult", 2.0)
+            result.tp_pct = G * gray_tp_g_mult
+            # Opsiyonel: TP'yi geçerse dar trailing ile bonus kâr
+            result.trailing_trigger_pct = result.tp_pct * 1.2  # TP'nin %20 üstü
+            result.trailing_callback_pct = G * sh.get("gray_trailing_callback_g_mult", 0.8)
         else:
             # Ranging: sabit TP (BB karşı bant veya 3G — yakın olan)
             tp_g_mult = sh.get("ranging_tp_g_mult", 3.0)
@@ -1706,14 +1819,17 @@ class SystemHScanner:
         wins = sum(1 for r in trades_roi if r > 0)
         wr = wins / len(trades_roi) * 100
 
-        dd = 0.0
+        # Equity curve drawdown (peak-to-trough)
+        equity = 0.0
+        peak = 0.0
         max_dd = 0.0
         for r in trades_roi:
-            if r < 0:
-                dd += r
-                max_dd = min(max_dd, dd)
-            else:
-                dd = 0.0
+            equity += r
+            if equity > peak:
+                peak = equity
+            dd = equity - peak  # her zaman <= 0
+            if dd < max_dd:
+                max_dd = dd
 
         return OptResult(
             combo=combo,
@@ -1743,11 +1859,30 @@ class SystemHScanner:
                 fav = (entry_price - low) / entry_price * 100
                 adv = (high - entry_price) / entry_price * 100
 
-            if sl_pct > 0 and adv >= sl_pct:
-                return "SL", i + 1, -sl_pct * leverage - fee_roi
+            # Liq her zaman önce kontrol edilir (gerçek hayatta da böyle)
             if adv >= liq_pct:
                 return "LIQ", i + 1, -100.0
-            if fav >= tp_pct:
+
+            sl_hit = sl_pct > 0 and adv >= sl_pct
+            tp_hit = fav >= tp_pct
+
+            if sl_hit and tp_hit:
+                # Aynı mumda ikisi de tetiklendi — open'a yakınlığa göre karar
+                # Open ile SL/TP mesafesini karşılaştır (unbiased)
+                candle_open = float(k[1])
+                if direction == "LONG":
+                    dist_to_sl = abs(candle_open - entry_price * (1 - sl_pct / 100))
+                    dist_to_tp = abs(candle_open - entry_price * (1 + tp_pct / 100))
+                else:
+                    dist_to_sl = abs(candle_open - entry_price * (1 + sl_pct / 100))
+                    dist_to_tp = abs(candle_open - entry_price * (1 - tp_pct / 100))
+                if dist_to_sl <= dist_to_tp:
+                    return "SL", i + 1, -sl_pct * leverage - fee_roi
+                else:
+                    return "TP", i + 1, tp_pct * leverage - fee_roi
+            elif sl_hit:
+                return "SL", i + 1, -sl_pct * leverage - fee_roi
+            elif tp_hit:
                 return "TP", i + 1, tp_pct * leverage - fee_roi
 
         if forward_5m:

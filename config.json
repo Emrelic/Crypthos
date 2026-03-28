@@ -406,7 +406,7 @@
     "fast_scan_ob_refresh": true
   },
   "system_g": {
-    "enabled": true,
+    "enabled": false,
     "coin_sayisi": 50,
     "mum_sayisi": 200,
     "direction_tfs": [
@@ -523,50 +523,217 @@
     "tf_multiplier": 12,
     "er_macro_ranging": 0.15,
     "er_macro_trending": 0.35,
-    "er_micro_ranging": 0.20,
-    "er_micro_trending": 0.40,
+    "er_micro_ranging": 0.2,
+    "er_micro_trending": 0.4,
     "hurst_ranging": 0.45,
     "hurst_trending": 0.55,
     "yon_mum_sayisi": 72,
     "regime_hysteresis": 3,
-
     "ev_hard_gate_enabled": false,
     "min_ev_pct": 5.0,
-
     "optimizer_enabled": false,
     "optimizer_cache_ttl_hours": 4,
     "optimizer_blend_weight_g": 0.6,
     "optimizer_blend_weight_opt": 0.4,
     "optimizer_min_score": 20.0,
     "optimization": {
-      "leverages": [10, 20, 30, 50, 75, 100],
-      "tp_pcts": [0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 2.5, 3.0],
-      "sl_modes": ["no_sl", "0.5", "0.7", "1.0", "1.5"],
+      "leverages": [
+        10,
+        20,
+        30,
+        50,
+        75,
+        100
+      ],
+      "tp_pcts": [
+        0.3,
+        0.5,
+        0.7,
+        1.0,
+        1.5,
+        2.0,
+        2.5,
+        3.0
+      ],
+      "sl_modes": [
+        "no_sl",
+        "0.5",
+        "0.7",
+        "1.0",
+        "1.5"
+      ],
       "min_trades_required": 5,
-      "max_liq_rate": 0.50,
+      "max_liq_rate": 0.5,
       "score_weights": {
         "roi": 0.35,
         "win_rate": 0.25,
-        "max_drawdown": 0.20,
+        "max_drawdown": 0.2,
         "liq_rate": 0.15,
         "trade_count": 0.05
       }
     },
-
     "climax_filter_enabled": false,
     "vol_climax_ma_period": 20,
     "vol_spike_current_mult": 2.5,
     "vol_spike_avg3_mult": 2.0,
-
     "btc_beta_filter_enabled": false,
     "btc_beta_threshold": 0.5,
-
     "score_weights": {
-      "direction_strength": 0.30,
+      "direction_strength": 0.3,
       "ev_quality": 0.25,
-      "regime_clarity": 0.20,
+      "regime_clarity": 0.2,
       "market_context": 0.15,
-      "wave_quality": 0.10
+      "wave_quality": 0.1
+    }
+  },
+  "system_i": {
+    "enabled": true,
+    "coin_sayisi": 50,
+    "swing_n": 10,
+    "scan_interval_seconds": 60,
+    "deep_analysis_interval_seconds": 120,
+    "deep_analysis_top_n": 999,
+    "spike_detection_enabled": true,
+    "spike_min_change_pct": 3.0,
+    "max_finalists": 5,
+    "min_buy_score": 55,
+    "kline_limit": 200,
+    "timeframe": {
+      "tf_count": 2,
+      "confirm_tf_multiplier": 12,
+      "entry_tf_mode": "auto",
+      "entry_tf_divisor": 3,
+      "entry_tf_manual": "5m",
+      "tf_rounding": "up",
+      "mid_multiplier": 4,
+      "zoom_min_tf": "1m",
+      "zoom_max_tf": "1w",
+      "zoom_min_backward_waves": 10,
+      "zoom_g_tf_efficient": 0.60,
+      "zoom_g_tf_inefficient": 0.80
+    },
+    "direction": {
+      "ema_fast": 9,
+      "ema_slow": 21,
+      "ema_gap_min_pct": 0.05,
+      "macd_fast": 8,
+      "macd_slow": 17,
+      "macd_signal": 9,
+      "rsi_period": 14,
+      "rsi_long_threshold": 55,
+      "rsi_short_threshold": 45
+    },
+    "regime": {
+      "er_trending": 0.35,
+      "er_ranging": 0.2,
+      "hurst_trending": 0.55,
+      "hurst_ranging": 0.45,
+      "hysteresis_count": 2,
+      "gray_zone_trading_enabled": true
+    },
+    "leverage": {
+      "min_leverage": 2,
+      "max_leverage": 125,
+      "trend_sl_g_mult": 1.5,
+      "trend_liq_g_mult": 3.0,
+      "ranging_sl_g_mult": 2.0,
+      "ranging_liq_g_mult": 4.0,
+      "liq_safety_factor": 0.7,
+      "fee_pct": 0.08,
+      "slippage_pct": 0.04,
+      "cv_threshold": 0.4,
+      "cv_multiplier": 0.7,
+      "weak_signal_multiplier": 0.7,
+      "gray_zone_confirmed_mult": 0.7,
+      "gray_zone_uncertain_mult": 0.5
+    },
+    "entry": {
+      "entry_mode": "limit_wave",
+      "entry_g_ratio": 0.7,
+      "limit_timeout_seconds": 300,
+      "limit_recheck_signal": true,
+      "entry_tf_rsi_confirm": true,
+      "entry_tf_ema_confirm": true,
+      "trend_entry_type": "market",
+      "ranging_entry_type": "limit",
+      "limit_atr_offset": 0.1
+    },
+    "tp": {
+      "trend_tp_mode": "trailing_only",
+      "ranging_tp_mode": "single",
+      "trailing_trigger_g_mult": 2.5,
+      "trailing_callback_g_mult": 0.5,
+      "ranging_tp_target": "bb_middle",
+      "ranging_tp_g_mult": 2.0,
+      "ladder_enabled": false,
+      "ladder_tp1_g_mult": 2.0,
+      "ladder_tp1_close_pct": 30,
+      "ladder_tp2_g_mult": 3.5,
+      "ladder_tp2_close_pct": 30,
+      "roi_based_tp_enabled": false,
+      "roi_based_tp_pct": 50.0,
+      "single_tp_g_mult": 2.5
+    },
+    "position_sizing": {
+      "min_position_usd": 1.0,
+      "min_divider": 4,
+      "max_divider": 12,
+      "max_positions": 12,
+      "mr_max_positions": 2,
+      "trend_max_positions": 10,
+      "max_same_direction": 8,
+      "max_per_coin": 1
+    },
+    "filters": {
+      "funding_rate_max": 0.001,
+      "max_spread_pct": 0.05,
+      "min_depth_usd": 50000,
+      "min_volume_ratio": 0.5,
+      "volume_filter_enabled": false,
+      "min_wave_count": 3,
+      "max_wall_imbalance": 0.3,
+      "max_cv": 1.5,
+      "max_atr_percent": 5.0,
+      "fee_rate": 0.0004
+    },
+    "optional_features": {
+      "signal_exit_enabled": true,
+      "signal_exit_threshold": 4.0,
+      "signal_deep_exit_threshold": 8.0,
+      "signal_min_hold_seconds": 180,
+      "emergency_exit_enabled": true,
+      "divergence_exit_enabled": false,
+      "regime_switch_exit_enabled": true,
+      "time_limit_enabled": true,
+      "time_limit_hours": 8,
+      "ev_validation_enabled": true,
+      "ev_hard_gate_enabled": false,
+      "ev_min": 0,
+      "btc_correlation_enabled": true,
+      "btc_beta_threshold": 0.5,
+      "btc_action": "block",
+      "direction_balance_enabled": true,
+      "direction_balance_ratio": "2-1",
+      "coin_ban_enabled": true,
+      "coin_daily_loss_limit": 3,
+      "coin_daily_ban_hours": 24,
+      "loss_cooldown_enabled": true,
+      "loss_cooldown_seconds": 600
+    },
+    "backtest_optimizer": {
+      "enabled": true,
+      "role": "advisor",
+      "gatekeeper_min_score": 0.3,
+      "cache_hours": 4,
+      "combos": 240,
+      "show_in_table": true
+    },
+    "score_weights": {
+      "direction_strength": 0.3,
+      "ev_quality": 0.25,
+      "regime_clarity": 0.2,
+      "market_context": 0.15,
+      "wave_quality": 0.1
     }
   },
   "trading": {
