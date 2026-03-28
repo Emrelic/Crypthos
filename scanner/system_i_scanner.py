@@ -659,16 +659,22 @@ class SystemIScanner:
                 hist_prev = histogram
 
             if histogram > 0 and histogram > hist_prev:
-                vote.macd_vote = 1.0
+                vote.macd_vote = 1.0       # pozitif + momentum artıyor
+            elif histogram > 0:
+                vote.macd_vote = 0.5       # pozitif ama momentum azalıyor
             elif histogram < 0 and histogram < hist_prev:
-                vote.macd_vote = -1.0
+                vote.macd_vote = -1.0      # negatif + momentum düşüyor
+            elif histogram < 0:
+                vote.macd_vote = -0.5      # negatif ama momentum toparlanıyor
 
-        # RSI 14
+        # RSI 14 — config'ten oku
+        rsi_long_th = self._cfg("direction.rsi_long_threshold", 52)
+        rsi_short_th = self._cfg("direction.rsi_short_threshold", 48)
         rsi = self._rsi(closes, 14)
         vote.rsi_value = rsi
-        if rsi > 55:
+        if rsi > rsi_long_th:
             vote.rsi_vote = 1.0
-        elif rsi < 45:
+        elif rsi < rsi_short_th:
             vote.rsi_vote = -1.0
 
         # TF yönü = 3 oyun ortalaması
