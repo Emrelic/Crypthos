@@ -442,7 +442,13 @@ class SystemIPanel(ctk.CTkFrame):
         str_color = _STRENGTH_COLORS.get(strength, "gray")
 
         # Regime
-        regime = g(r, 'regime_zone', '') or g(r, 'regime', '') or ''
+        regime = g(r, 'regime_zone', '') or ''
+        if not regime:
+            regime_obj = g(r, 'regime', None)
+            if regime_obj and hasattr(regime_obj, 'regime'):
+                regime = regime_obj.regime or ''
+            elif isinstance(regime_obj, str):
+                regime = regime_obj
         zone_short = {"TRENDING": "TRND", "RANGING": "RANG", "GRAY": "GRI",
                       "TREND": "TRND"}.get(regime, regime[:4] if regime else "--")
         zone_color = _ZONE_COLORS.get(regime, "gray")
@@ -581,7 +587,13 @@ class SystemIPanel(ctk.CTkFrame):
         str_color = _STRENGTH_COLORS.get(strength, "gray")
 
         # Regime
-        regime = g(r, 'regime_zone', '') or g(r, 'regime', '') or ''
+        regime = g(r, 'regime_zone', '') or ''
+        if not regime:
+            regime_obj = g(r, 'regime', None)
+            if regime_obj and hasattr(regime_obj, 'regime'):
+                regime = regime_obj.regime or ''
+            elif isinstance(regime_obj, str):
+                regime = regime_obj
         zone_short = {"TRENDING": "TRND", "RANGING": "RANG", "GRAY": "GRI",
                       "TREND": "TRND"}.get(regime, regime[:4] if regime else "--")
         zone_color = _ZONE_COLORS.get(regime, "gray")

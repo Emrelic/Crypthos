@@ -1184,9 +1184,8 @@ class SystemIScanner:
                (result.direction == "SHORT" and wall_imbalance > max_wall):
                 return False, f"wall_blocking ({wall_imbalance:.2f})"
 
-        # 7. EV hard gate (opsiyonel)
-        ev_gate = self._cfg("ev_hard_gate_enabled",
-                            self._cfg("optional_features.ev_validation_enabled", False))
+        # 7. EV hard gate (opsiyonel — ev_hard_gate_enabled ile kontrol edilir)
+        ev_gate = self._cfg("ev_hard_gate_enabled", False)
         if ev_gate and result.probability.sufficient:
             min_ev = self._cfg("ev_min", 0.0)
             if result.probability.ev_pct < min_ev:

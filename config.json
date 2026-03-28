@@ -679,8 +679,8 @@
       "min_divider": 4,
       "max_divider": 12,
       "max_positions": 12,
-      "mr_max_positions": 2,
-      "trend_max_positions": 10,
+      "mr_max_positions": 12,
+      "trend_max_positions": 12,
       "max_same_direction": 8,
       "max_per_coin": 1
     },

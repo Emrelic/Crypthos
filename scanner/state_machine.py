@@ -8054,24 +8054,28 @@ class ScannerStateMachine:
             deep_syms = [c.symbol for c in top_candidates]
             self._fetch_oi_depth(deep_syms, market_ctx)
 
-            results = []
-            for cand in top_candidates:
-                sym = cand.symbol
-                # Fetch klines for ALL Binance TFs — TF'ye gore dinamik mum sayisi
-                from scanner.system_i_scanner import ZOOM_KLINE_LIMITS as SI_KLINE_LIMITS
+            # Batch fetch: TF bazlı toplu çekim (coin bazlı değil)
+            from scanner.system_i_scanner import ZOOM_KLINE_LIMITS as SI_KLINE_LIMITS
+            deep_sym_list = [c.symbol for c in top_candidates]
+            all_klines = {}  # {symbol: {tf: klines}}
+            for sym in deep_sym_list:
+                all_klines[sym] = {}
 
-                klines_by_tf = {}
-                # 5m zaten prefilter'da cekildi (200 mum), ama zoom icin daha fazla lazim
-                for tf_name, _ in SI_ZOOM_TF_LADDER:
-                    tf_limit = SI_KLINE_LIMITS.get(tf_name, kline_limit)
-                    tf_map = self._fetcher.fetch_batch([sym], tf_name, tf_limit)
+            for tf_name, _ in SI_ZOOM_TF_LADDER:
+                tf_limit = SI_KLINE_LIMITS.get(tf_name, kline_limit)
+                tf_map = self._fetcher.fetch_batch(deep_sym_list, tf_name, tf_limit)
+                for sym in deep_sym_list:
                     kl = tf_map.get(sym)
                     if kl is not None:
                         if hasattr(kl, 'values'):
-                            klines_by_tf[tf_name] = kl.values.tolist()
+                            all_klines[sym][tf_name] = kl.values.tolist()
                         else:
-                            klines_by_tf[tf_name] = kl
+                            all_klines[sym][tf_name] = kl
 
+            results = []
+            for cand in top_candidates:
+                sym = cand.symbol
+                klines_by_tf = all_klines.get(sym, {})
                 ctx = market_ctx.get(sym, {})
                 result = scanner.deep_analyze(sym, klines_by_tf, ctx)
                 results.append(result)
