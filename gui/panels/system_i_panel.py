@@ -271,9 +271,21 @@ class SystemIPanel(ctk.CTkFrame):
         all_positions = []
         try:
             all_positions = self.controller.get_all_scanner_positions()
-        except Exception:
-            pass
-        si_positions = [p for p in all_positions if p.get("entry_mode") == "SYSTEM_I"]
+        except Exception as e:
+            logger.debug(f"[SysI Panel] get positions error: {e}")
+
+        # Debug: entry_mode değerlerini logla
+        if all_positions:
+            modes = [p.get("entry_mode", "NONE") for p in all_positions]
+            mode_counts = {}
+            for m in modes:
+                mode_counts[m] = mode_counts.get(m, 0) + 1
+            logger.debug(f"[SysI Panel] all_positions={len(all_positions)}, "
+                         f"entry_modes={mode_counts}")
+
+        # SYSTEM_I pozisyonları + entry_mode boş olanları da dahil et (eski pozisyonlar)
+        si_positions = [p for p in all_positions
+                        if p.get("entry_mode") in ("SYSTEM_I", "", None)]
 
         trend_positions = [p for p in si_positions
                            if p.get("entry_regime", "").upper() in ("TREND", "TRENDING")]
@@ -284,6 +296,9 @@ class SystemIPanel(ctk.CTkFrame):
         for p in si_positions:
             if id(p) not in matched:
                 trend_positions.append(p)
+
+        logger.debug(f"[SysI Panel] si={len(si_positions)}, "
+                     f"trend_pos={len(trend_positions)}, rang_pos={len(rang_positions)}")
 
         # Update trend scan table
         try:
