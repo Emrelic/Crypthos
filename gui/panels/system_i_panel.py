@@ -283,9 +283,9 @@ class SystemIPanel(ctk.CTkFrame):
             logger.debug(f"[SysI Panel] all_positions={len(all_positions)}, "
                          f"entry_modes={mode_counts}")
 
-        # SYSTEM_I pozisyonları + entry_mode boş olanları da dahil et (eski pozisyonlar)
-        si_positions = [p for p in all_positions
-                        if p.get("entry_mode") in ("SYSTEM_I", "", None)]
+        # System I paneli aktifken tüm pozisyonları göster
+        # (eski sistemlerden kalan pozisyonlar da dahil)
+        si_positions = list(all_positions)
 
         trend_positions = [p for p in si_positions
                            if p.get("entry_regime", "").upper() in ("TREND", "TRENDING")]
