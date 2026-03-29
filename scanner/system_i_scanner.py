@@ -425,12 +425,12 @@ class SystemIScanner:
         reliable = [t for t in tf_results if t.bw_count >= min_bw]
 
         if not reliable:
-            # Hicbiri yeterli dalga yok — en cok dalgaya sahip TF'yi sec
-            reliable = sorted(tf_results, key=lambda t: t.bw_count, reverse=True)[:1]
-            if reliable:
-                self._log.warning(
-                    f"[Zoom] {symbol}: Hicbir TF'de yeterli dalga yok "
-                    f"(min_bw={min_bw}), en iyi: {reliable[0].tf} bw={reliable[0].bw_count}")
+            # Hiçbir TF'de yeterli dalga yok → güvenilir G hesaplanamaz, reddet
+            best_bw = max(tf_results, key=lambda t: t.bw_count)
+            self._log.warning(
+                f"[Zoom] {symbol}: Hicbir TF'de yeterli dalga yok "
+                f"(min_bw={min_bw}), en iyi: {best_bw.tf} bw={best_bw.bw_count} — SKIP")
+            return result
 
         # ---- ADIM 4: Alttan yukari G/TF verimlilik taramasi ----
         # En kucuk TF'den basla (max kaldirac, min G)
@@ -1483,6 +1483,13 @@ class SystemIScanner:
 
         if zoom.optimal_G < 0.01:
             result.reject_reason = "zoom_no_valid_g"
+            return result
+
+        # G max sınırı: çok yüksek G = çok geniş SL = anlamsız trade
+        # G > %20 → SL > %30 → düşük kaldıraçta bile likidasyon riski
+        max_g = self._cfg("max_g_pct", 20.0)
+        if zoom.optimal_G > max_g:
+            result.reject_reason = f"g_too_high ({zoom.optimal_G:.1f}% > {max_g}%)"
             return result
 
         # 2. Yön belirleme

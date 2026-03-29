@@ -1559,7 +1559,9 @@ class ScannerStateMachine:
             otype = self._classify_order_type(o)
             if otype == "STOP_MARKET":
                 order_map[sym]["sl"] += 1
-            elif otype == "TRAILING_STOP_MARKET":
+            elif otype in ("TRAILING_STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                # TRAILING_STOP_MARKET: trend trailing, TAKE_PROFIT_MARKET: ranging sabit TP
+                # Verify açısından ikisi de "SL dışı koruma emri" — trail olarak say
                 order_map[sym]["trail"] += 1
             else:
                 order_map[sym]["other"] += 1
