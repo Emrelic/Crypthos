@@ -896,14 +896,20 @@ class PositionManager:
 
         # === 3. TP TARGET (sabit TP — server-side birincil, software yedek) ===
         # TP server-side'da aktif, ama software da kontrol etsin
-        G_val = getattr(pos, 'entry_bb_width', 0)
+        # NOT: entry_bb_width artık SL% saklar (G değil). G'yi geri hesapla.
+        sl_pct_stored = getattr(pos, 'entry_bb_width', 0)
         tp_cfg = si_cfg.get("tp", {})
         entry_regime = getattr(pos, 'entry_regime', '')
+        lev_cfg = si_cfg.get("leverage", {})
 
         # Ranging: sabit TP kontrolü
-        if entry_regime == "RANGING" and G_val > 0:
+        if entry_regime == "RANGING" and sl_pct_stored > 0:
+            # G'yi SL%'den geri hesapla: SL% = sl_mult * G + fee_total
+            fee_total = lev_cfg.get("fee_pct", 0.08) + lev_cfg.get("slippage_pct", 0.04)
+            sl_mult = lev_cfg.get("ranging_sl_g_mult", 2.0)
+            G_approx = max(0.01, (sl_pct_stored - fee_total) / sl_mult)
             ranging_tp_mult = tp_cfg.get("ranging_tp_g_mult", 2.0)
-            tp_pct = ranging_tp_mult * G_val / 100
+            tp_pct = ranging_tp_mult * G_approx / 100
             if tp_pct > 0:
                 if pos.side == OrderSide.BUY_LONG:
                     tp_price = pos.entry_price * (1 + tp_pct)
@@ -919,7 +925,7 @@ class PositionManager:
                         return self.EXIT_TP
 
         # === 4. G BAZLI TRAILING (software yedek kontrol) ===
-        if G_val > 0 and strat.get("trailing_enabled", True):
+        if sl_pct_stored > 0 and strat.get("trailing_enabled", True):
             self._update_trailing(pos, price)
             if self._check_trailing(pos, price):
                 return self.EXIT_TRAILING_RENEW

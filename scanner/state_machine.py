@@ -8643,30 +8643,39 @@ class ScannerStateMachine:
                                         entry_price, actual_qty,
                                         entry_regime,
                                         need_sl, need_trailing):
-        """System I: G bazlı eksik emir onarımı."""
+        """System I: eksik emir onarımı.
+
+        NOT: entry_bb_width artık doğrudan SL% saklar (G değil).
+        G'ye ihtiyaç olan yerlerde SL%'den geri hesaplanır.
+        """
         sl_placed = False
         trail_placed = False
         si_cfg = self._config.get("system_i", {})
         lev_cfg = si_cfg.get("leverage", {})
 
-        G_val = getattr(pos, 'entry_bb_width', 0)
-        if G_val <= 0:
+        sl_pct_stored = getattr(pos, 'entry_bb_width', 0)  # SL% (fee dahil)
+        if sl_pct_stored <= 0:
             return sl_placed, trail_placed
 
-        # SL onarımı
+        # G'yi SL%'den geri hesapla: SL% = sl_mult * G + fee_total
+        fee_pct_cfg = lev_cfg.get("fee_pct", 0.08)
+        slippage_pct_cfg = lev_cfg.get("slippage_pct", 0.04)
+        fee_total = fee_pct_cfg + slippage_pct_cfg
+
+        eff_regime = entry_regime
+        if entry_regime == "GRAY":
+            conf = getattr(pos, 'entry_regime_confidence', 0)
+            eff_regime = "TRENDING" if conf > 0.5 else "RANGING"
+        if eff_regime in ("TRENDING",):
+            sl_mult = lev_cfg.get("trend_sl_g_mult", 1.5)
+        else:
+            sl_mult = lev_cfg.get("ranging_sl_g_mult", 2.0)
+
+        G_approx = max(0.01, (sl_pct_stored - fee_total) / sl_mult)
+
+        # SL onarımı — entry_bb_width doğrudan SL%, tekrar çarpmaya gerek yok
         if need_sl:
-            # GRAY rejim çözümleme
-            eff_regime = entry_regime
-            if entry_regime == "GRAY":
-                conf = getattr(pos, 'entry_regime_confidence', 0)
-                eff_regime = "TRENDING" if conf > 0.5 else "RANGING"
-            if eff_regime in ("TRENDING",):
-                sl_mult = lev_cfg.get("trend_sl_g_mult", 1.5)
-            else:
-                sl_mult = lev_cfg.get("ranging_sl_g_mult", 2.0)
-            sl_pct = G_val * sl_mult / 100
-            fee_pct = lev_cfg.get("fee_pct", 0.08) / 100
-            sl_pct += fee_pct + fee_pct * 0.5
+            sl_pct = sl_pct_stored / 100  # fraction'a çevir
             if is_long:
                 sl_price = round(entry_price * (1 - sl_pct), pp)
             else:
@@ -8682,30 +8691,22 @@ class ScannerStateMachine:
                 )
                 sl_placed = True
                 logger.info(f"[SysI REPAIR] {symbol}: SL @ {sl_price} "
-                            f"({sl_mult}xG={G_val:.3f}%)")
+                            f"(SL%={sl_pct_stored:.3f}%, G≈{G_approx:.3f}%)")
             except Exception as e:
                 logger.error(f"[SysI REPAIR] {symbol}: SL FAILED: {e}")
 
-        # Trailing/TP onarımı
+        # Trailing/TP onarımı — G_approx kullanarak (SL%'den geri hesaplanmış)
         if need_trailing:
             tp_cfg = si_cfg.get("tp", {})
-            # GRAY rejim: confidence'a göre trend mi ranging mi
-            if not hasattr(self, '_si_eff_regime_cache'):
-                self._si_eff_regime_cache = {}
-            if entry_regime == "GRAY":
-                conf = getattr(pos, 'entry_regime_confidence', 0)
-                eff_regime_trail = "TRENDING" if conf > 0.5 else "RANGING"
-            else:
-                eff_regime_trail = entry_regime
-            if eff_regime_trail in ("TRENDING",):
-                # Trailing
-                trail_trigger = tp_cfg.get("trailing_trigger_g_mult", 2.5) * G_val / 100
-                trail_callback = tp_cfg.get("trailing_callback_g_mult", 0.5) * G_val / 100
-                callback_pct = max(0.1, min(round(trail_callback * 100, 2), 5.0))
+            if eff_regime in ("TRENDING",):
+                # Trailing — G bazlı hesapla
+                trail_trigger_pct = tp_cfg.get("trailing_trigger_g_mult", 2.5) * G_approx / 100
+                trail_callback_pct = tp_cfg.get("trailing_callback_g_mult", 0.5) * G_approx / 100
+                callback_pct = max(0.1, min(round(trail_callback_pct * 100, 2), 5.0))
                 if is_long:
-                    act_price = round(entry_price * (1 + trail_trigger), pp)
+                    act_price = round(entry_price * (1 + trail_trigger_pct), pp)
                 else:
-                    act_price = round(entry_price * (1 - trail_trigger), pp)
+                    act_price = round(entry_price * (1 - trail_trigger_pct), pp)
                 try:
                     rest.place_order(
                         symbol=symbol,
@@ -8718,13 +8719,13 @@ class ScannerStateMachine:
                     )
                     trail_placed = True
                     logger.info(f"[SysI REPAIR] {symbol}: trailing callback={callback_pct}% "
-                                f"activation={act_price}")
+                                f"activation={act_price} (G≈{G_approx:.3f}%)")
                 except Exception as e:
                     logger.error(f"[SysI REPAIR] {symbol}: trailing FAILED: {e}")
             else:
-                # RANGING: sabit TP
+                # RANGING: sabit TP — G bazlı hesapla
                 tp_mult = tp_cfg.get("ranging_tp_g_mult", 2.0)
-                tp_pct = tp_mult * G_val / 100
+                tp_pct = tp_mult * G_approx / 100
                 if is_long:
                     tp_price = round(entry_price * (1 + tp_pct), pp)
                 else:
@@ -8740,7 +8741,7 @@ class ScannerStateMachine:
                     )
                     trail_placed = True
                     logger.info(f"[SysI REPAIR] {symbol}: TP @ {tp_price} "
-                                f"({tp_mult}xG={G_val:.3f}%)")
+                                f"({tp_mult}xG≈{G_approx:.3f}%)")
                 except Exception as e:
                     logger.error(f"[SysI REPAIR] {symbol}: TP FAILED: {e}")
 
