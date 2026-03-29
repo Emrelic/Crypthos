@@ -8510,7 +8510,7 @@ class ScannerStateMachine:
             entry_regime=cand.regime.regime or "",
             entry_regime_confidence=cand.regime.confidence if cand.regime else 0,
             entry_mode="SYSTEM_I",
-            entry_bb_width=cand.G,  # G değeri → SL/trailing override için
+            entry_bb_width=cand.sl_pct,  # EV-optimal SL% → server SL ile tutarlı
         )
 
         if not pos:

@@ -1057,7 +1057,8 @@ class SystemIScanner:
         best_tp_mult = tp_pct / G if G > 0 else 2.5
 
         if G > 0.01:
-            for sl_m_10 in range(7, 26, 2):    # 0.7 - 2.5 arasi (x10)
+            # SL min 1.2×G (0.7× çok yakın, normal gürültüde tetiklenir)
+            for sl_m_10 in range(12, 30, 2):    # 1.2 - 2.9 arasi (x10)
                 sl_mult = sl_m_10 / 10.0
                 test_sl = G * sl_mult + fee_total
 
@@ -1074,7 +1075,7 @@ class SystemIScanner:
 
                     sw, sl, st = simulate(test_sl, test_tp)
                     stotal = sw + sl
-                    if stotal < 2:
+                    if stotal < 3:
                         continue
 
                     pw = sw / stotal
@@ -1567,9 +1568,12 @@ class SystemIScanner:
         )
 
         # 8. Optimal SL/TP'yi sonuca yansit
-        # EV pozitif optimal bulunduysa, SL/TP/kaldirac/trailing guncelle
+        # EV pozitif optimal bulunduysa VE yeterli trade sayısı varsa güncelle
         prob = result.probability
-        if prob.sufficient and prob.ev_pct > 0 and prob.optimal_sl_pct > 0:
+        min_trades_for_override = 5
+        total_sim_trades = prob.sim_wins + prob.sim_losses
+        if (prob.sufficient and prob.ev_pct > 0 and prob.optimal_sl_pct > 0
+                and total_sim_trades >= min_trades_for_override):
             result.sl_pct = prob.optimal_sl_pct
             result.leverage = min(prob.optimal_leverage,
                                   self._config.get("strategy.max_leverage", 20))

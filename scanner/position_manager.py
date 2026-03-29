@@ -352,31 +352,18 @@ class PositionManager:
                 pos.trailing_stop = pos.emergency_close_price
                 logger.info(f"  [SysG] No SL — emergency only @ {pos.emergency_close_price:.6f}")
 
-        # System I mode: G bazlı SL (G değeri entry_bb_width alanında saklanır)
+        # System I mode: EV-optimal SL% doğrudan entry_bb_width'te (server SL ile tutarlı)
         elif entry_mode == "SYSTEM_I":
-            si_cfg = self._config.get("system_i", {})
-            lev_cfg = si_cfg.get("leverage", {})
-            G_val = entry_bb_width  # G değeri bb_width alanında
-            if G_val > 0 and price > 0:
-                # GRAY rejim: regime_confidence'a göre çöz (>0.5 = trend-like)
-                effective_regime = entry_regime
-                if entry_regime == "GRAY":
-                    effective_regime = "TRENDING" if entry_regime_confidence > 0.5 else "RANGING"
-                if effective_regime in ("TRENDING",):
-                    sl_carpan = lev_cfg.get("trend_sl_g_mult", 1.5)
-                else:
-                    sl_carpan = lev_cfg.get("ranging_sl_g_mult", 2.0)
-                fee = lev_cfg.get("fee_pct", 0.08) / 100
-                slippage = fee * 0.5
-                si_sl_pct = (sl_carpan * G_val) / 100 + fee + slippage
-                si_sl_pct = max(si_sl_pct, fee * 2)
+            sl_pct_value = entry_bb_width  # EV-optimal SL% (server SL ile aynı)
+            if sl_pct_value > 0 and price > 0:
+                si_sl_pct = sl_pct_value / 100.0
                 if side == OrderSide.BUY_LONG:
                     pos.initial_sl = price * (1 - si_sl_pct)
                 else:
                     pos.initial_sl = price * (1 + si_sl_pct)
                 pos.trailing_stop = pos.initial_sl
-                logger.info(f"  [SysI] SL override: {sl_carpan}xG={G_val:.3f}% → "
-                            f"SL={pos.initial_sl:.6f} ({si_sl_pct*100:.3f}%)")
+                logger.info(f"  [SysI] SL from EV-optimal: {sl_pct_value:.3f}% → "
+                            f"SL={pos.initial_sl:.6f}")
 
         # System H mode: G bazlı SL (G değeri entry_bb_width alanında saklanır)
         elif entry_mode == "SYSTEM_H":
