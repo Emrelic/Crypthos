@@ -1887,6 +1887,7 @@ class PositionManager:
             "entry_rsi": pos.entry_rsi,
             "roi_percent": roi,
             "entry_mode": pos.entry_mode,
+            "entry_regime": pos.entry_regime,
             "entry_bb_width": pos.entry_bb_width,
             "regime_switched": pos.regime_switched,
         }
