@@ -157,66 +157,65 @@ class SystemIPanel(ctk.CTkFrame):
         )
         self._stats_label.pack(side="right")
 
-        # ═══ SECTION 1: TREND HAVUZU ═══
-        trend_frame = ctk.CTkFrame(self)
-        trend_frame.pack(fill="both", expand=True, padx=3, pady=(1, 0))
+        # ═══ TAB VIEW: TREND / RANGING ═══
+        self._tabview = ctk.CTkTabview(self, segmented_button_fg_color="#1a1a2e",
+                                        segmented_button_selected_color="#2d3a6e",
+                                        segmented_button_unselected_color="#1a1a2e")
+        self._tabview.pack(fill="both", expand=True, padx=3, pady=(1, 2))
 
+        tab_trend = self._tabview.add("TREND")
+        tab_rang = self._tabview.add("RANGING")
+
+        # ═══ TREND TAB ═══
         ctk.CTkLabel(
-            trend_frame,
+            tab_trend,
             text="TREND HAVUZU (ER > 0.35)",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=_TREND_ACCENT,
         ).pack(anchor="w", padx=4, pady=(1, 0))
 
-        _build_header(trend_frame, SI_TREND_HEADERS, SI_TREND_WIDTHS, _SI_TREND_IMP)
+        _build_header(tab_trend, SI_TREND_HEADERS, SI_TREND_WIDTHS, _SI_TREND_IMP)
 
-        self._trend_scan_scroll = ctk.CTkScrollableFrame(trend_frame, height=200)
+        self._trend_scan_scroll = ctk.CTkScrollableFrame(tab_trend, height=220)
         self._trend_scan_scroll.pack(fill="both", expand=True, padx=2)
 
-        # Trend positions sub-section
-        trend_pos_label_frame = ctk.CTkFrame(trend_frame, fg_color="transparent")
-        trend_pos_label_frame.pack(fill="x", padx=4, pady=(2, 0))
+        # Trend positions
         ctk.CTkLabel(
-            trend_pos_label_frame,
+            tab_trend,
             text="Aktif Trend Pozisyonlari",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#FFD54F",
-        ).pack(anchor="w")
+        ).pack(anchor="w", padx=4, pady=(4, 0))
 
-        _build_header(trend_frame, SI_POS_HEADERS, SI_POS_WIDTHS, set())
+        _build_header(tab_trend, SI_POS_HEADERS, SI_POS_WIDTHS, set())
 
-        self._trend_pos_scroll = ctk.CTkScrollableFrame(trend_frame, height=90)
+        self._trend_pos_scroll = ctk.CTkScrollableFrame(tab_trend, height=100)
         self._trend_pos_scroll.pack(fill="x", padx=2, pady=(0, 2))
 
-        # ═══ SECTION 2: RANGING HAVUZU ═══
-        rang_frame = ctk.CTkFrame(self)
-        rang_frame.pack(fill="both", expand=True, padx=3, pady=(1, 2))
-
+        # ═══ RANGING TAB ═══
         ctk.CTkLabel(
-            rang_frame,
+            tab_rang,
             text="RANGING HAVUZU (ER < 0.20)",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=_RANGING_ACCENT,
         ).pack(anchor="w", padx=4, pady=(1, 0))
 
-        _build_header(rang_frame, SI_RANGING_HEADERS, SI_RANGING_WIDTHS, _SI_RANGING_IMP)
+        _build_header(tab_rang, SI_RANGING_HEADERS, SI_RANGING_WIDTHS, _SI_RANGING_IMP)
 
-        self._rang_scan_scroll = ctk.CTkScrollableFrame(rang_frame, height=200)
+        self._rang_scan_scroll = ctk.CTkScrollableFrame(tab_rang, height=220)
         self._rang_scan_scroll.pack(fill="both", expand=True, padx=2)
 
-        # Ranging positions sub-section
-        rang_pos_label_frame = ctk.CTkFrame(rang_frame, fg_color="transparent")
-        rang_pos_label_frame.pack(fill="x", padx=4, pady=(2, 0))
+        # Ranging positions
         ctk.CTkLabel(
-            rang_pos_label_frame,
+            tab_rang,
             text="Aktif Ranging Pozisyonlari",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#FFD54F",
-        ).pack(anchor="w")
+        ).pack(anchor="w", padx=4, pady=(4, 0))
 
-        _build_header(rang_frame, SI_POS_HEADERS, SI_POS_WIDTHS, set())
+        _build_header(tab_rang, SI_POS_HEADERS, SI_POS_WIDTHS, set())
 
-        self._rang_pos_scroll = ctk.CTkScrollableFrame(rang_frame, height=90)
+        self._rang_pos_scroll = ctk.CTkScrollableFrame(tab_rang, height=100)
         self._rang_pos_scroll.pack(fill="x", padx=2, pady=(0, 2))
 
     # ═══ Refresh ═══
