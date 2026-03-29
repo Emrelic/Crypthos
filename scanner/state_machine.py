@@ -8124,12 +8124,21 @@ class ScannerStateMachine:
         strat = self._config.get("strategy", {})
         results = self._last_system_i_results
         if not results:
+            logger.debug("[SysI-Buy] No results, skipping")
             return
 
         # Filter eligible, sort by score
-        min_score = si_cfg.get("min_buy_score", 55)
+        min_score = si_cfg.get("min_buy_score", 48)
         eligible = [r for r in results if r.eligible and r.score >= min_score and r.G > 0]
+        logger.info(f"[SysI-Buy] results={len(results)}, min_score={min_score}, "
+                    f"eligible={len(eligible)}")
         if not eligible:
+            # Debug: neden boş?
+            e_count = sum(1 for r in results if r.eligible)
+            s_count = sum(1 for r in results if r.eligible and r.score >= min_score)
+            g_count = sum(1 for r in results if r.eligible and r.score >= min_score and r.G > 0)
+            logger.info(f"[SysI-Buy] EMPTY: eligible_flag={e_count}, "
+                        f"score_pass={s_count}, g_pass={g_count}")
             return
         eligible.sort(key=lambda r: abs(r.score), reverse=True)
 
@@ -8170,10 +8179,16 @@ class ScannerStateMachine:
             except Exception:
                 pass
         if real_balance > 0 and real_balance < 0.30:
-            logger.info(f"[SysI] Balance too low ({real_balance:.2f}$)")
+            logger.info(f"[SysI-Buy] Balance too low ({real_balance:.2f}$)")
             return
 
-        current_positions = self._position_mgr.get_positions()
+        logger.info(f"[SysI-Buy] balance={real_balance:.2f}$, "
+                    f"positions={self._position_mgr.position_count}/{max_pos}, "
+                    f"mr_max={mr_max}, trend_max={trend_max}, "
+                    f"pending_limits={len(self._pending_limits)}, "
+                    f"top candidate: {eligible[0].symbol} score={eligible[0].score:.1f}")
+
+        current_positions = self._position_mgr.get_all_positions()
         trend_count = sum(1 for p in current_positions.values()
                          if getattr(p, 'entry_regime', '') in ('TRENDING', 'GRAY'))
         mr_count = sum(1 for p in current_positions.values()
