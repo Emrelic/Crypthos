@@ -20,6 +20,7 @@ from scanner.system_f_scanner import SystemFScanner, SystemFScanResult
 from scanner.system_g_scanner import SystemGScanner, SystemGScanResult
 from scanner.system_h_scanner import SystemHScanner, SystemHScanResult
 from scanner.system_i_scanner import SystemIScanner, SystemIScanResult
+from scanner.system_j_scanner import SystemJScanner, SystemJScanResult
 from scanner.position_manager import PositionManager
 from scanner.timeframe_selector import TimeframeSelector
 from indicators.indicator_engine import IndicatorEngine
@@ -146,6 +147,10 @@ class ScannerStateMachine:
         self._system_g_scanner = SystemGScanner(config)
         self._last_system_g_results: list[SystemGScanResult] = []
 
+        # ── System J (Max Leverage First) ──
+        self._system_j_scanner: SystemJScanner | None = None
+        self._last_system_j_results: list[SystemJScanResult] = []
+
         # ── System I (Unified) ──
         self._system_i_scanner: SystemIScanner | None = None
         self._last_system_i_results: list[SystemIScanResult] = []
@@ -240,10 +245,22 @@ class ScannerStateMachine:
     # ──── Main Loop ────
 
     def _main_loop(self) -> None:
+        _last_state_save = 0.0
         while self._running:
             try:
+                # Periyodik state save (60sn'de bir, crash/kill koruması)
+                _now = time.time()
+                if _now - _last_state_save > 60 and self._position_mgr.has_position:
+                    try:
+                        self._position_mgr.save_state()
+                    except Exception:
+                        pass
+                    _last_state_save = _now
+
                 if self._state == ScannerState.SCANNING:
-                    if self._config.get("system_i.enabled", False):
+                    if self._config.get("system_j.enabled", False):
+                        self._do_scanning_system_j()
+                    elif self._config.get("system_i.enabled", False):
                         self._do_scanning_system_i()
                     elif self._config.get("system_h.enabled", False):
                         self._do_scanning_system_h()
@@ -272,7 +289,8 @@ class ScannerStateMachine:
                 else:
                     self._stop_event.wait(timeout=1)
             except Exception as e:
-                logger.error(f"Scanner error in {self._state.value}: {e}")
+                import traceback
+                logger.error(f"Scanner error in {self._state.value}: {e}\n{traceback.format_exc()}")
                 self._stop_event.wait(timeout=5)
 
     # ──── SCANNING State ────
@@ -1023,6 +1041,11 @@ class ScannerStateMachine:
 
         logger.info(f"Limit order FILLED: {symbol} @ ~{fill_price:.6f}")
 
+        # System J: skip signal recheck, directly open position
+        if info.get("entry_mode") == "SYSTEM_J":
+            self._on_limit_filled_system_j(symbol, fill_price, info)
+            return
+
         # System E: skip signal recheck, directly open position
         if info.get("entry_mode") == "SYSTEM_E":
             self._on_limit_filled_system_e(symbol, info, fill_price)
@@ -1384,15 +1407,17 @@ class ScannerStateMachine:
                 return
 
             # Build map: symbol → positionAmt (signed: positive=LONG, negative=SHORT)
+            # Sadece amt != 0 olanları kaydet (amt=0 = kapalı pozisyon)
             api_pos_map = {}
             for p in api_positions:
                 sym = p.get("symbol", "")
                 amt = float(p.get("positionAmt", 0))
-                api_pos_map[sym] = amt
+                if amt != 0:
+                    api_pos_map[sym] = amt
 
             api_symbols = set(api_pos_map.keys())
 
-            # Check 1: symbol completely gone from API
+            # Check 1: symbol completely gone from API or amt=0
             closed_externally = held_symbols - api_symbols
 
             # Check 2: symbol exists but DIRECTION FLIPPED (SL/trailing açtı ters pozisyon)
@@ -1427,17 +1452,20 @@ class ScannerStateMachine:
                 except Exception:
                     exit_price = pos.entry_price
 
-                logger.warning(f"[EXTERNAL CLOSE] {symbol} kapatilmis "
-                               f"(manuel/SL/TP/trailing) — dahili takipten siliniyor. "
+                # ── Gerçek kapanış nedenini Binance'den tespit et ──
+                exit_reason = self._detect_real_exit_reason(
+                    symbol, pos, exit_price)
+
+                logger.warning(f"[CLOSE] {symbol} kapandi: {exit_reason} | "
                                f"Giris={pos.entry_price:.6f} Cikis={exit_price:.6f}")
 
                 # Cancel orphan server orders (SL + trailing) for closed position
                 if self._order_executor and hasattr(self._order_executor, '_rest'):
                     try:
                         cancel_result = self._order_executor._rest.cancel_all_orders(symbol)
-                        logger.info(f"[EXTERNAL CLOSE] {symbol}: orphan orders cancelled: {cancel_result}")
+                        logger.info(f"[CLOSE] {symbol}: orphan orders cancelled: {cancel_result}")
                     except Exception as e:
-                        logger.warning(f"[EXTERNAL CLOSE] {symbol}: cancel orphan orders failed: {e}")
+                        logger.warning(f"[CLOSE] {symbol}: cancel orphan orders failed: {e}")
 
                 # Clean up internal state
                 self._held_indicators.pop(symbol, None)
@@ -1445,7 +1473,7 @@ class ScannerStateMachine:
                 self._close_retries.pop(symbol, None)
 
                 result = self._position_mgr.close_position(
-                    symbol, exit_price, "external_close")
+                    symbol, exit_price, exit_reason)
                 self._last_trade_result = result
 
                 if self._risk_manager and result:
@@ -1534,6 +1562,73 @@ class ScannerStateMachine:
 
         except Exception as e:
             logger.debug(f"External close detection error: {e}")
+
+    def _detect_real_exit_reason(self, symbol: str, pos, exit_price: float) -> str:
+        """Binance API'den gerçek kapanış nedenini tespit et.
+        Önce fiyat karşılaştırması ile tahmin, sonra userTrades ile doğrulama.
+        Returns: 'SL_MARKET', 'TP_MARKET', 'TRAILING_STOP', 'MANUAL_CLOSE', 'external_close'"""
+        entry = pos.entry_price
+        sl = pos.initial_sl
+        tp = pos.initial_tp
+        is_long = pos.side == OrderSide.BUY_LONG
+
+        # 1. Fiyat bazlı tahmin (hızlı, API gerektirmez)
+        if entry > 0 and sl > 0:
+            sl_dist = abs(exit_price - sl) / entry * 100
+        else:
+            sl_dist = 999.0
+        if entry > 0 and tp > 0:
+            tp_dist = abs(exit_price - tp) / entry * 100
+        else:
+            tp_dist = 999.0
+
+        # SL veya TP fiyatına %0.5'ten yakın kapanma → o emir tetiklendi
+        price_reason = "external_close"
+        if sl_dist < 0.5:
+            price_reason = "SL_MARKET"
+        elif tp_dist < 0.5:
+            price_reason = "TP_MARKET"
+        elif (is_long and exit_price > entry) or (not is_long and exit_price < entry):
+            price_reason = "TRAILING_STOP"  # kârda kapanmış, muhtemelen trailing
+        else:
+            price_reason = "MANUAL_CLOSE"  # zararda ama SL'ye ulaşmamış
+
+        # 2. Binance userTrades ile doğrulama (daha kesin)
+        try:
+            rest = self._order_executor._rest if self._order_executor else self._rest
+            if rest:
+                # Son 5 dakikanın trade'lerini al
+                import time as _time
+                end_ms = int(_time.time() * 1000)
+                start_ms = end_ms - 300_000  # 5dk
+                trades = rest.get_account_trades(
+                    symbol=symbol, start_time=start_ms, end_time=end_ms, limit=10)
+                if trades:
+                    # Son reduce_only trade'i bul (pozisyon kapatma)
+                    for t in reversed(trades):
+                        if t.get("buyer") != (not is_long):
+                            # Bu trade pozisyonu kapatmıyor
+                            continue
+                        # realizedPnl > 0 → kârda kapanmış
+                        rpnl = float(t.get("realizedPnl", 0))
+                        trade_price = float(t.get("price", 0))
+
+                        # Trade fiyatını SL/TP ile karşılaştır
+                        if trade_price > 0 and entry > 0:
+                            if sl > 0 and abs(trade_price - sl) / entry * 100 < 0.3:
+                                price_reason = "SL_MARKET"
+                            elif tp > 0 and abs(trade_price - tp) / entry * 100 < 0.3:
+                                price_reason = "TP_MARKET"
+                            elif rpnl > 0:
+                                price_reason = "TRAILING_STOP"
+                        break
+        except Exception as e:
+            logger.debug(f"[EXIT DETECT] {symbol}: userTrades check failed: {e}")
+
+        logger.info(f"[EXIT DETECT] {symbol}: {price_reason} | "
+                    f"exit={exit_price:.6f} sl={sl:.6f} tp={tp:.6f} "
+                    f"sl_dist={sl_dist:.3f}% tp_dist={tp_dist:.3f}%")
+        return price_reason
 
     @staticmethod
     def _classify_order_type(order: dict) -> str:
@@ -1751,22 +1846,35 @@ class ScannerStateMachine:
                 self._place_missing_orders(symbol, pos, strat,
                                            need_sl=True, need_trailing=True)
 
+    # Sentinel: API başarısız → pozisyon durumu bilinmiyor (silme güvenli değil)
+    _API_FAILED = (-1, None)
+
     def _get_actual_qty_and_side(self, symbol: str) -> tuple:
         """Binance API'den gerçek pozisyon miktarı ve yönünü oku.
-        Returns (abs_qty, is_long) or (0, None) if not found/error.
-        is_long=True → LONG, is_long=False → SHORT, is_long=None → bulunamadı."""
+        Returns:
+          (abs_qty, is_long)  — pozisyon bulundu
+          (0, None)           — pozisyon API'de yok (amt=0 veya symbol yok)
+          _API_FAILED (-1, None) — API çağrısı başarısız, durum bilinmiyor
+        """
         try:
             api_positions = self._order_executor.get_open_positions()
-            if api_positions:
-                for p in api_positions:
-                    if p.get("symbol") == symbol:
-                        amt = float(p.get("positionAmt", 0))
-                        if amt == 0:
-                            return (0, None)
-                        return (abs(amt), amt > 0)
+            if api_positions is None:
+                # API başarısız — pozisyon durumu bilinmiyor
+                logger.warning(f"[ORDER REPAIR] {symbol}: API returned None — "
+                               f"durum bilinmiyor, silme yapılmayacak")
+                return self._API_FAILED
+            # API başarılı ama boş liste → hiç pozisyon yok
+            for p in api_positions:
+                if p.get("symbol") == symbol:
+                    amt = float(p.get("positionAmt", 0))
+                    if amt == 0:
+                        return (0, None)
+                    return (abs(amt), amt > 0)
+            # Symbol listede yok → pozisyon yok
+            return (0, None)
         except Exception as e:
             logger.warning(f"[ORDER REPAIR] {symbol}: API qty read failed: {e}")
-        return (0, None)
+            return self._API_FAILED
 
     def _place_missing_orders(self, symbol: str, pos, strat: dict,
                                need_sl: bool, need_trailing: bool) -> None:
@@ -1796,11 +1904,17 @@ class ScannerStateMachine:
 
             # ── GERÇEK QTY + YÖN: Binance'den oku ──
             actual_qty, api_is_long = self._get_actual_qty_and_side(symbol)
-            if actual_qty <= 0:
+            if actual_qty < 0:
+                # API başarısız — durum bilinmiyor, GÜVENLİ davran: repair'ı atla
+                logger.warning(f"[ORDER REPAIR] {symbol}: API başarısız — "
+                               f"repair atlanıyor (pozisyon silinmeyecek)")
+                return
+            if actual_qty == 0:
                 # Pozisyon API'de yok — kapanmış olabilir
                 logger.warning(f"[ORDER REPAIR] {symbol}: API'de pozisyon YOK — "
                                f"repair iptal, pozisyon kapatılıyor")
-                self._position_mgr.close_position(symbol, reason="api_position_gone")
+                self._position_mgr.close_position(symbol, pos.entry_price,
+                                                  reason="api_position_gone")
                 return
             # ── YÖN KONTROLÜ: API yönü sistem yönüyle eşleşmeli ──
             if api_is_long is not None and api_is_long != is_long:
@@ -1808,7 +1922,8 @@ class ScannerStateMachine:
                                 f"Sistem={'LONG' if is_long else 'SHORT'} "
                                 f"API={'LONG' if api_is_long else 'SHORT'} "
                                 f"— repair DURDURULDU, pozisyon takipten siliniyor")
-                self._position_mgr.close_position(symbol, reason="direction_mismatch")
+                self._position_mgr.close_position(symbol, entry_price,
+                                                  reason="direction_mismatch")
                 # Ters yöndeki orphan emirleri temizle
                 try:
                     self._order_executor._rest.cancel_all_orders(symbol)
@@ -1830,7 +1945,9 @@ class ScannerStateMachine:
             entry_mode = getattr(pos, 'entry_mode', 'TREND')
 
             # ── Sisteme göre eksik emir onarımı ──
-            if entry_mode == "SYSTEM_I":
+            if entry_mode == "SYSTEM_J":
+                sl_placed, trail_placed = self._place_missing_orders_system_j(symbol, pos)
+            elif entry_mode == "SYSTEM_I":
                 sl_placed, trail_placed = self._place_missing_orders_system_i(
                     symbol, pos, rest, pp, is_long, close_side,
                     entry_price, actual_qty, entry_regime,
@@ -3110,9 +3227,13 @@ class ScannerStateMachine:
 
     def _sync_api_positions(self) -> None:
         """On startup, sync any existing API positions into the position manager.
-        This way the program tracks positions that were opened before restart."""
+        This way the program tracks positions that were opened before restart.
+        Önce kaydedilmiş state okunur → entry_mode, entry_bb_width gibi bilgiler korunur."""
         if not self._order_executor or not hasattr(self._order_executor, 'get_open_positions'):
             return
+
+        # Kaydedilmiş state'i oku (shutdown sırasında kaydedilmiş)
+        saved_state = self._position_mgr.load_state()
 
         try:
             api_positions = self._order_executor.get_open_positions()
@@ -3191,7 +3312,50 @@ class ScannerStateMachine:
                 except Exception as e:
                     logger.warning(f"ATR calculation failed for sync {symbol}: {e}")
 
-                # Open position in manager (will set SL/TP/trailing)
+                # Kaydedilmiş state varsa oradan oku (entry_mode, entry_bb_width vb.)
+                prev = saved_state.get(symbol, {})
+                if prev:
+                    sync_entry_mode = prev.get("entry_mode", "")
+                    # State'ten korunacak alanlar (scanner hesaplamalarından daha güvenilir)
+                    if prev.get("entry_bb_width", 0) > 0:
+                        entry_bb_width = prev["entry_bb_width"]
+                    if prev.get("entry_regime", ""):
+                        entry_regime = prev["entry_regime"]
+                    if prev.get("entry_regime_confidence", 0) > 0:
+                        entry_regime_confidence = prev["entry_regime_confidence"]
+                    if prev.get("entry_score", 0) != 0:
+                        entry_score = prev["entry_score"]
+                    logger.info(f"[SYNC] {symbol}: state'ten yüklendi → "
+                                f"entry_mode={sync_entry_mode}, "
+                                f"bb_width={entry_bb_width:.3f}, "
+                                f"regime={entry_regime}")
+                else:
+                    # State yoksa aktif sisteme göre tahmin et
+                    sync_entry_mode = ""
+                    if self._config.get("system_i.enabled", False):
+                        sync_entry_mode = "SYSTEM_I"
+                    elif self._config.get("system_b.enabled", False):
+                        sync_entry_mode = "SYSTEM_B"
+
+                # SL/TP override: saved state varsa veya System I ise kendi degerlerini kullan
+                sync_sl_override = 0.0
+                sync_tp_override = 0.0
+                if prev and sync_entry_mode == "SYSTEM_I":
+                    # State'ten SL/TP fiyatlarini koru
+                    sync_sl_override = prev.get("initial_sl", 0.0)
+                    sync_tp_override = prev.get("initial_tp", 0.0)
+                elif sync_entry_mode == "SYSTEM_I" and entry_bb_width > 0:
+                    # State yok ama entry_bb_width (SL%) var → hesapla
+                    sl_pct_frac = entry_bb_width / 100
+                    tp_pct_frac = entry_bb_width / 100  # en az SL kadar TP
+                    if side == OrderSide.BUY_LONG:
+                        sync_sl_override = entry_price * (1 - sl_pct_frac)
+                        sync_tp_override = entry_price * (1 + tp_pct_frac)
+                    else:
+                        sync_sl_override = entry_price * (1 + sl_pct_frac)
+                        sync_tp_override = entry_price * (1 - tp_pct_frac)
+
+                # Open position in manager
                 self._position_mgr.open_position(
                     symbol, side, entry_price, size, atr,
                     leverage=leverage,
@@ -3203,18 +3367,37 @@ class ScannerStateMachine:
                     entry_rsi=entry_rsi,
                     entry_regime_confidence=entry_regime_confidence,
                     entry_bb_width=entry_bb_width,
+                    entry_mode=sync_entry_mode,
+                    initial_sl_override=sync_sl_override,
+                    initial_tp_override=sync_tp_override,
                 )
                 logger.info(f"Synced API position: {symbol} {side.value} "
                             f"qty={size} entry={entry_price} lev={leverage}x "
                             f"margin={margin:.2f} "
                             f"score={entry_score:+.1f}")
 
-                # Hemen SL/trailing kontrolü yap — 30s boşluk bırakma
+                # Binance'de bu sembol için zaten emir var mı kontrol et
+                # Varsa dokunma — verify döngüsü eksikleri düzeltir
+                # Yoksa (gerçekten korumasız) → emir koy
                 logger.info(f"[SYNC] {symbol}: SL/trailing emir kontrolü yapılıyor...")
                 try:
-                    pos_obj = self._position_mgr.get_position(symbol)
-                    if pos_obj and atr > 0:
-                        self._place_initial_trailing(symbol, pos_obj, entry_price, atr)
+                    existing = self._rest.get_symbol_open_orders_combined(symbol) \
+                        if hasattr(self, '_rest') and self._rest else None
+                    if existing is None and self._order_executor and hasattr(self._order_executor, '_rest'):
+                        existing = self._order_executor._rest.get_symbol_open_orders_combined(symbol)
+                    has_orders = existing is not None and len(existing) > 0
+                    if has_orders:
+                        logger.info(f"[SYNC] {symbol}: {len(existing)} mevcut emir var — "
+                                    f"dokunmuyorum (verify düzeltir)")
+                    else:
+                        pos_obj = self._position_mgr.get_position(symbol)
+                        if pos_obj and atr > 0:
+                            # Entry mode'a gore dogru fonksiyonu cagir
+                            if sync_entry_mode == "SYSTEM_I":
+                                logger.info(f"[SYNC] {symbol}: System I repair delegated to verify")
+                                # System I emirlerini verify'e birak — dogru G bazli hesaplama yapar
+                            else:
+                                self._place_initial_trailing(symbol, pos_obj, entry_price, atr)
                 except Exception as e:
                     logger.warning(f"[SYNC] {symbol}: SL/trailing placement failed: {e}")
 
@@ -4357,7 +4540,7 @@ class ScannerStateMachine:
                         side=close_side,
                         order_type="TRAILING_STOP_MARKET",
                         quantity=pos.size,
-                        activation_price=activation_price,
+                        stop_price=activation_price,
                         callback_rate=callback_pct,
                         reduce_only=True,
                     )
@@ -8030,23 +8213,28 @@ class ScannerStateMachine:
             deep_n = si_cfg.get("deep_analysis_top_n", 999)
             top_candidates = sorted(eligible_pre, key=lambda r: r.volume_24h, reverse=True)[:deep_n]
 
-            # Spike detection: %3+ fiyat değişimi olan coinleri ekle (eligible olmasa bile)
+            # Spike detection: fiyat değişimi + hacim kontrolü (thin-book sahte spike'ları elenir)
             spike_enabled = si_cfg.get("spike_detection_enabled", True)
-            spike_min_pct = si_cfg.get("spike_min_change_pct", 3.0)
+            spike_min_pct = si_cfg.get("spike_min_change_pct", 1.5)
             if spike_enabled and ticker_map:
                 existing_syms = {c.symbol for c in top_candidates}
+                # Median hacim hesapla — düşük hacimli sahte spike'ları ele
+                all_vols = sorted([float(ticker_map.get(s, {}).get("quoteVolume", 0))
+                                   for s in symbols if ticker_map.get(s)])
+                median_vol = all_vols[len(all_vols) // 2] if all_vols else 0
                 for sym in symbols:
                     if sym in existing_syms:
                         continue
                     t = ticker_map.get(sym, {})
                     change_pct = abs(float(t.get("priceChangePercent", 0)))
-                    if change_pct >= spike_min_pct:
+                    sym_vol = float(t.get("quoteVolume", 0))
+                    if change_pct >= spike_min_pct and sym_vol >= median_vol:
                         # Pre-filter'dan bu coin'in sonucunu bul (eligible olmasa da)
                         spike_r = next((r for r in prefiltered if r.symbol == sym), None)
                         if spike_r:
                             top_candidates.append(spike_r)
                             logger.info(f"[SysI] Spike detected: {sym} "
-                                        f"change={change_pct:+.1f}% "
+                                        f"change={change_pct:+.1f}% vol=${sym_vol/1e6:.1f}M "
                                         f"(pre-filter: {spike_r.reject_reason or 'eligible'})")
 
             logger.info(f"[SysI] Deep analysis: {len(top_candidates)} coins "
@@ -8355,7 +8543,7 @@ class ScannerStateMachine:
         # 7. Entry: limit or market based on regime
         # Scanner'ın hesapladığı entry_type ve entry_price kullan
         entry_cfg = si_cfg.get("entry", {})
-        use_limit = cand.entry_type == "limit" and cand.entry_price > 0
+        use_limit = cand.entry_type in ("limit", "limit_wave", "limit_g") and cand.entry_price > 0
 
         if use_limit:
             # Scanner BB bazlı (RANGING) veya ATR bazlı (TREND) fiyat hesapladı
@@ -8496,6 +8684,19 @@ class ScannerStateMachine:
         """System I pozisyonu aç ve server-side emirleri yerleştir."""
         si_cfg = self._config.get("system_i", {})
 
+        # System I kendi SL/TP fiyatlarini hesaplar — position_manager'a override gecer
+        # Boylece System A formullerine bulasmaz
+        sl_pct = cand.sl_pct
+        tp_pct = cand.tp_pct if cand.tp_pct > 0 else cand.trailing_trigger_pct
+        if tp_pct <= 0:
+            tp_pct = cand.G * 2.5  # fallback
+        if side == OrderSide.BUY_LONG:
+            sl_price = price * (1 - sl_pct / 100)
+            tp_price = price * (1 + tp_pct / 100)
+        else:
+            sl_price = price * (1 + sl_pct / 100)
+            tp_price = price * (1 - tp_pct / 100)
+
         pos = self._position_mgr.open_position(
             symbol=symbol,
             side=side,
@@ -8512,7 +8713,9 @@ class ScannerStateMachine:
             entry_regime=cand.regime.regime or "",
             entry_regime_confidence=cand.regime.confidence if cand.regime else 0,
             entry_mode="SYSTEM_I",
-            entry_bb_width=cand.sl_pct,  # EV-optimal SL% → server SL ile tutarlı
+            entry_bb_width=cand.sl_pct,
+            initial_sl_override=sl_price,
+            initial_tp_override=tp_price,
         )
 
         if not pos:
@@ -8725,9 +8928,13 @@ class ScannerStateMachine:
                 except Exception as e:
                     logger.error(f"[SysI REPAIR] {symbol}: trailing FAILED: {e}")
             else:
-                # RANGING: sabit TP — G bazlı hesapla
+                # RANGING: sabit TP — G bazlı, fee-aware
                 tp_mult = tp_cfg.get("ranging_tp_g_mult", 2.0)
-                tp_pct = tp_mult * G_approx / 100
+                tp_pct_raw = tp_mult * G_approx + fee_total  # fee dahil
+                # R:R koruması: TP asla SL'den küçük olmamalı
+                if tp_pct_raw < sl_pct_stored:
+                    tp_pct_raw = sl_pct_stored
+                tp_pct = tp_pct_raw / 100
                 if is_long:
                     tp_price = round(entry_price * (1 + tp_pct), pp)
                 else:
@@ -8756,3 +8963,753 @@ class ScannerStateMachine:
     def get_system_h_results(self) -> list:
         """GUI erişimi için son System H tarama sonuçları."""
         return self._last_system_h_results
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SYSTEM J — Maximum Leverage First (3 turlu döngüsel tarama)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _do_scanning_system_j(self) -> None:
+        """System J: 3 turlu döngüsel tarama — max kaldirac → G-bazli → zoom dirsek."""
+        from scanner.system_j_scanner import TF_LADDER as SJ_TF_LADDER, ZOOM_TF_LADDER as SJ_ZOOM
+
+        # Step 0: Check pending limit orders
+        if self._pending_limits:
+            self._check_pending_limits()
+
+        # Step A: Check held positions
+        if self._position_mgr.has_position:
+            self._check_held_positions()
+
+        self._scan_count += 1
+        sj_cfg = self._config.get("system_j", {})
+        strat = self._config.get("strategy", {})
+        pos_cfg = sj_cfg.get("position", {})
+        max_pos = pos_cfg.get("max_positions", strat.get("max_positions", 12))
+        self._position_mgr._max_positions = max_pos
+
+        logger.info(f"[SysJ] Scan #{self._scan_count} starting... "
+                    f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+
+        # Initialize scanner if needed
+        if self._system_j_scanner is None:
+            self._system_j_scanner = SystemJScanner(self._config)
+
+        scanner = self._system_j_scanner
+
+        # 1. Symbol universe
+        coin_sayisi = sj_cfg.get("coin_sayisi", 50)
+        self._universe._top_n = coin_sayisi
+        symbols = self._universe.refresh()
+        if not symbols:
+            logger.warning("[SysJ] No symbols found")
+            self._wait(30)
+            return
+
+        logger.info(f"[SysJ] Universe: {len(symbols)} coins")
+
+        # 2. Load leverage brackets (eksik coinler için incremental)
+        missing_bracket = [s for s in symbols if s not in scanner._leverage_brackets]
+        if missing_bracket:
+            scanner.load_leverage_brackets(self._rest, symbols)
+
+        # 3. Lazy kline fetch — turlar ilerledikçe sadece ihtiyaç olan TF çekilir
+        #    Tur 1: 6 trade TF (1m-1h) + confirm TF (ihtiyaç halinde)
+        #    Tur 2: aynı 6 TF (cache'den), yeni çekim yok
+        #    Tur 3: genişletilmiş TF'ler (2h-1d) sadece kalan coinler için
+        #    Toplam: ~300-400 çağrı (750 yerine)
+        from scanner.system_j_scanner import CONFIRM_TF_MAP as SJ_CONFIRM_MAP
+        klines_cache = {}  # {(symbol, tf): klines}  — scan boyunca cache
+        kline_limit = sj_cfg.get("kline_limit", 200)
+
+        def _get_klines(sym, tf):
+            """Cache'li kline çekimi."""
+            key = (sym, tf)
+            if key in klines_cache:
+                return klines_cache[key]
+            try:
+                kl = self._rest.get_klines(sym, tf, limit=kline_limit)
+                if kl is not None and len(kl) > 0:
+                    klines_cache[key] = kl
+                    return kl
+            except Exception:
+                pass
+            klines_cache[key] = None
+            return None
+
+        def _get_klines_by_tf(sym, tf_list):
+            """Birden fazla TF için dict oluştur."""
+            result = {}
+            for tf in tf_list:
+                kl = _get_klines(sym, tf)
+                if kl is not None:
+                    result[tf] = kl
+            return result
+
+        # Funding rates (1 batch API call)
+        funding_rates = self._fetch_funding_rates(symbols)
+
+        # Market context — ticker price batch yerine universe'deki data kullan
+        market_ctx_map = {}
+        ticker_data = getattr(self._universe, '_ticker_data', {})
+
+        # Volume ratio: medyan hacme göre oran (ek API çağrısı yok)
+        all_volumes = []
+        for sym in symbols:
+            td = ticker_data.get(sym, {})
+            vol = float(td.get("quoteVolume", 0)) if td else 0
+            if vol > 0:
+                all_volumes.append(vol)
+        median_vol = sorted(all_volumes)[len(all_volumes) // 2] if all_volumes else 1.0
+
+        for sym in symbols:
+            td = ticker_data.get(sym, {})
+            price = float(td.get("lastPrice", 0)) if td else 0
+            vol_24h = float(td.get("quoteVolume", 0)) if td else 0
+            vol_ratio = vol_24h / median_vol if median_vol > 0 else 1.0
+            fr_data = funding_rates.get(sym, {})
+            fr = fr_data.get("funding_rate", 0) if isinstance(fr_data, dict) else fr_data
+            market_ctx_map[sym] = {
+                "price": price,
+                "funding_rate": fr,
+                "spread_pct": 0,       # depth API gerektirir, şimdilik filtre atlanır
+                "depth_usd": 0,        # depth API gerektirir, şimdilik filtre atlanır
+                "volume_ratio": vol_ratio,
+                "volume_24h": vol_24h,
+            }
+
+        # 4. Held symbols
+        held_symbols = set()
+        with self._position_mgr._lock:
+            held_symbols = set(self._position_mgr._positions.keys())
+        held_symbols.update(self._pending_limits.keys())
+        slots = max_pos - len(held_symbols)
+
+        available = [s for s in symbols if s not in held_symbols]
+        results_by_sym = {}    # {symbol: best result} — duplikasyon önler
+        pass2_candidates = []  # Tur 1'de G eşiği sağlanamadı
+        pass3_candidates = []  # Tur 2'de de bulunamadı
+
+        # ── TUR 1/2 TF listesi: trade TF + confirm TF (yön tespiti için gerekli) ──
+        trade_tfs = list(SJ_TF_LADDER)
+        confirm_tfs = set()
+        for tf in trade_tfs:
+            ctf = SJ_CONFIRM_MAP.get(tf)
+            if ctf:
+                confirm_tfs.add(ctf)
+        all_scan_tfs = trade_tfs + [tf for tf in confirm_tfs if tf not in trade_tfs]
+
+        # ── TUR 1: TÜM coinleri tara (en iyi coin seçmek için) ──
+        for sym in available:
+            klines_by_tf = _get_klines_by_tf(sym, all_scan_tfs)
+            ctx = market_ctx_map.get(sym, {})
+            r = scanner.scan_pass1(sym, klines_by_tf, ctx)
+            if r and r.eligible:
+                results_by_sym[sym] = r
+                logger.info(f"[SysJ Tur1] {sym}: {r.trade_tf} Lev={r.leverage}x "
+                            f"G={r.G:.3f}% {r.direction} EV={r.ev_pct:.1f}%")
+            elif r:
+                results_by_sym[sym] = r
+                # Kalıcı redler Tur 2'ye gitmez (GRAY_ZONE artık yok — Hurst çözüyor)
+                if r.reject_reason in ("UNDECIDED_REGIME", "NO_DIRECTION", "NEGATIVE_EV",
+                                       "LOW_RR_RANGING"):
+                    pass
+                else:
+                    pass2_candidates.append(sym)
+            else:
+                pass2_candidates.append(sym)
+
+        # ── TUR 2: G-bazlı kaldıraç (cache'den gelir) ──
+        for sym in pass2_candidates:
+            klines_by_tf = _get_klines_by_tf(sym, all_scan_tfs)
+            ctx = market_ctx_map.get(sym, {})
+            r = scanner.scan_pass2(sym, klines_by_tf, ctx)
+            if r and r.eligible:
+                results_by_sym[sym] = r  # Daha iyi sonuç: üzerine yaz
+                logger.info(f"[SysJ Tur2] {sym}: {r.trade_tf} Lev={r.leverage}x "
+                            f"G={r.G:.3f}% {r.direction} EV={r.ev_pct:.1f}%")
+            elif r:
+                results_by_sym[sym] = r
+                pass3_candidates.append(sym)
+            else:
+                pass3_candidates.append(sym)
+
+        # ── TUR 3: Genişletilmiş TF'ler, sadece kalan coinler (lazy) ──
+        zoom_tfs = [tf for tf, _ in SJ_ZOOM]
+        for sym in pass3_candidates:
+            klines_by_tf = _get_klines_by_tf(sym, zoom_tfs)
+            ctx = market_ctx_map.get(sym, {})
+            r = scanner.scan_pass3(sym, klines_by_tf, ctx)
+            if r:
+                results_by_sym[sym] = r
+                if r.eligible:
+                    logger.info(f"[SysJ Tur3] {sym}: {r.trade_tf} Lev={r.leverage}x "
+                                f"G={r.G:.3f}% {r.direction} EV={r.ev_pct:.1f}%")
+
+        # Dict → list, sırala: eligible olanlar önce, skora göre azalan
+        all_results = list(results_by_sym.values())
+        all_results.sort(key=lambda r: (-r.eligible, -r.score))
+        eligible_count = sum(1 for r in all_results if r.eligible)
+        logger.info(f"[SysJ] Scan tamamlandi: {eligible_count} eligible / "
+                    f"{len(all_results)} sonuc / {len(symbols)} coin, "
+                    f"API calls: ~{len(klines_cache)}")
+        results = all_results
+
+        self._last_system_j_results = results
+
+        # Publish results for GUI
+        self._event_bus.publish(EventType.SCANNER_UPDATE, {
+            "scan_count": self._scan_count,
+            "results": results,
+            "source": "system_j",
+        })
+
+        # 5. Buying
+        close_only = strat.get("close_only", False)
+        if not close_only and slots > 0:
+            self._do_buying_system_j()
+
+        # 6. Wait
+        interval = sj_cfg.get("scan_interval_seconds", 60)
+        if self._position_mgr.has_position:
+            interval = min(interval, 30)
+        self._wait(interval)
+
+    def _do_buying_system_j(self) -> None:
+        """System J pozisyon açma — eligible sonuçlardan en iyilerini seç."""
+        results = self._last_system_j_results
+        if not results:
+            return
+
+        sj_cfg = self._config.get("system_j", {})
+        pos_cfg = sj_cfg.get("position", {})
+        min_score = sj_cfg.get("min_buy_score", 48)
+        max_pos = pos_cfg.get("max_positions", 12)
+        max_same_dir = pos_cfg.get("max_same_direction", 8)
+        max_per_coin = pos_cfg.get("max_per_coin", 1)
+
+        # Current position counts
+        with self._position_mgr._lock:
+            current_count = len(self._position_mgr._positions)
+            long_count = sum(1 for p in self._position_mgr._positions.values()
+                             if p.side == OrderSide.BUY_LONG)
+            short_count = current_count - long_count
+
+        if current_count >= max_pos:
+            return
+
+        # Direction balance
+        dir_balance = pos_cfg.get("direction_balance_enabled", True)
+        dir_ratio = pos_cfg.get("direction_balance_ratio", "2-1")
+        try:
+            parts = dir_ratio.split("-")
+            majority = int(parts[0])
+            minority = int(parts[1])
+        except Exception:
+            majority, minority = 2, 1
+
+        # Filter and sort
+        candidates = [r for r in results
+                      if r.eligible and r.score >= min_score and r.G > 0]
+        candidates.sort(key=lambda r: -r.score)
+
+        for cand in candidates:
+            if current_count >= max_pos:
+                break
+
+            sym = cand.symbol
+
+            # Skip if already holding
+            with self._position_mgr._lock:
+                if sym in self._position_mgr._positions:
+                    continue
+            # Skip pending limits
+            if sym in self._pending_limits:
+                continue
+            # Skip failed/banned/cooldown
+            if sym in self._failed_symbols and time.time() - self._failed_symbols[sym] < self._failed_cooldown:
+                continue
+            if sym in self._loss_cooldown_symbols:
+                cooldown = pos_cfg.get("loss_cooldown_seconds", 600)
+                if time.time() - self._loss_cooldown_symbols[sym] < cooldown:
+                    continue
+            # Coin daily ban kontrolü
+            coin_ok, coin_reason = self._check_coin_daily_ban(sym)
+            if not coin_ok:
+                logger.info(f"[SysJ] {sym} skipped ({coin_reason})")
+                continue
+
+            # Direction balance check
+            side = OrderSide.BUY_LONG if cand.direction == "LONG" else OrderSide.SELL_SHORT
+            if dir_balance:
+                if side == OrderSide.BUY_LONG and long_count >= max_same_dir:
+                    continue
+                if side == OrderSide.SELL_SHORT and short_count >= max_same_dir:
+                    continue
+                dir_count = long_count if side == OrderSide.BUY_LONG else short_count
+                opp_count = short_count if side == OrderSide.BUY_LONG else long_count
+                if dir_count >= majority * (opp_count // minority + 1):
+                    continue
+
+            # Open position
+            success = self._do_buying_system_j_single(cand)
+            if success:
+                current_count += 1
+                if side == OrderSide.BUY_LONG:
+                    long_count += 1
+                else:
+                    short_count += 1
+                break  # Scan döngüsü başına 1 pozisyon
+
+    def _do_buying_system_j_single(self, cand: 'SystemJScanResult') -> bool:
+        """System J tek pozisyon açma."""
+        symbol = cand.symbol
+        direction = cand.direction
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        sj_cfg = self._config.get("system_j", {})
+
+        # 1. Fresh price
+        price = cand.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # 2. Leverage
+        leverage = cand.leverage
+        lev_enabled = self._config.get("leverage.enabled", False)
+        if not lev_enabled:
+            leverage = 1
+
+        if leverage > 1:
+            try:
+                margin_est = 5.0
+                available_max = self._rest.get_max_leverage(symbol, margin_est * leverage)
+                if available_max < leverage:
+                    leverage = available_max
+                min_lev = sj_cfg.get("leverage", {}).get("min_leverage", 2)
+                if leverage < min_lev:
+                    logger.info(f"[SysJ] {symbol} max lev {leverage}x < min {min_lev}, skip")
+                    self._failed_symbols[symbol] = time.time()
+                    return False
+            except Exception as e:
+                logger.warning(f"[SysJ] {symbol} leverage check failed: {e}")
+
+        # 3. Position sizing
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            real_balance = self._order_executor.get_balance()
+        locked_margin = 0.0
+        with self._position_mgr._lock:
+            for pos in self._position_mgr._positions.values():
+                locked_margin += pos.margin_usdt
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 4.0)
+
+        scanner = self._system_j_scanner
+        margin_usdt = scanner.calculate_position_size(wallet)
+        margin_usdt = min(margin_usdt, real_balance * 0.95)
+        if margin_usdt < 1.0:
+            logger.info(f"[SysJ] {symbol}: margin {margin_usdt:.2f} < 1.0, skip")
+            return False
+
+        # 4. Set leverage & margin type
+        try:
+            self._rest.set_margin_type(symbol, "ISOLATED")
+        except Exception:
+            pass
+        try:
+            self._rest.set_leverage(symbol, leverage)
+        except Exception as e:
+            logger.warning(f"[SysJ] {symbol} set_leverage({leverage}) failed: {e}")
+
+        # 5. Qty calculation
+        qty = margin_usdt * leverage / price if price > 0 else 0
+        if qty <= 0:
+            return False
+
+        # Precision
+        pp = 2
+        qp = 3
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+                    qp = si.quantity_precision
+            except Exception:
+                pass
+
+        qty = round(qty, qp)
+        if qty <= 0:
+            return False
+
+        # Min notional check
+        notional = qty * price
+        if notional < 5.0:
+            old_qty = qty
+            qty = round(5.5 / price, qp)
+            margin_usdt = qty * price / leverage
+            logger.debug(f"[SysJ] {symbol}: notional bump {old_qty}->{qty}")
+
+        # 6. SL tight check
+        fee_rt = (sj_cfg.get("leverage", {}).get("fee_pct", 0.08) +
+                  sj_cfg.get("leverage", {}).get("slippage_pct", 0.04))
+        if cand.sl_pct < 3.0 * fee_rt:
+            logger.info(f"[SysJ] {symbol}: SL too tight ({cand.sl_pct:.3f}% < {3*fee_rt:.3f}%)")
+            return False
+
+        # 7. Entry
+        order_side = "BUY" if side == OrderSide.BUY_LONG else "SELL"
+
+        if cand.entry_type == "limit" and cand.entry_price > 0:
+            # Limit order
+            limit_price = round(cand.entry_price, pp)
+            # Drift check
+            drift = abs(price - limit_price) / price
+            atr_pct = cand.atr_pct / 100.0 if cand.atr_pct > 0 else 0.01
+            if drift > 1.5 * atr_pct:
+                # Too much drift, use market
+                logger.info(f"[SysJ] {symbol}: limit drift {drift:.3f} > 1.5*ATR, market fallback")
+                limit_price = None
+            else:
+                try:
+                    result = self._rest.place_order(
+                        symbol=symbol, side=order_side,
+                        order_type="LIMIT",
+                        quantity=qty, price=limit_price,
+                        time_in_force="GTC",
+                    )
+                    order_id = result.get("orderId", 0)
+                    logger.info(f"[SysJ LIMIT] {symbol} {direction} @ {limit_price} "
+                                f"qty={qty} lev={leverage}x orderId={order_id}")
+
+                    timeout = sj_cfg.get("entry", {}).get("limit_timeout_seconds", 300)
+                    self._pending_limits[symbol] = {
+                        "order_id": order_id,
+                        "limit_price": limit_price,
+                        "side": side,
+                        "direction": direction,
+                        "size": qty,
+                        "leverage": leverage,
+                        "margin_usdt": margin_usdt,
+                        "atr": cand.atr,
+                        "entry_mode": "SYSTEM_J",
+                        "placed_at": time.time(),
+                        "timeout": timeout,
+                        "cand": cand,
+                    }
+                    return True
+                except Exception as e:
+                    logger.error(f"[SysJ LIMIT] {symbol}: FAILED: {e}")
+                    limit_price = None  # fallback to market
+
+        # Market order
+        try:
+            result = self._rest.place_order(
+                symbol=symbol, side=order_side,
+                order_type="MARKET",
+                quantity=qty,
+            )
+            fill_price = float(result.get("avgPrice", price))
+            logger.info(f"[SysJ MARKET] {symbol} {direction} @ {fill_price} "
+                        f"qty={qty} lev={leverage}x G={cand.G:.3f}%")
+
+            self._open_position_system_j(symbol, cand, side, fill_price,
+                                         qty, leverage, margin_usdt)
+
+            if self._order_logger:
+                self._order_logger.log_order("SYSTEM_J", symbol, direction,
+                                             fill_price, qty, leverage, cand.score)
+            return True
+        except Exception as e:
+            logger.error(f"[SysJ MARKET] {symbol}: FAILED: {e}")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+    def _on_limit_filled_system_j(self, symbol: str, fill_price: float,
+                                   pending_info: dict) -> None:
+        """System J limit emir dolunca çağrılır."""
+        cand = pending_info.get("cand")
+        if not cand:
+            logger.warning(f"[SysJ] limit filled for {symbol} but no cand info")
+            return
+
+        side = pending_info["side"]
+        size = pending_info["size"]
+        leverage = pending_info["leverage"]
+        margin_usdt = pending_info["margin_usdt"]
+
+        self._open_position_system_j(symbol, cand, side, fill_price,
+                                     size, leverage, margin_usdt)
+
+        if self._order_logger:
+            self._order_logger.log_order("SYSTEM_J_LIMIT", symbol,
+                                         pending_info["direction"],
+                                         fill_price, size, leverage,
+                                         cand.score if cand else 0)
+
+        self._event_bus.publish(EventType.ORDER_PLACED, {
+            "symbol": symbol, "type": "SYSTEM_J_LIMIT_FILLED",
+            "price": fill_price, "leverage": leverage,
+        })
+
+    def _open_position_system_j(self, symbol: str, cand: 'SystemJScanResult',
+                                side: OrderSide, price: float,
+                                size_qty: float, leverage: int,
+                                margin_usdt: float) -> None:
+        """System J pozisyonu aç ve server-side emirleri yerleştir."""
+        sj_cfg = self._config.get("system_j", {})
+
+        sl_pct = cand.sl_pct
+        tp_pct = cand.tp_pct if cand.tp_pct > 0 else cand.trailing_trigger_pct
+        if tp_pct <= 0:
+            tp_pct = cand.G * 2.5
+
+        if side == OrderSide.BUY_LONG:
+            sl_price = price * (1 - sl_pct / 100)
+            tp_price = price * (1 + tp_pct / 100)
+        else:
+            sl_price = price * (1 + sl_pct / 100)
+            tp_price = price * (1 - tp_pct / 100)
+
+        pos = self._position_mgr.open_position(
+            symbol=symbol,
+            side=side,
+            price=price,
+            size=size_qty,
+            atr=cand.atr,
+            leverage=leverage,
+            margin_usdt=margin_usdt,
+            timeframe=cand.trade_tf or "5m",
+            entry_score=abs(cand.score),
+            entry_confluence=0,
+            entry_adx=0,
+            entry_rsi=cand.rsi,
+            entry_regime=cand.regime.regime if cand.regime else "",
+            entry_regime_confidence=cand.regime.confidence if cand.regime else 0,
+            entry_mode="SYSTEM_J",
+            entry_bb_width=cand.sl_pct,
+            initial_sl_override=sl_price,
+            initial_tp_override=tp_price,
+        )
+
+        if not pos:
+            logger.error(f"[SysJ] Failed to open position for {symbol}")
+            return
+
+        self._place_initial_orders_system_j(symbol, pos, cand, sj_cfg)
+
+    def _place_initial_orders_system_j(self, symbol: str, pos,
+                                        cand: 'SystemJScanResult',
+                                        sj_cfg: dict) -> None:
+        """Server-side SL + trailing/TP emirleri (G bazlı)."""
+        rest = self._rest
+        if not rest:
+            return
+
+        pp = 2
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+            except Exception:
+                pass
+
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        entry_price = pos.entry_price
+
+        # 1. SL emri (STOP_MARKET)
+        sl_pct = cand.sl_pct
+        if pos.side == OrderSide.BUY_LONG:
+            sl_price = round(entry_price * (1 - sl_pct / 100), pp)
+        else:
+            sl_price = round(entry_price * (1 + sl_pct / 100), pp)
+
+        try:
+            rest.place_order(
+                symbol=symbol, side=close_side,
+                order_type="STOP_MARKET",
+                quantity=pos.size,
+                stop_price=sl_price,
+                reduce_only=True,
+            )
+            logger.info(f"[SysJ SL] {symbol}: STOP_MARKET @ {sl_price} "
+                        f"(SL={sl_pct:.2f}%, G={cand.G:.3f}%)")
+        except Exception as e:
+            logger.error(f"[SysJ SL] {symbol}: FAILED: {e}")
+
+        # 2. Rejime göre trailing veya sabit TP
+        pool = cand.pool
+
+        if pool == "TREND" and cand.trailing_callback_pct > 0:
+            # TREND: trailing stop
+            callback_pct = round(cand.trailing_callback_pct, 2)
+            callback_pct = max(0.1, min(callback_pct, 5.0))
+
+            if pos.side == OrderSide.BUY_LONG:
+                activate_price = round(entry_price * (1 + cand.trailing_trigger_pct / 100), pp)
+            else:
+                activate_price = round(entry_price * (1 - cand.trailing_trigger_pct / 100), pp)
+
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=pos.size,
+                    stop_price=activate_price,
+                    callback_rate=callback_pct,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysJ TRAIL] {symbol}: trailing callback={callback_pct:.2f}% "
+                            f"activate={activate_price}")
+
+                self._server_trailing[symbol] = {
+                    "callback_pct": callback_pct,
+                    "activate_price": activate_price,
+                    "last_update": time.time(),
+                }
+            except Exception as e:
+                logger.error(f"[SysJ TRAIL] {symbol}: FAILED: {e}")
+        else:
+            # RANGING veya trailing yok: sabit TP
+            tp_pct = cand.tp_pct
+            if tp_pct <= 0:
+                tp_pct = cand.G * 2.0
+
+            if pos.side == OrderSide.BUY_LONG:
+                tp_price = round(entry_price * (1 + tp_pct / 100), pp)
+            else:
+                tp_price = round(entry_price * (1 - tp_pct / 100), pp)
+
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    quantity=pos.size,
+                    stop_price=tp_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysJ TP] {symbol}: TP @ {tp_price} "
+                            f"(TP={tp_pct:.2f}%)")
+            except Exception as e:
+                logger.error(f"[SysJ TP] {symbol}: FAILED: {e}")
+
+    def _place_missing_orders_system_j(self, symbol: str, pos) -> tuple:
+        """System J: Eksik SL/trailing/TP emirlerini yeniden koy."""
+        sj_cfg = self._config.get("system_j", {})
+        lev_cfg = sj_cfg.get("leverage", {})
+        tp_cfg = sj_cfg.get("tp", {})
+
+        sl_pct_stored = getattr(pos, 'entry_bb_width', 0)
+        if sl_pct_stored <= 0:
+            return (False, False)
+
+        fee_total = lev_cfg.get("fee_pct", 0.08) + lev_cfg.get("slippage_pct", 0.04)
+        sl_mult = lev_cfg.get("sl_g_mult", 1.5)
+        G_approx = max(0.01, (sl_pct_stored - fee_total) / sl_mult)
+
+        rest = self._rest
+        if not rest:
+            return (False, False)
+
+        pp = 2
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+            except Exception:
+                pass
+
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        sl_placed = False
+        trail_placed = False
+
+        # SL
+        if pos.side == OrderSide.BUY_LONG:
+            sl_price = round(pos.entry_price * (1 - sl_pct_stored / 100), pp)
+        else:
+            sl_price = round(pos.entry_price * (1 + sl_pct_stored / 100), pp)
+        try:
+            rest.place_order(
+                symbol=symbol, side=close_side,
+                order_type="STOP_MARKET",
+                quantity=pos.size,
+                stop_price=sl_price,
+                reduce_only=True,
+            )
+            sl_placed = True
+            logger.info(f"[SysJ REPAIR SL] {symbol}: @ {sl_price}")
+        except Exception as e:
+            logger.error(f"[SysJ REPAIR SL] {symbol}: FAILED: {e}")
+
+        # Trailing/TP
+        entry_regime = getattr(pos, 'entry_regime', '')
+        if entry_regime in ("TRENDING", "TREND"):
+            cb_mult = tp_cfg.get("trailing_callback_g_mult", 0.5)
+            trig_mult = tp_cfg.get("trailing_trigger_g_mult", 2.5)
+            cb_raw = cb_mult * G_approx
+
+            if cb_raw >= 0.15:
+                # Normal trailing
+                cb = max(0.1, min(cb_raw, 5.0))
+                if pos.side == OrderSide.BUY_LONG:
+                    act = round(pos.entry_price * (1 + trig_mult * G_approx / 100), pp)
+                else:
+                    act = round(pos.entry_price * (1 - trig_mult * G_approx / 100), pp)
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="TRAILING_STOP_MARKET",
+                        quantity=pos.size,
+                        stop_price=act,
+                        callback_rate=round(cb, 2),
+                        reduce_only=True,
+                    )
+                    trail_placed = True
+                    logger.info(f"[SysJ REPAIR TRAIL] {symbol}: cb={cb:.2f}%")
+                except Exception as e:
+                    logger.error(f"[SysJ REPAIR TRAIL] {symbol}: FAILED: {e}")
+            else:
+                # Callback çok sıkı → sabit TP kullan (RANGING branch'e düş)
+                tp_pct = trig_mult * G_approx
+                if pos.side == OrderSide.BUY_LONG:
+                    tp_price = round(pos.entry_price * (1 + tp_pct / 100), pp)
+                else:
+                    tp_price = round(pos.entry_price * (1 - tp_pct / 100), pp)
+                try:
+                    rest.place_order(
+                        symbol=symbol, side=close_side,
+                        order_type="TAKE_PROFIT_MARKET",
+                        quantity=pos.size,
+                        stop_price=tp_price,
+                        reduce_only=True,
+                    )
+                    trail_placed = True
+                    logger.info(f"[SysJ REPAIR TP-FALLBACK] {symbol}: @ {tp_price} (trailing too tight)")
+                except Exception as e:
+                    logger.error(f"[SysJ REPAIR TP-FALLBACK] {symbol}: FAILED: {e}")
+        else:
+            tp_mult = tp_cfg.get("ranging_tp_g_mult", 2.0)
+            tp_pct = tp_mult * G_approx
+            if pos.side == OrderSide.BUY_LONG:
+                tp_price = round(pos.entry_price * (1 + tp_pct / 100), pp)
+            else:
+                tp_price = round(pos.entry_price * (1 - tp_pct / 100), pp)
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    quantity=pos.size,
+                    stop_price=tp_price,
+                    reduce_only=True,
+                )
+                trail_placed = True
+                logger.info(f"[SysJ REPAIR TP] {symbol}: @ {tp_price}")
+            except Exception as e:
+                logger.error(f"[SysJ REPAIR TP] {symbol}: FAILED: {e}")
+
+        return (sl_placed, trail_placed)

@@ -587,14 +587,14 @@
     }
   },
   "system_i": {
-    "enabled": true,
+    "enabled": false,
     "coin_sayisi": 50,
-    "swing_n": 10,
+    "swing_n": 5,
     "scan_interval_seconds": 60,
     "deep_analysis_interval_seconds": 120,
     "deep_analysis_top_n": 999,
     "spike_detection_enabled": true,
-    "spike_min_change_pct": 3.0,
+    "spike_min_change_pct": 1.5,
     "max_finalists": 5,
     "min_buy_score": 48,
     "kline_limit": 200,
@@ -609,8 +609,8 @@
       "zoom_min_tf": "1m",
       "zoom_max_tf": "1w",
       "zoom_min_backward_waves": 10,
-      "zoom_g_tf_efficient": 0.60,
-      "zoom_g_tf_inefficient": 0.80
+      "zoom_g_tf_efficient": 0.6,
+      "zoom_g_tf_inefficient": 0.8
     },
     "direction": {
       "ema_fast": 9,
@@ -624,10 +624,12 @@
       "rsi_short_threshold": 48
     },
     "regime": {
-      "er_trending": 0.35,
-      "er_ranging": 0.2,
-      "hurst_trending": 0.55,
-      "hurst_ranging": 0.45,
+      "er_trending": 0.25,
+      "er_ranging": 0.08,
+      "er_window": 20,
+      "er_median_count": 10,
+      "hurst_trending": 0.6,
+      "hurst_ranging": 0.5,
       "hysteresis_count": 2,
       "gray_zone_trading_enabled": true
     },
@@ -674,6 +676,13 @@
       "roi_based_tp_pct": 50.0,
       "single_tp_g_mult": 2.5
     },
+    "ev": {
+      "ev_mode": "optimizer",
+      "ev_min_threshold": 0.0,
+      "ev_min_rr": 1.5,
+      "ev_max_bonus": 1.3,
+      "ev_min_penalty": 0.7
+    },
     "position_sizing": {
       "min_position_usd": 1.0,
       "min_divider": 4,
@@ -685,13 +694,13 @@
       "max_per_coin": 1
     },
     "filters": {
-      "funding_rate_max": 0.001,
+      "funding_rate_max": 0.0003,
       "max_spread_pct": 0.05,
-      "min_depth_usd": 50000,
-      "min_volume_ratio": 0.5,
-      "volume_filter_enabled": false,
+      "min_depth_usd": 100000,
+      "min_volume_ratio": 1.2,
+      "volume_filter_enabled": true,
       "min_wave_count": 3,
-      "max_wall_imbalance": 0.3,
+      "max_wall_imbalance": 0.4,
       "max_cv": 1.5,
       "max_atr_percent": 5.0,
       "fee_rate": 0.0004
@@ -734,6 +743,112 @@
       "regime_clarity": 0.2,
       "market_context": 0.15,
       "wave_quality": 0.1
+    }
+  },
+  "system_j": {
+    "enabled": true,
+    "coin_sayisi": 50,
+    "swing_n": 5,
+    "scan_interval_seconds": 60,
+    "min_buy_score": 48,
+    "kline_limit": 200,
+    "zoom_g_tf_efficient": 0.6,
+    "zoom_g_tf_inefficient": 0.8,
+    "leverage": {
+      "sl_divisor": 2.0,
+      "sl_g_mult": 1.5,
+      "fee_pct": 0.08,
+      "slippage_pct": 0.04,
+      "min_leverage": 2
+    },
+    "regime": {
+      "er_trending": 0.25,
+      "er_ranging": 0.08,
+      "er_window": 20,
+      "er_median_count": 10,
+      "gray_zone_skip": true
+    },
+    "direction": {
+      "ema_fast": 9,
+      "ema_slow": 21,
+      "ema_gap_min_pct": 0.05,
+      "macd_fast": 8,
+      "macd_slow": 17,
+      "macd_signal": 9,
+      "rsi_period": 14,
+      "rsi_long_threshold": 55,
+      "rsi_short_threshold": 45
+    },
+    "entry": {
+      "wave_dip_threshold": 0.3,
+      "wave_mid_threshold": 0.7,
+      "limit_g_offset_ratio": 0.5,
+      "limit_timeout_seconds": 300
+    },
+    "tp": {
+      "trailing_trigger_g_mult": 2.5,
+      "trailing_callback_g_mult": 0.5,
+      "ranging_tp_target": "bb_middle",
+      "ranging_tp_g_mult": 2.0
+    },
+    "ev": {
+      "min_p_win": 0.4,
+      "min_rr": 2.5,
+      "ev_min_threshold": 0.0,
+      "sl_candidates": [
+        1.0,
+        1.25,
+        1.5,
+        1.75,
+        2.0
+      ],
+      "tp_candidates": [
+        2.0,
+        2.5,
+        3.0,
+        3.5,
+        4.0,
+        5.0
+      ]
+    },
+    "position": {
+      "min_position_usd": 1.0,
+      "min_divider": 4,
+      "max_divider": 12,
+      "max_positions": 12,
+      "max_same_direction": 8,
+      "max_per_coin": 1,
+      "direction_balance_enabled": true,
+      "direction_balance_ratio": "2-1",
+      "loss_cooldown_seconds": 600,
+      "coin_daily_loss_limit": 3,
+      "coin_daily_ban_hours": 8
+    },
+    "filters": {
+      "funding_rate_max": 0.0003,
+      "max_spread_pct": 0.05,
+      "min_depth_usd": 100000,
+      "min_volume_ratio": 1.0,
+      "min_wave_count": 3,
+      "fee_rate": 0.0004
+    },
+    "optional": {
+      "signal_exit_enabled": true,
+      "signal_exit_threshold": -4.0,
+      "signal_deep_exit_threshold": -8.0,
+      "signal_min_hold_seconds": 180,
+      "time_limit_enabled": true,
+      "time_limit_hours": 8,
+      "emergency_exit_enabled": true,
+      "direction_balance_enabled": true,
+      "coin_ban_enabled": true,
+      "loss_cooldown_enabled": true
+    },
+    "score_weights": {
+      "direction_strength": 0.3,
+      "ev_quality": 0.3,
+      "regime_clarity": 0.2,
+      "wave_quality": 0.2
     }
   },
   "trading": {
