@@ -988,13 +988,13 @@
       "slope_factor": 0.1
     },
     "position": {
-      "sizing_mode": "divider",
+      "sizing_mode": "min_notional",
       "portfolio_divider": 12,
       "min_notional_usd": 5.0,
       "min_notional_buffer_pct": 20,
-      "max_positions": 12,
-      "min_position_usd": 1.0,
-      "max_same_direction": 8,
+      "max_positions": 50,
+      "min_position_usd": 0.01,
+      "max_same_direction": 30,
       "direction_balance_enabled": false,
       "direction_balance_ratio": "2-1"
     },

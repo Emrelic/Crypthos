@@ -11017,8 +11017,18 @@ class ScannerStateMachine:
         if wallet <= 0:
             wallet = self._config.get("risk.initial_balance", 4.0)
 
+        # Coin bazlı min notional oku (Binance exchangeInfo)
+        coin_min_notional = 5.0
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si and hasattr(si, 'min_notional') and si.min_notional > 0:
+                    coin_min_notional = si.min_notional
+            except Exception:
+                pass
+
         scanner = self._system_n_scanner
-        margin_usdt = scanner.calculate_position_size(wallet, leverage)
+        margin_usdt = scanner.calculate_position_size(wallet, leverage, coin_min_notional)
         margin_usdt = min(margin_usdt, real_balance * 0.90) if real_balance > 0 else margin_usdt
         min_pos_usd = pos_cfg.get("min_position_usd", 1.0)
         if margin_usdt < min_pos_usd:
@@ -11026,11 +11036,8 @@ class ScannerStateMachine:
                         f"(available={real_balance:.2f}, wallet={wallet:.2f})")
             return False
 
-        # Qty
-        qty = margin_usdt * leverage / price if price > 0 else 0
-        if qty <= 0:
-            return False
-
+        # Coin bazlı min notional (Binance exchangeInfo'dan)
+        coin_min_notional = 5.0
         pp, qp = 2, 3
         if self._symbol_info_cache:
             try:
@@ -11038,19 +11045,33 @@ class ScannerStateMachine:
                 if si:
                     pp = si.price_precision
                     qp = si.quantity_precision
+                    if hasattr(si, 'min_notional') and si.min_notional > 0:
+                        coin_min_notional = si.min_notional
             except Exception:
                 pass
+
+        # Buffer ekle (%20 varsayılan)
+        buffer_pct = pos_cfg.get("min_notional_buffer_pct", 20)
+        effective_min_notional = coin_min_notional * (1 + buffer_pct / 100.0)
+
+        # Qty
+        qty = margin_usdt * leverage / price if price > 0 else 0
+        if qty <= 0:
+            return False
 
         qty = round(qty, qp)
         if qty <= 0:
             return False
 
-        # Min notional kontrolü: Binance 5 USDT + buffer%
+        # Min notional kontrolü: coin bazlı Binance minimum + buffer
         notional = qty * price
-        if notional < min_notional:
-            qty = round((min_notional * 1.02) / price, qp)  # +%2 yuvarlama payı
+        if notional < effective_min_notional:
+            qty = round((effective_min_notional * 1.02) / price, qp)
             notional = qty * price
             margin_usdt = notional / leverage
+            logger.info(f"[SysN] {symbol}: notional {notional:.2f}$ adjusted "
+                        f"(coin min_notional={coin_min_notional}$, "
+                        f"effective={effective_min_notional:.2f}$)")
 
         # Son kontrol: gerçek bakiyeyi aşma
         required_margin = notional / max(leverage, 1)

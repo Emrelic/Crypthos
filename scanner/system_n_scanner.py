@@ -637,13 +637,19 @@ class SystemNScanner:
             else:
                 self._coin_trend_direction.clear()
 
-    def calculate_position_size(self, wallet: float, leverage: int = 1) -> float:
+    def calculate_position_size(self, wallet: float, leverage: int = 1,
+                               coin_min_notional: float = 0) -> float:
         """Pozisyon büyüklüğü (margin) hesapla.
 
         İki mod:
           divider:      wallet / portfolio_divider (klasik 1/12)
-          min_notional: Binance min_notional × (1 + buffer%) / leverage
+          min_notional: max(config, coin_bazlı) × (1 + buffer%) / leverage
                         → cebinden çıkan minimum marjin
+
+        Args:
+            wallet: toplam bakiye (available + locked)
+            leverage: kaldıraç çarpanı
+            coin_min_notional: Binance'in bu coin için min notional değeri (0=config kullan)
 
         Returns: margin_usdt (kaldıraç ÖNCESİ, cebinden çıkan tutar)
         """
@@ -651,6 +657,9 @@ class SystemNScanner:
 
         if mode == "min_notional":
             base_notional = self._cfg("position.min_notional_usd", 5.0)
+            # Coin bazlı min notional daha yüksekse onu kullan
+            if coin_min_notional > base_notional:
+                base_notional = coin_min_notional
             buffer_pct = self._cfg("position.min_notional_buffer_pct", 20)
             target_notional = base_notional * (1 + buffer_pct / 100.0)
             margin = target_notional / max(leverage, 1)
