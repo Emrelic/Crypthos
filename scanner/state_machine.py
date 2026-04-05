@@ -4,6 +4,7 @@ Supports up to max_positions concurrent positions."""
 import re
 import time
 import threading
+import pandas as pd
 from loguru import logger
 from core.config_manager import ConfigManager
 from core.event_bus import EventBus
@@ -21,6 +22,8 @@ from scanner.system_g_scanner import SystemGScanner, SystemGScanResult
 from scanner.system_h_scanner import SystemHScanner, SystemHScanResult
 from scanner.system_i_scanner import SystemIScanner, SystemIScanResult
 from scanner.system_j_scanner import SystemJScanner, SystemJScanResult
+from scanner.system_m_scanner import SystemMScanner, SystemMScanResult
+from scanner.system_n_scanner import SystemNScanner, SystemNScanResult
 from scanner.position_manager import PositionManager
 from scanner.timeframe_selector import TimeframeSelector
 from indicators.indicator_engine import IndicatorEngine
@@ -147,6 +150,17 @@ class ScannerStateMachine:
         self._system_g_scanner = SystemGScanner(config)
         self._last_system_g_results: list[SystemGScanResult] = []
 
+        # ── System M (AlphaTrend PRO) ──
+        self._system_m_scanner: SystemMScanner | None = None
+        self._last_system_m_results: list[SystemMScanResult] = []
+        self._system_m_decisions: list[dict] = []  # karar log'u (max 200)
+
+        # ── System N (AlphaTrend PRO v2 — System M kopyası, geliştirme için) ──
+        self._system_n_scanner: SystemNScanner | None = None
+        self._last_system_n_results: list[SystemNScanResult] = []
+        self._system_n_decisions: list[dict] = []  # karar log'u (max 500)
+        self._system_n_scan_count: int = 0  # System N'e özel tarama sayacı
+
         # ── System J (Max Leverage First) ──
         self._system_j_scanner: SystemJScanner | None = None
         self._last_system_j_results: list[SystemJScanResult] = []
@@ -258,7 +272,11 @@ class ScannerStateMachine:
                     _last_state_save = _now
 
                 if self._state == ScannerState.SCANNING:
-                    if self._config.get("system_j.enabled", False):
+                    if self._config.get("system_n.enabled", False):
+                        self._do_scanning_system_n()
+                    elif self._config.get("system_m.enabled", False):
+                        self._do_scanning_system_m()
+                    elif self._config.get("system_j.enabled", False):
                         self._do_scanning_system_j()
                     elif self._config.get("system_i.enabled", False):
                         self._do_scanning_system_i()
@@ -1311,6 +1329,11 @@ class ScannerStateMachine:
             if symbol in self._selling_symbols:
                 continue
 
+            # System M/N pozisyonları burada işlenmez — kendi sinyal bazlı çıkışı var
+            pos_check = self._position_mgr.get_position(symbol)
+            if pos_check and getattr(pos_check, 'entry_mode', '') in ("SYSTEM_M", "SYSTEM_N"):
+                continue
+
             try:
                 ticker = self._rest.get_ticker_price(symbol)
                 current_price = float(ticker.get("price", 0))
@@ -1560,6 +1583,13 @@ class ScannerStateMachine:
                             config_snapshot_id=config_snapshot_id,
                         )
 
+            # External close sonrası hemen state kaydet
+            if closed_externally:
+                try:
+                    self._position_mgr.save_state()
+                except Exception:
+                    pass
+
         except Exception as e:
             logger.debug(f"External close detection error: {e}")
 
@@ -1684,6 +1714,10 @@ class ScannerStateMachine:
         rest = self._order_executor._rest
         held_symbols = set(self._position_mgr.get_held_symbols())
 
+        # System M/N pozisyonlarını çıkar — sinyal bazlı, server SL/trailing kullanmaz
+        held_symbols = {s for s in held_symbols
+                        if getattr(self._position_mgr.get_position(s), 'entry_mode', '') not in ("SYSTEM_M", "SYSTEM_N")}
+
         if not held_symbols:
             return
 
@@ -1790,6 +1824,9 @@ class ScannerStateMachine:
         for symbol in held_symbols:
             pos = self._position_mgr.get_position(symbol)
             if not pos or pos.entry_price <= 0:
+                continue
+            # System M/N: sinyal bazlı — server SL/trailing kullanmaz, emir koymayı atla
+            if getattr(pos, 'entry_mode', '') in ("SYSTEM_M", "SYSTEM_N"):
                 continue
 
             info = order_map.get(symbol, {"sl": 0, "trail": 0, "other": 0, "total": 0})
@@ -2319,6 +2356,12 @@ class ScannerStateMachine:
                     logger.warning(f"Orphan order cancel issues for {symbol}: {result['errors']}")
             result = self._position_mgr.close_position(symbol, exit_price, reason)
             self._last_trade_result = result
+
+            # Hemen state kaydet (crash koruması)
+            try:
+                self._position_mgr.save_state()
+            except Exception:
+                pass
 
             if self._risk_manager:
                 pnl = result.get("pnl_usdt", 0)
@@ -3332,7 +3375,13 @@ class ScannerStateMachine:
                 else:
                     # State yoksa aktif sisteme göre tahmin et
                     sync_entry_mode = ""
-                    if self._config.get("system_i.enabled", False):
+                    if self._config.get("system_n.enabled", False):
+                        sync_entry_mode = "SYSTEM_N"
+                    elif self._config.get("system_m.enabled", False):
+                        sync_entry_mode = "SYSTEM_M"
+                    elif self._config.get("system_j.enabled", False):
+                        sync_entry_mode = "SYSTEM_J"
+                    elif self._config.get("system_i.enabled", False):
                         sync_entry_mode = "SYSTEM_I"
                     elif self._config.get("system_b.enabled", False):
                         sync_entry_mode = "SYSTEM_B"
@@ -3393,7 +3442,10 @@ class ScannerStateMachine:
                         pos_obj = self._position_mgr.get_position(symbol)
                         if pos_obj and atr > 0:
                             # Entry mode'a gore dogru fonksiyonu cagir
-                            if sync_entry_mode == "SYSTEM_I":
+                            if sync_entry_mode in ("SYSTEM_M", "SYSTEM_N"):
+                                logger.info(f"[SYNC] {symbol}: {sync_entry_mode} sinyal bazlı — "
+                                            f"SL/trailing konmayacak")
+                            elif sync_entry_mode == "SYSTEM_I":
                                 logger.info(f"[SYNC] {symbol}: System I repair delegated to verify")
                                 # System I emirlerini verify'e birak — dogru G bazli hesaplama yapar
                             else:
@@ -3898,6 +3950,54 @@ class ScannerStateMachine:
                         }
 
         return result
+
+    def get_system_m_results(self) -> list:
+        """Return last System M (AlphaTrend) scan results (for GUI)."""
+        return list(self._last_system_m_results)
+
+    def get_system_m_decisions(self) -> list[dict]:
+        """Return System M trade decision log (for GUI)."""
+        return list(self._system_m_decisions)
+
+    def _log_m_decision(self, symbol: str, signal: str, action: str,
+                        detail: str = "", price: float = 0.0) -> None:
+        """System M karar log'una kayıt ekle."""
+        import time as _time
+        entry = {
+            "time": _time.time(),
+            "symbol": symbol,
+            "signal": signal,
+            "action": action,
+            "detail": detail,
+            "price": price,
+        }
+        self._system_m_decisions.append(entry)
+        if len(self._system_m_decisions) > 500:
+            self._system_m_decisions = self._system_m_decisions[-500:]
+
+    def get_system_n_results(self) -> list:
+        """Return last System N scan results (for GUI)."""
+        return list(self._last_system_n_results)
+
+    def get_system_n_decisions(self) -> list[dict]:
+        """Return System N trade decision log (for GUI)."""
+        return list(self._system_n_decisions)
+
+    def _log_n_decision(self, symbol: str, signal: str, action: str,
+                        detail: str = "", price: float = 0.0) -> None:
+        """System N karar log'una kayıt ekle."""
+        import time as _time
+        entry = {
+            "time": _time.time(),
+            "symbol": symbol,
+            "signal": signal,
+            "action": action,
+            "detail": detail,
+            "price": price,
+        }
+        self._system_n_decisions.append(entry)
+        if len(self._system_n_decisions) > 500:
+            self._system_n_decisions = self._system_n_decisions[-500:]
 
     def get_system_b_results(self) -> list:
         """Return last System B scan results (for GUI)."""
@@ -8998,7 +9098,9 @@ class ScannerStateMachine:
 
         # 1. Symbol universe
         coin_sayisi = sj_cfg.get("coin_sayisi", 50)
+        max_spikes = sj_cfg.get("max_spikes", 20)
         self._universe._top_n = coin_sayisi
+        self._universe._max_spikes = max_spikes
         symbols = self._universe.refresh()
         if not symbols:
             logger.warning("[SysJ] No symbols found")
@@ -9056,15 +9158,15 @@ class ScannerStateMachine:
         all_volumes = []
         for sym in symbols:
             td = ticker_data.get(sym, {})
-            vol = float(td.get("quoteVolume", 0)) if td else 0
+            vol = float(td.get("volume_24h", 0)) if td else 0
             if vol > 0:
                 all_volumes.append(vol)
         median_vol = sorted(all_volumes)[len(all_volumes) // 2] if all_volumes else 1.0
 
         for sym in symbols:
             td = ticker_data.get(sym, {})
-            price = float(td.get("lastPrice", 0)) if td else 0
-            vol_24h = float(td.get("quoteVolume", 0)) if td else 0
+            price = float(td.get("price", 0)) if td else 0
+            vol_24h = float(td.get("volume_24h", 0)) if td else 0
             vol_ratio = vol_24h / median_vol if median_vol > 0 else 1.0
             fr_data = funding_rates.get(sym, {})
             fr = fr_data.get("funding_rate", 0) if isinstance(fr_data, dict) else fr_data
@@ -9149,9 +9251,19 @@ class ScannerStateMachine:
         all_results = list(results_by_sym.values())
         all_results.sort(key=lambda r: (-r.eligible, -r.score))
         eligible_count = sum(1 for r in all_results if r.eligible)
+
+        # Reject nedeni dağılımı (debug)
+        reject_dist: dict[str, int] = {}
+        for r in all_results:
+            if not r.eligible and r.reject_reason:
+                reject_dist[r.reject_reason] = reject_dist.get(r.reject_reason, 0) + 1
+        reject_str = " | ".join(f"{k}={v}" for k, v in sorted(reject_dist.items(), key=lambda x: -x[1]))
+
         logger.info(f"[SysJ] Scan tamamlandi: {eligible_count} eligible / "
                     f"{len(all_results)} sonuc / {len(symbols)} coin, "
                     f"API calls: ~{len(klines_cache)}")
+        if reject_str:
+            logger.info(f"[SysJ] Reject dagilimi: {reject_str}")
         results = all_results
 
         self._last_system_j_results = results
@@ -9541,11 +9653,11 @@ class ScannerStateMachine:
         except Exception as e:
             logger.error(f"[SysJ SL] {symbol}: FAILED: {e}")
 
-        # 2. Rejime göre trailing veya sabit TP
-        pool = cand.pool
-
-        if pool == "TREND" and cand.trailing_callback_pct > 0:
-            # TREND: trailing stop
+        # 2. Trailing veya sabit TP
+        # Elliott aktifken: her zaman trailing (reaktif çıkış)
+        # Elliott kapalıyken: rejime göre (eski mantık)
+        if cand.trailing_callback_pct > 0:
+            # Trailing stop (Elliott aktif → her zaman, eski → sadece TREND)
             callback_pct = round(cand.trailing_callback_pct, 2)
             callback_pct = max(0.1, min(callback_pct, 5.0))
 
@@ -9564,7 +9676,7 @@ class ScannerStateMachine:
                     reduce_only=True,
                 )
                 logger.info(f"[SysJ TRAIL] {symbol}: trailing callback={callback_pct:.2f}% "
-                            f"activate={activate_price}")
+                            f"activate={activate_price} elliott={cand.elliott_pattern or 'off'}")
 
                 self._server_trailing[symbol] = {
                     "callback_pct": callback_pct,
@@ -9574,7 +9686,7 @@ class ScannerStateMachine:
             except Exception as e:
                 logger.error(f"[SysJ TRAIL] {symbol}: FAILED: {e}")
         else:
-            # RANGING veya trailing yok: sabit TP
+            # Trailing yok (callback çok sıkı): sabit TP
             tp_pct = cand.tp_pct
             if tp_pct <= 0:
                 tp_pct = cand.G * 2.0
@@ -9646,36 +9758,24 @@ class ScannerStateMachine:
         except Exception as e:
             logger.error(f"[SysJ REPAIR SL] {symbol}: FAILED: {e}")
 
-        # Trailing/TP
-        entry_regime = getattr(pos, 'entry_regime', '')
-        if entry_regime in ("TRENDING", "TREND"):
-            cb_mult = tp_cfg.get("trailing_callback_g_mult", 0.5)
-            trig_mult = tp_cfg.get("trailing_trigger_g_mult", 2.5)
-            cb_raw = cb_mult * G_approx
+        # Trailing/TP — Elliott aktifken her zaman trailing dene
+        elliott_cfg = sj_cfg.get("elliott", {})
+        elliott_on = elliott_cfg.get("enabled", True)
 
-            if cb_raw >= 0.15:
-                # Normal trailing
-                cb = max(0.1, min(cb_raw, 5.0))
-                if pos.side == OrderSide.BUY_LONG:
-                    act = round(pos.entry_price * (1 + trig_mult * G_approx / 100), pp)
-                else:
-                    act = round(pos.entry_price * (1 - trig_mult * G_approx / 100), pp)
-                try:
-                    rest.place_order(
-                        symbol=symbol, side=close_side,
-                        order_type="TRAILING_STOP_MARKET",
-                        quantity=pos.size,
-                        stop_price=act,
-                        callback_rate=round(cb, 2),
-                        reduce_only=True,
-                    )
-                    trail_placed = True
-                    logger.info(f"[SysJ REPAIR TRAIL] {symbol}: cb={cb:.2f}%")
-                except Exception as e:
-                    logger.error(f"[SysJ REPAIR TRAIL] {symbol}: FAILED: {e}")
+        if elliott_on:
+            # Reaktif trailing parametreleri
+            cb_mult = elliott_cfg.get("trail_callback_g_mult", 0.3)
+            trig_mult = elliott_cfg.get("trail_trigger_g_mult", 1.0)
+        else:
+            # Eski rejim bazlı parametreler
+            entry_regime = getattr(pos, 'entry_regime', '')
+            if entry_regime in ("TRENDING", "TREND"):
+                cb_mult = tp_cfg.get("trailing_callback_g_mult", 0.5)
+                trig_mult = tp_cfg.get("trailing_trigger_g_mult", 2.5)
             else:
-                # Callback çok sıkı → sabit TP kullan (RANGING branch'e düş)
-                tp_pct = trig_mult * G_approx
+                # RANGING: sabit TP
+                tp_mult = tp_cfg.get("ranging_tp_g_mult", 2.0)
+                tp_pct = tp_mult * G_approx
                 if pos.side == OrderSide.BUY_LONG:
                     tp_price = round(pos.entry_price * (1 + tp_pct / 100), pp)
                 else:
@@ -9689,12 +9789,33 @@ class ScannerStateMachine:
                         reduce_only=True,
                     )
                     trail_placed = True
-                    logger.info(f"[SysJ REPAIR TP-FALLBACK] {symbol}: @ {tp_price} (trailing too tight)")
+                    logger.info(f"[SysJ REPAIR TP] {symbol}: @ {tp_price}")
                 except Exception as e:
-                    logger.error(f"[SysJ REPAIR TP-FALLBACK] {symbol}: FAILED: {e}")
+                    logger.error(f"[SysJ REPAIR TP] {symbol}: FAILED: {e}")
+                return (sl_placed, trail_placed)
+
+        cb_raw = cb_mult * G_approx
+        if cb_raw >= 0.10:
+            cb = max(0.1, min(cb_raw, 5.0))
+            if pos.side == OrderSide.BUY_LONG:
+                act = round(pos.entry_price * (1 + trig_mult * G_approx / 100), pp)
+            else:
+                act = round(pos.entry_price * (1 - trig_mult * G_approx / 100), pp)
+            try:
+                rest.place_order(
+                    symbol=symbol, side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    quantity=pos.size,
+                    stop_price=act,
+                    callback_rate=round(cb, 2),
+                    reduce_only=True,
+                )
+                trail_placed = True
+                logger.info(f"[SysJ REPAIR TRAIL] {symbol}: cb={cb:.2f}%")
+            except Exception as e:
+                logger.error(f"[SysJ REPAIR TRAIL] {symbol}: FAILED: {e}")
         else:
-            tp_mult = tp_cfg.get("ranging_tp_g_mult", 2.0)
-            tp_pct = tp_mult * G_approx
+            tp_pct = trig_mult * G_approx
             if pos.side == OrderSide.BUY_LONG:
                 tp_price = round(pos.entry_price * (1 + tp_pct / 100), pp)
             else:
@@ -9708,8 +9829,1620 @@ class ScannerStateMachine:
                     reduce_only=True,
                 )
                 trail_placed = True
-                logger.info(f"[SysJ REPAIR TP] {symbol}: @ {tp_price}")
+                logger.info(f"[SysJ REPAIR TP-FALLBACK] {symbol}: @ {tp_price} (trailing too tight)")
             except Exception as e:
-                logger.error(f"[SysJ REPAIR TP] {symbol}: FAILED: {e}")
+                logger.error(f"[SysJ REPAIR TP-FALLBACK] {symbol}: FAILED: {e}")
 
         return (sl_placed, trail_placed)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  SYSTEM M — AlphaTrend PRO
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _do_scanning_system_m(self) -> None:
+        """System M: AlphaTrend PRO tarama — sabit 5m TF, sinyal bazlı."""
+
+        # Step 0: Check pending limits
+        if self._pending_limits:
+            self._check_pending_limits()
+
+        # Step A: Check held positions (external close detection)
+        if self._position_mgr.has_position:
+            self._check_held_positions_system_m()
+
+        self._scan_count += 1
+        sm_cfg = self._config.get("system_m", {})
+        pos_cfg = sm_cfg.get("position", {})
+        filter_cfg = sm_cfg.get("filters", {})
+        max_pos = pos_cfg.get("max_positions", 12)
+        self._position_mgr._max_positions = max_pos
+
+        logger.info(f"[SysM] Scan #{self._scan_count} starting... "
+                    f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+
+        # Initialize scanner if needed
+        if self._system_m_scanner is None:
+            self._system_m_scanner = SystemMScanner(self._config)
+            # Reconstruct state from open SYSTEM_M positions (restart protection)
+            held = self._position_mgr.get_all_positions()
+            self._system_m_scanner.reconstruct_state_from_positions(held)
+
+        scanner = self._system_m_scanner
+        tf = sm_cfg.get("timeframe", "5m")
+        kline_limit = sm_cfg.get("kline_limit", 300)
+
+        # 1. Symbol universe
+        coin_mode = sm_cfg.get("coin_mode", "top_n")
+        coin_list = sm_cfg.get("coin_list", [])
+        symbols = []
+
+        if coin_mode == "manual" and coin_list:
+            symbols = [s.strip().upper() for s in coin_list if s.strip()]
+
+        if not symbols:
+            coin_sayisi = sm_cfg.get("coin_sayisi", 50)
+            self._universe._top_n = coin_sayisi
+            self._universe._max_spikes = 0
+            # System M'nin kendi min volume eşiğini Universe'e geçir
+            min_vol = filter_cfg.get("min_volume_24h_usdt", 5_000_000)
+            self._universe._min_volume = min_vol
+            symbols = self._universe.refresh()
+
+        if not symbols:
+            logger.warning("[SysM] No symbols found")
+            self._wait(30)
+            return
+
+        logger.info(f"[SysM] Universe: {len(symbols)} coins, TF: {tf}, mode: {coin_mode}")
+
+        # 2. Fetch klines and scan each symbol
+        results: list = []
+        buy_signals: list = []
+        sell_signals: list = []
+
+        # Kline volume filtresi: 5m TF'de 288 bar ≈ 24 saat
+        min_vol_usdt = filter_cfg.get("min_volume_24h_usdt", 5_000_000)
+        vol_check_bars = 288  # 24h / 5m = 288 bar
+
+        for sym in symbols:
+            try:
+                klines_raw = self._rest.get_klines(sym, tf, limit=kline_limit)
+                # get_klines returns DataFrame — convert to list of lists
+                if isinstance(klines_raw, pd.DataFrame):
+                    if klines_raw.empty or len(klines_raw) < 50:
+                        self._log_m_decision(sym, "—", "VERİ_YOK",
+                                             f"kline < 50 bar", 0)
+                        continue
+                    klines = klines_raw[["open", "high", "low", "close", "volume"]].values.tolist()
+                    # Prepend timestamp as index 0 (analyze_symbol expects [ts, open, high, low, close, volume, ...])
+                    klines = [[0, row[0], row[1], row[2], row[3], row[4]] for row in klines]
+                else:
+                    if not klines_raw or len(klines_raw) < 50:
+                        self._log_m_decision(sym, "—", "VERİ_YOK",
+                                             f"kline < 50 bar", 0)
+                        continue
+                    klines = klines_raw
+
+                # Katman C: Kline volume'den ~24h hacim kontrolü (ek güvenlik)
+                if min_vol_usdt > 0:
+                    recent = klines[-vol_check_bars:] if len(klines) >= vol_check_bars else klines
+                    try:
+                        vol_sum = sum(
+                            float(k[5]) * float(k[4])  # volume × close ≈ quote volume
+                            for k in recent
+                        )
+                    except (IndexError, ValueError):
+                        vol_sum = 0
+                    if vol_sum < min_vol_usdt:
+                        self._log_m_decision(
+                            sym, "—", "SİNYAL_YOK",
+                            f"düşük hacim: ~${vol_sum/1e6:.1f}M < ${min_vol_usdt/1e6:.0f}M eşik",
+                            0)
+                        continue
+
+                result = scanner.analyze_symbol(sym, klines)
+                results.append(result)
+
+                if result.eligible:
+                    if result.signal == "BUY":
+                        buy_signals.append(result)
+                    elif result.signal == "SELL":
+                        sell_signals.append(result)
+                else:
+                    # Neden sinyal yok — filtre detayları
+                    reasons = []
+                    if not result.adx_static_ok:
+                        reasons.append(f"ADX({result.adx:.1f})<eşik")
+                    if not result.adx_dynamic_ok:
+                        reasons.append("ADX_dyn✗")
+                    if not result.slope_ok:
+                        reasons.append("slope✗")
+                    if result.reject_reason and result.reject_reason != "no_signal":
+                        reasons.append(result.reject_reason)
+                    if not reasons:
+                        reasons.append("crossover yok")
+                    trend = "▲" if result.trend_color == "green" else "▼"
+                    self._log_m_decision(
+                        sym, "—", "SİNYAL_YOK",
+                        f"{trend} ADX:{result.adx:.1f} RSI:{result.rsi:.0f} | {', '.join(reasons)}",
+                        result.price)
+
+            except Exception as e:
+                logger.debug(f"[SysM] {sym}: scan error: {e}")
+                self._log_m_decision(sym, "—", "HATA", str(e)[:80], 0)
+
+        # 3. Store results for GUI
+        self._last_system_m_results = results
+
+        # 3b. Funding Rate filtresi (sadece futures modda — spot'ta FR yok)
+        trading_mode = sm_cfg.get("trading_mode", "spot")
+        fr_max = filter_cfg.get("funding_rate_max", 0.001)
+
+        if trading_mode != "spot" and fr_max > 0 and (buy_signals or sell_signals):
+            # Batch API: tek çağrıda tüm coinlerin FR'sini çek
+            fr_symbols = list({s.symbol for s in buy_signals + sell_signals})
+            fr_ctx = self._fetch_funding_rates(fr_symbols)
+
+            filtered_buy = []
+            for sig in buy_signals:
+                fr = fr_ctx.get(sig.symbol, {}).get("funding_rate", 0.0)
+                if fr > fr_max:
+                    # Aşırı pozitif FR → long kalabalık, long girme
+                    self._log_m_decision(
+                        sig.symbol, "BUY", "ATLA",
+                        f"FR filtresi: FR={fr*100:+.4f}% > +{fr_max*100:.2f}% "
+                        f"(kalabalık long, contrarian red)",
+                        sig.price)
+                else:
+                    filtered_buy.append(sig)
+
+            filtered_sell = []
+            for sig in sell_signals:
+                fr = fr_ctx.get(sig.symbol, {}).get("funding_rate", 0.0)
+                if fr < -fr_max:
+                    # Aşırı negatif FR → short kalabalık, short girme
+                    self._log_m_decision(
+                        sig.symbol, "SELL", "ATLA",
+                        f"FR filtresi: FR={fr*100:+.4f}% < -{fr_max*100:.2f}% "
+                        f"(kalabalık short, contrarian red)",
+                        sig.price)
+                else:
+                    filtered_sell.append(sig)
+
+            fr_rejected = (len(buy_signals) - len(filtered_buy) +
+                           len(sell_signals) - len(filtered_sell))
+            if fr_rejected > 0:
+                logger.info(f"[SysM] FR filtresi: {fr_rejected} sinyal reddedildi "
+                            f"(eşik: ±{fr_max*100:.2f}%)")
+            buy_signals = filtered_buy
+            sell_signals = filtered_sell
+
+        logger.info(f"[SysM] Scan complete: {len(results)} coins, "
+                    f"BUY: {len(buy_signals)}, SELL: {len(sell_signals)}")
+
+        # Log scan summary
+        self._log_m_decision(
+            "—", "TARAMA", "ÖZET",
+            f"{len(results)} coin tarandı | BUY: {len(buy_signals)} | SELL: {len(sell_signals)}")
+
+        # 4. Execute trades
+        self._do_trading_system_m(buy_signals, sell_signals)
+
+        # 6. Wait for next scan
+        interval = sm_cfg.get("scan_interval_seconds", 300)
+        self._wait(interval)
+
+    def _do_trading_system_m(self, buy_signals: list, sell_signals: list) -> None:
+        """System M trade execution — modlara göre BUY/SELL işle."""
+        sm_cfg = self._config.get("system_m", {})
+        short_enabled = sm_cfg.get("short_enabled", False)
+        reverse_enabled = sm_cfg.get("reverse_enabled", False)
+        pos_cfg = sm_cfg.get("position", {})
+        max_pos = pos_cfg.get("max_positions", 12)
+
+        held = self._position_mgr.get_all_positions()
+        held_m = {sym: pos for sym, pos in held.items()
+                  if pos.entry_mode == "SYSTEM_M"}
+
+        # ── BÖLGE UYUMSUZLUĞU: kaçırılmış sinyal tespiti ──
+        # Restart/kopukluk sırasında kaçırılan sinyaller nedeniyle
+        # pozisyon yanlış bölgede kalabilir. Tespit et ve düzelt.
+        all_results = self._last_system_m_results or []
+        result_map = {r.symbol: r for r in all_results}
+
+        for sym, pos in list(held_m.items()):
+            scan_r = result_map.get(sym)
+            if not scan_r:
+                continue
+
+            is_long = pos.side == OrderSide.BUY_LONG
+            # Doğrudan AT karşılaştırması (trend_color fallback'i flat trend'de
+            # yanlış pozitif üretebilir). at_now == at_2 → ikisi de False → aksiyon yok.
+            in_short_zone = scan_r.alpha_trend < scan_r.alpha_trend_2
+            in_long_zone = scan_r.alpha_trend > scan_r.alpha_trend_2
+
+            # LONG pozisyon SHORT bölgesinde — kaçırılmış SELL sinyali
+            if is_long and in_short_zone:
+                logger.warning(f"[SysM ZONE] {sym}: LONG pozisyon SHORT bölgesinde — "
+                               f"kaçırılmış SELL sinyali (AT={scan_r.alpha_trend:.6f} "
+                               f"< AT[2]={scan_r.alpha_trend_2:.6f})")
+                if reverse_enabled and short_enabled:
+                    ok = self._do_reverse_system_m(sym, pos, scan_r, "SHORT")
+                    self._log_m_decision(sym, "SELL", "ZONE_REVERSE→SHORT" if ok else "ZONE_REVERSE_BAŞARISIZ",
+                                         f"LONG→SHORT (kaçırılmış sinyal)", scan_r.price)
+                else:
+                    ok = self._do_close_system_m(sym, pos, "ZONE_MISMATCH_SELL")
+                    self._log_m_decision(sym, "SELL", "ZONE_KAPAT" if ok else "ZONE_KAPAT_BAŞARISIZ",
+                                         f"LONG kapatıldı (yanlış bölge)", scan_r.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items() if p.entry_mode == "SYSTEM_M"}
+
+            # SHORT pozisyon LONG bölgesinde — kaçırılmış BUY sinyali
+            elif not is_long and in_long_zone:
+                logger.warning(f"[SysM ZONE] {sym}: SHORT pozisyon LONG bölgesinde — "
+                               f"kaçırılmış BUY sinyali (AT={scan_r.alpha_trend:.6f} "
+                               f"> AT[2]={scan_r.alpha_trend_2:.6f})")
+                if reverse_enabled and short_enabled:
+                    ok = self._do_reverse_system_m(sym, pos, scan_r, "LONG")
+                    self._log_m_decision(sym, "BUY", "ZONE_REVERSE→LONG" if ok else "ZONE_REVERSE_BAŞARISIZ",
+                                         f"SHORT→LONG (kaçırılmış sinyal)", scan_r.price)
+                elif short_enabled:
+                    ok = self._do_close_system_m(sym, pos, "ZONE_MISMATCH_BUY")
+                    self._log_m_decision(sym, "BUY", "ZONE_KAPAT" if ok else "ZONE_KAPAT_BAŞARISIZ",
+                                         f"SHORT kapatıldı (yanlış bölge)", scan_r.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items() if p.entry_mode == "SYSTEM_M"}
+
+        # ── SELL sinyallerini işle (önce çıkış) ──
+        for sig in sell_signals:
+            sym = sig.symbol
+            pos = held_m.get(sym)
+
+            if not pos:
+                if short_enabled:
+                    current_count = self._position_mgr.position_count
+                    if current_count < max_pos:
+                        ok = self._do_open_system_m(sig, "SHORT")
+                        self._log_m_decision(sym, "SELL", "SHORT_AÇ" if ok else "SHORT_BAŞARISIZ",
+                                             f"poz yok, short açılıyor", sig.price)
+                        held = self._position_mgr.get_all_positions()
+                        held_m = {s: p for s, p in held.items()
+                                  if p.entry_mode == "SYSTEM_M"}
+                    else:
+                        self._log_m_decision(sym, "SELL", "ATLA",
+                                             f"max pozisyon dolu ({current_count}/{max_pos})", sig.price)
+                else:
+                    self._log_m_decision(sym, "SELL", "ATLA",
+                                         "short kapalı, pozisyon yok", sig.price)
+                continue
+
+            if pos.side == OrderSide.BUY_LONG:
+                if reverse_enabled and short_enabled:
+                    ok = self._do_reverse_system_m(sym, pos, sig, "SHORT")
+                    self._log_m_decision(sym, "SELL", "REVERSE→SHORT" if ok else "REVERSE_BAŞARISIZ",
+                                         "LONG→SHORT çeviriliyor", sig.price)
+                else:
+                    ok = self._do_close_system_m(sym, pos, "SELL_SIGNAL")
+                    self._log_m_decision(sym, "SELL", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
+                                         "LONG pozisyon kapatılıyor", sig.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items()
+                          if p.entry_mode == "SYSTEM_M"}
+
+        # ── BUY sinyallerini işle ──
+        for sig in buy_signals:
+            sym = sig.symbol
+            pos = held_m.get(sym)
+
+            if not pos:
+                current_count = self._position_mgr.position_count
+                if current_count >= max_pos:
+                    self._log_m_decision(sym, "BUY", "ATLA",
+                                         f"max pozisyon dolu ({current_count}/{max_pos})", sig.price)
+                    continue
+                ok = self._do_open_system_m(sig, "LONG")
+                self._log_m_decision(sym, "BUY", "LONG_AÇ" if ok else "LONG_BAŞARISIZ",
+                                     "yeni LONG açılıyor", sig.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items()
+                          if p.entry_mode == "SYSTEM_M"}
+                continue
+
+            if pos.side == OrderSide.SELL_SHORT:
+                if reverse_enabled and short_enabled:
+                    ok = self._do_reverse_system_m(sym, pos, sig, "LONG")
+                    self._log_m_decision(sym, "BUY", "REVERSE→LONG" if ok else "REVERSE_BAŞARISIZ",
+                                         "SHORT→LONG çeviriliyor", sig.price)
+                elif short_enabled:
+                    ok = self._do_close_system_m(sym, pos, "BUY_SIGNAL")
+                    self._log_m_decision(sym, "BUY", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
+                                         "SHORT pozisyon kapatılıyor", sig.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items()
+                          if p.entry_mode == "SYSTEM_M"}
+
+    def _do_open_system_m(self, sig, direction: str) -> bool:
+        """System M pozisyon aç (LONG veya SHORT)."""
+        sm_cfg = self._config.get("system_m", {})
+        pos_cfg = sm_cfg.get("position", {})
+        symbol = sig.symbol
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        order_side = "BUY" if direction == "LONG" else "SELL"
+
+        price = sig.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # Leverage
+        trading_mode = sm_cfg.get("trading_mode", "spot")
+        if trading_mode == "spot" or (not sm_cfg.get("short_enabled", False) and direction == "SHORT"):
+            leverage = 1
+        else:
+            leverage = sm_cfg.get("leverage", 1)
+            max_lev = sm_cfg.get("max_leverage", 20)
+            leverage = min(leverage, max_lev)
+
+        # Önceki sistemlerden kalan orphan emirleri temizle (SL/TP/trailing)
+        try:
+            self._rest.cancel_all_orders(symbol)
+        except Exception:
+            pass
+
+        # HER ZAMAN Binance'te leverage set et (onceki ayar farkli olabilir)
+        try:
+            self._rest.set_margin_type(symbol, "ISOLATED")
+        except Exception as e:
+            if "-4046" not in str(e):
+                logger.warning(f"[SysM] {symbol} set_margin_type failed: {e}")
+        try:
+            self._rest.set_leverage(symbol, max(leverage, 1))
+        except Exception as e:
+            logger.warning(f"[SysM] {symbol} set_leverage({leverage}) failed: {e}")
+
+        # Position sizing
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            real_balance = self._order_executor.get_balance()
+
+        # Erken bakiye kontrolü: Binance min notional 5 USDT
+        min_required = 5.0 / max(leverage, 1)
+        if real_balance < min_required:
+            logger.debug(f"[SysM] {symbol}: bakiye yetersiz "
+                         f"(available={real_balance:.2f} < min_required={min_required:.2f}), skip")
+            return False
+
+        locked_margin = 0.0
+        with self._position_mgr._lock:
+            for p in self._position_mgr._positions.values():
+                locked_margin += p.margin_usdt
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 4.0)
+
+        scanner = self._system_m_scanner
+        margin_usdt = scanner.calculate_position_size(wallet)
+        margin_usdt = min(margin_usdt, real_balance * 0.90) if real_balance > 0 else margin_usdt
+        min_pos_usd = pos_cfg.get("min_position_usd", 1.0)
+        if margin_usdt < min_pos_usd:
+            logger.info(f"[SysM] {symbol}: margin {margin_usdt:.2f} < {min_pos_usd}, skip "
+                        f"(available={real_balance:.2f}, wallet={wallet:.2f})")
+            return False
+
+        # Qty
+        qty = margin_usdt * leverage / price if price > 0 else 0
+        if qty <= 0:
+            return False
+
+        pp, qp = 2, 3
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+                    qp = si.quantity_precision
+            except Exception:
+                pass
+
+        qty = round(qty, qp)
+        if qty <= 0:
+            return False
+
+        notional = qty * price
+        if notional < 5.0:
+            qty = round(5.5 / price, qp)
+            notional = qty * price
+            margin_usdt = qty * price / leverage
+
+        # Son kontrol: gerçek bakiyeyi aşma
+        required_margin = notional / max(leverage, 1)
+        if required_margin > real_balance * 0.90:
+            logger.info(f"[SysM] {symbol}: margin yetersiz "
+                        f"(gerekli={required_margin:.2f} > available={real_balance * 0.90:.2f}), skip")
+            return False
+
+        # Market order
+        try:
+            result = self._rest.place_order(
+                symbol=symbol, side=order_side,
+                order_type="MARKET",
+                quantity=qty,
+            )
+            fill_price = float(result.get("avgPrice", price))
+            logger.info(f"[SysM MARKET] {symbol} {direction} @ {fill_price} "
+                        f"qty={qty} lev={leverage}x")
+
+            pos = self._position_mgr.open_position(
+                symbol=symbol, side=side, price=fill_price,
+                size=qty, atr=sig.atr, leverage=leverage,
+                margin_usdt=margin_usdt,
+                timeframe=sm_cfg.get("timeframe", "5m"),
+                entry_score=0, entry_mode="SYSTEM_M",
+                initial_sl_override=0, initial_tp_override=0,
+            )
+
+            if not pos:
+                logger.error(f"[SysM] Failed to open position for {symbol}")
+                return False
+
+            # Hemen state kaydet (crash koruması)
+            try:
+                self._position_mgr.save_state()
+            except Exception:
+                pass
+
+            if self._order_logger:
+                self._order_logger.log_order(
+                    symbol=symbol, side=order_side, order_type="MARKET",
+                    price=fill_price, size=qty,
+                    notional_usdt=qty * fill_price,
+                    status="filled",
+                    trigger_source=f"system_m:{direction}",
+                )
+            return True
+
+        except Exception as e:
+            logger.error(f"[SysM MARKET] {symbol} {direction}: FAILED: {e} "
+                         f"(qty={qty}, notional={qty * price:.2f}, "
+                         f"available={real_balance:.2f})")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+    def _do_close_system_m(self, symbol: str, pos, reason: str) -> bool:
+        """System M pozisyon kapat."""
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        try:
+            try:
+                self._rest.cancel_all_orders(symbol)
+            except Exception:
+                pass
+
+            result = self._rest.place_order(
+                symbol=symbol, side=close_side,
+                order_type="MARKET",
+                quantity=pos.size,
+                reduce_only=True,
+            )
+            exit_price = float(result.get("avgPrice", pos.entry_price))
+            logger.info(f"[SysM CLOSE] {symbol} {reason} @ {exit_price}")
+
+            trade = self._position_mgr.close_position(symbol, exit_price, reason)
+
+            # Hemen state kaydet (crash koruması)
+            try:
+                self._position_mgr.save_state()
+            except Exception:
+                pass
+
+            if self._order_logger and trade:
+                from datetime import datetime as dt
+                entry_t = trade.get("entry_time", 0)
+                open_time = dt.fromtimestamp(entry_t).isoformat() if entry_t else ""
+                fee_pct = self._config.get("strategy.fee_pct", 0.10) / 100.0
+                fee_usdt = trade.get("notional_usdt", 0) * fee_pct
+                self._order_logger.log_trade(
+                    open_time=open_time,
+                    close_time=dt.now().isoformat(),
+                    symbol=symbol,
+                    side=trade.get("side", ""),
+                    leverage=trade.get("leverage", 1),
+                    margin_usdt=trade.get("margin_usdt", 0),
+                    notional_usdt=trade.get("notional_usdt", 0),
+                    entry_price=trade.get("entry_price", 0),
+                    exit_price=exit_price,
+                    size=trade.get("size", 0),
+                    pnl_usdt=trade.get("pnl_usdt", 0),
+                    pnl_percent=trade.get("pnl_percent", 0),
+                    roi_percent=trade.get("roi_percent", 0),
+                    fee_usdt=fee_usdt,
+                    exit_reason=reason,
+                    hold_seconds=trade.get("hold_seconds", 0),
+                    highest_price=trade.get("highest_price", 0),
+                    lowest_price=trade.get("lowest_price", 0),
+                    initial_sl=trade.get("initial_sl", 0),
+                    initial_tp=trade.get("initial_tp", 0),
+                    atr_at_entry=trade.get("atr_at_entry", 0),
+                    timeframe=trade.get("timeframe", ""),
+                    entry_score=trade.get("entry_score", 0),
+                    entry_confluence=trade.get("entry_confluence", 0),
+                    entry_adx=trade.get("entry_adx", 0),
+                    entry_rsi=trade.get("entry_rsi", 0),
+                    entry_regime=trade.get("entry_regime", ""),
+                    entry_regime_confidence=trade.get("entry_regime_confidence", 0),
+                    entry_bb_width=trade.get("entry_bb_width", 0),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"[SysM CLOSE] {symbol}: FAILED: {e}")
+            return False
+
+    def _do_reverse_system_m(self, symbol: str, pos, sig,
+                              new_direction: str) -> bool:
+        """System M reverse: mevcut pozisyonu kapat + ters yönde aç.
+
+        Binance trick: pos.size + new_qty ile tek emirde reverse.
+        """
+        sm_cfg = self._config.get("system_m", {})
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        new_side = OrderSide.BUY_LONG if new_direction == "LONG" else OrderSide.SELL_SHORT
+
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            real_balance = self._order_executor.get_balance()
+        locked_margin = 0.0
+        with self._position_mgr._lock:
+            for p in self._position_mgr._positions.values():
+                locked_margin += p.margin_usdt
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 4.0)
+
+        scanner = self._system_m_scanner
+        new_margin = scanner.calculate_position_size(wallet)
+        new_margin = min(new_margin, real_balance * 0.90) if real_balance > 0 else new_margin
+
+        price = sig.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        leverage = sm_cfg.get("leverage", 1)
+        max_lev = sm_cfg.get("max_leverage", 20)
+        leverage = min(leverage, max_lev)
+        if sm_cfg.get("trading_mode", "spot") == "spot":
+            leverage = 1
+
+        new_qty = new_margin * leverage / price if price > 0 else 0
+
+        qp = 3
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    qp = si.quantity_precision
+            except Exception:
+                pass
+
+        new_qty = round(new_qty, qp)
+        if new_qty <= 0:
+            return self._do_close_system_m(symbol, pos, f"REVERSE_{new_direction}_FAIL")
+
+        new_notional = new_qty * price
+        if new_notional < 5.0:
+            new_qty = round(5.5 / price, qp)
+            new_notional = new_qty * price
+
+        # Reverse'te mevcut pos kapanıp margin serbest kalır ama yine de kontrol
+        freed_margin = pos.margin_usdt
+        available_after = real_balance + freed_margin
+        required_margin = new_notional / max(leverage, 1)
+        if required_margin > available_after * 0.90:
+            logger.warning(f"[SysM REVERSE] {symbol}: margin yetersiz "
+                           f"(gerekli={required_margin:.2f}, "
+                           f"available={real_balance:.2f}+freed={freed_margin:.2f}="
+                           f"{available_after:.2f}), sadece close yapılıyor")
+            return self._do_close_system_m(symbol, pos, f"REVERSE_{new_direction}_MARGIN")
+
+        reverse_qty = round(pos.size + new_qty, qp)
+
+        try:
+            try:
+                self._rest.cancel_all_orders(symbol)
+            except Exception:
+                pass
+
+            result = self._rest.place_order(
+                symbol=symbol, side=close_side,
+                order_type="MARKET",
+                quantity=reverse_qty,
+            )
+            fill_price = float(result.get("avgPrice", price))
+            logger.info(f"[SysM REVERSE] {symbol}: "
+                        f"{'LONG→SHORT' if new_direction == 'SHORT' else 'SHORT→LONG'} "
+                        f"@ {fill_price} reverse_qty={reverse_qty}")
+
+            trade = self._position_mgr.close_position(symbol, fill_price,
+                                                       f"REVERSE_{new_direction}")
+
+            if self._order_logger and trade:
+                from datetime import datetime as dt
+                entry_t = trade.get("entry_time", 0)
+                open_time = dt.fromtimestamp(entry_t).isoformat() if entry_t else ""
+                fee_pct = self._config.get("strategy.fee_pct", 0.10) / 100.0
+                fee_usdt = trade.get("notional_usdt", 0) * fee_pct
+                self._order_logger.log_trade(
+                    open_time=open_time,
+                    close_time=dt.now().isoformat(),
+                    symbol=symbol,
+                    side=trade.get("side", ""),
+                    leverage=trade.get("leverage", 1),
+                    margin_usdt=trade.get("margin_usdt", 0),
+                    notional_usdt=trade.get("notional_usdt", 0),
+                    entry_price=trade.get("entry_price", 0),
+                    exit_price=fill_price,
+                    size=trade.get("size", 0),
+                    pnl_usdt=trade.get("pnl_usdt", 0),
+                    pnl_percent=trade.get("pnl_percent", 0),
+                    roi_percent=trade.get("roi_percent", 0),
+                    fee_usdt=fee_usdt,
+                    exit_reason=f"REVERSE_{new_direction}",
+                    hold_seconds=trade.get("hold_seconds", 0),
+                    highest_price=trade.get("highest_price", 0),
+                    lowest_price=trade.get("lowest_price", 0),
+                    initial_sl=trade.get("initial_sl", 0),
+                    initial_tp=trade.get("initial_tp", 0),
+                    atr_at_entry=trade.get("atr_at_entry", 0),
+                    timeframe=trade.get("timeframe", ""),
+                    entry_score=trade.get("entry_score", 0),
+                    entry_confluence=trade.get("entry_confluence", 0),
+                    entry_adx=trade.get("entry_adx", 0),
+                    entry_rsi=trade.get("entry_rsi", 0),
+                    entry_regime=trade.get("entry_regime", ""),
+                    entry_regime_confidence=trade.get("entry_regime_confidence", 0),
+                    entry_bb_width=trade.get("entry_bb_width", 0),
+                )
+
+            new_pos = self._position_mgr.open_position(
+                symbol=symbol, side=new_side, price=fill_price,
+                size=new_qty, atr=sig.atr, leverage=leverage,
+                margin_usdt=new_margin,
+                timeframe=sm_cfg.get("timeframe", "5m"),
+                entry_score=0, entry_mode="SYSTEM_M",
+                initial_sl_override=0, initial_tp_override=0,
+            )
+
+            if not new_pos:
+                logger.error(f"[SysM REVERSE] {symbol}: new pos failed")
+
+            # Hemen state kaydet (crash koruması)
+            try:
+                self._position_mgr.save_state()
+            except Exception:
+                pass
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[SysM REVERSE] {symbol}: FAILED: {e} "
+                         f"(reverse_qty={reverse_qty}, "
+                         f"available={real_balance:.2f})")
+            return self._do_close_system_m(symbol, pos, f"REVERSE_{new_direction}_ERR")
+
+    def _check_held_positions_system_m(self) -> None:
+        """System M pozisyon kontrolü — sadece external close tespiti.
+        Sinyal bazlı çıkış _do_trading_system_m'de yapılır."""
+        self._detect_external_closes()
+
+
+    # ══════════════════════════════════════════════════════════════════��
+    #  SYSTEM N — AlphaTrend PRO v2 (System M kopya — gelistirme icin)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _do_scanning_system_n(self) -> None:
+        """System N: AlphaTrend PRO v2 — dinamik TF + G-bazlı kaldıraç."""
+
+        # Step 0: Check pending limits
+        if self._pending_limits:
+            self._check_pending_limits()
+
+        # Step A: Check held positions (external close detection)
+        if self._position_mgr.has_position:
+            self._check_held_positions_system_n()
+
+        self._scan_count += 1
+        self._system_n_scan_count += 1
+        sm_cfg = self._config.get("system_n", {})
+        pos_cfg = sm_cfg.get("position", {})
+        filter_cfg = sm_cfg.get("filters", {})
+        max_pos = pos_cfg.get("max_positions", 12)
+        self._position_mgr._max_positions = max_pos
+
+        logger.info(f"[SysN] Scan #{self._system_n_scan_count} starting... "
+                    f"[positions: {self._position_mgr.position_count}/{max_pos}]")
+
+        # Initialize scanner if needed
+        if self._system_n_scanner is None:
+            self._system_n_scanner = SystemNScanner(self._config)
+            # Reconstruct state from open SYSTEM_N positions (restart protection)
+            held = self._position_mgr.get_all_positions()
+            self._system_n_scanner.reconstruct_state_from_positions(held)
+
+        scanner = self._system_n_scanner
+        # Optimize cache'i yenile (24 saatten eskiyse)
+        scanner.reload_if_stale(max_age_hours=24.0)
+
+        default_tf = sm_cfg.get("timeframe", "5m")
+        kline_limit = sm_cfg.get("kline_limit", 300)
+
+        # 1. Symbol universe — optimize cache + hacim sıralı birleştir
+        coin_mode = sm_cfg.get("coin_mode", "top_n")
+        coin_list = sm_cfg.get("coin_list", [])
+        symbols = []
+
+        if coin_mode == "manual" and coin_list:
+            symbols = [s.strip().upper() for s in coin_list if s.strip()]
+
+        if not symbols:
+            coin_sayisi = sm_cfg.get("coin_sayisi", 50)
+            self._universe._top_n = coin_sayisi
+            self._universe._max_spikes = 0
+            min_vol = filter_cfg.get("min_volume_24h_usdt", 5_000_000)
+            self._universe._min_volume = min_vol
+            universe_syms = self._universe.refresh()
+
+            # Optimize cache'deki kârlı coinleri de ekle (universe'de olmasa bile)
+            optimized = set(scanner.get_optimized_symbols())
+            universe_set = set(universe_syms)
+            symbols = universe_syms + [s for s in optimized if s not in universe_set]
+
+        if not symbols:
+            logger.warning("[SysN] No symbols found")
+            self._wait(30)
+            return
+
+        opt_count = sum(1 for s in symbols if s in scanner._optimize_cache)
+        logger.info(f"[SysN] Universe: {len(symbols)} coins "
+                    f"({opt_count} optimized), default TF: {default_tf}")
+
+        # 2. Fetch klines and scan each symbol
+        results: list = []
+        buy_signals: list = []
+        sell_signals: list = []
+
+        min_vol_usdt = filter_cfg.get("min_volume_24h_usdt", 5_000_000)
+
+        for sym in symbols:
+            try:
+                # Coin başına optimal TF (optimize cache'den)
+                coin_params = scanner.get_coin_params(sym)
+                tf = coin_params["tf"]
+
+                # TF'ye göre volume check bar sayısı (kline_limit'i aşamaz)
+                tf_mins = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+                mins = tf_mins.get(tf, 5)
+                vol_check_bars_ideal = int(1440 / mins)  # 24h bar sayısı
+                vol_check_bars = min(max(vol_check_bars_ideal, 50), kline_limit)
+
+                klines_raw = self._rest.get_klines(sym, tf, limit=kline_limit)
+                # get_klines returns DataFrame — convert to list of lists
+                if isinstance(klines_raw, pd.DataFrame):
+                    if klines_raw.empty or len(klines_raw) < 50:
+                        self._log_n_decision(sym, "—", "VERİ_YOK",
+                                             f"kline < 50 bar ({tf})", 0)
+                        continue
+                    # quote_volume varsa kullan (doğru 24h hacim), yoksa volume ile devam
+                    if "quote_volume" in klines_raw.columns:
+                        klines = klines_raw[["open", "high", "low", "close", "volume", "quote_volume"]].values.tolist()
+                        klines = [[0, row[0], row[1], row[2], row[3], row[4], row[5]] for row in klines]
+                    else:
+                        klines = klines_raw[["open", "high", "low", "close", "volume"]].values.tolist()
+                        klines = [[0, row[0], row[1], row[2], row[3], row[4]] for row in klines]
+                else:
+                    if not klines_raw or len(klines_raw) < 50:
+                        self._log_n_decision(sym, "—", "VERİ_YOK",
+                                             f"kline < 50 bar ({tf})", 0)
+                        continue
+                    klines = klines_raw
+
+                # Volume kontrolü (kısmi veri varsa 24h'e ölçekle)
+                if min_vol_usdt > 0:
+                    actual_bars = min(vol_check_bars, len(klines))
+                    recent = klines[-actual_bars:]
+                    try:
+                        # quote_volume varsa doğrudan kullan (idx 6), yoksa volume×close tahmin
+                        has_quote_vol = len(recent[0]) > 6
+                        if has_quote_vol:
+                            vol_sum = sum(float(k[6]) for k in recent)
+                        else:
+                            vol_sum = sum(float(k[5]) * float(k[4]) for k in recent)
+                        # Kısmi veri varsa 24h'e oranla (1m 300 mum = 5 saat → ×4.8)
+                        if actual_bars < vol_check_bars_ideal:
+                            vol_sum = vol_sum * (vol_check_bars_ideal / actual_bars)
+                    except (IndexError, ValueError):
+                        vol_sum = 0
+                    if vol_sum < min_vol_usdt:
+                        self._log_n_decision(
+                            sym, "—", "SİNYAL_YOK",
+                            f"düşük hacim: ~${vol_sum/1e6:.1f}M < ${min_vol_usdt/1e6:.0f}M eşik",
+                            0)
+                        continue
+
+                result = scanner.analyze_symbol(sym, klines)
+                results.append(result)
+
+                if result.eligible:
+                    if result.signal == "BUY":
+                        buy_signals.append(result)
+                    elif result.signal == "SELL":
+                        sell_signals.append(result)
+                else:
+                    # Neden sinyal yok — filtre detayları
+                    reasons = []
+                    if not result.adx_static_ok:
+                        reasons.append(f"ADX({result.adx:.1f})<eşik")
+                    if not result.adx_dynamic_ok:
+                        reasons.append("ADX_dyn✗")
+                    if not result.slope_ok:
+                        reasons.append("slope✗")
+                    if result.reject_reason and result.reject_reason != "no_signal":
+                        reasons.append(result.reject_reason)
+                    if not reasons:
+                        reasons.append("crossover yok")
+                    trend = "▲" if result.trend_color == "green" else "▼"
+                    self._log_n_decision(
+                        sym, "—", "SİNYAL_YOK",
+                        f"{trend} ADX:{result.adx:.1f} RSI:{result.rsi:.0f} | {', '.join(reasons)}",
+                        result.price)
+
+            except Exception as e:
+                logger.debug(f"[SysN] {sym}: scan error: {e}")
+                self._log_n_decision(sym, "—", "HATA", str(e)[:80], 0)
+
+        # 3. Store results for GUI
+        self._last_system_n_results = results
+
+        # 3b. Funding Rate filtresi (sadece futures modda — spot'ta FR yok)
+        trading_mode = sm_cfg.get("trading_mode", "spot")
+        fr_max = filter_cfg.get("funding_rate_max", 0.001)
+
+        if trading_mode != "spot" and fr_max > 0 and (buy_signals or sell_signals):
+            # Batch API: tek çağrıda tüm coinlerin FR'sini çek
+            fr_symbols = list({s.symbol for s in buy_signals + sell_signals})
+            fr_ctx = self._fetch_funding_rates(fr_symbols)
+
+            filtered_buy = []
+            for sig in buy_signals:
+                fr = fr_ctx.get(sig.symbol, {}).get("funding_rate", 0.0)
+                if fr > fr_max:
+                    # Aşırı pozitif FR → long kalabalık, long girme
+                    self._log_n_decision(
+                        sig.symbol, "BUY", "ATLA",
+                        f"FR filtresi: FR={fr*100:+.4f}% > +{fr_max*100:.2f}% "
+                        f"(kalabalık long, contrarian red)",
+                        sig.price)
+                else:
+                    filtered_buy.append(sig)
+
+            filtered_sell = []
+            for sig in sell_signals:
+                fr = fr_ctx.get(sig.symbol, {}).get("funding_rate", 0.0)
+                if fr < -fr_max:
+                    # Aşırı negatif FR → short kalabalık, short girme
+                    self._log_n_decision(
+                        sig.symbol, "SELL", "ATLA",
+                        f"FR filtresi: FR={fr*100:+.4f}% < -{fr_max*100:.2f}% "
+                        f"(kalabalık short, contrarian red)",
+                        sig.price)
+                else:
+                    filtered_sell.append(sig)
+
+            fr_rejected = (len(buy_signals) - len(filtered_buy) +
+                           len(sell_signals) - len(filtered_sell))
+            if fr_rejected > 0:
+                logger.info(f"[SysN] FR filtresi: {fr_rejected} sinyal reddedildi "
+                            f"(eşik: ±{fr_max*100:.2f}%)")
+            buy_signals = filtered_buy
+            sell_signals = filtered_sell
+
+        logger.info(f"[SysN] Scan complete: {len(results)} coins, "
+                    f"BUY: {len(buy_signals)}, SELL: {len(sell_signals)}")
+
+        # Log scan summary
+        self._log_n_decision(
+            "—", "TARAMA", "ÖZET",
+            f"{len(results)} coin tarandı | BUY: {len(buy_signals)} | SELL: {len(sell_signals)}")
+
+        # 4. Execute trades
+        self._do_trading_system_n(buy_signals, sell_signals)
+
+        # 6. Wait for next scan
+        interval = sm_cfg.get("scan_interval_seconds", 300)
+        self._wait(interval)
+
+    def _do_trading_system_n(self, buy_signals: list, sell_signals: list) -> None:
+        """System N trade execution — modlara göre BUY/SELL işle."""
+        sm_cfg = self._config.get("system_n", {})
+        short_enabled = sm_cfg.get("short_enabled", False)
+        reverse_enabled = sm_cfg.get("reverse_enabled", False)
+        pos_cfg = sm_cfg.get("position", {})
+        max_pos = pos_cfg.get("max_positions", 12)
+
+        held = self._position_mgr.get_all_positions()
+        held_m = {sym: pos for sym, pos in held.items()
+                  if pos.entry_mode == "SYSTEM_N"}
+
+        # ── BÖLGE UYUMSUZLUĞU: kaçırılmış sinyal tespiti ──
+        # Restart/kopukluk sırasında kaçırılan sinyaller nedeniyle
+        # pozisyon yanlış bölgede kalabilir. Tespit et ve düzelt.
+        # İlk taramada zone check atla — reconstruct sonrası yanlış
+        # algılama riski (trend direction henüz oturmamış olabilir)
+        all_results = self._last_system_n_results or []
+        result_map = {r.symbol: r for r in all_results}
+        _zone_check_skip = self._system_n_scan_count <= 1
+
+        for sym, pos in list(held_m.items()):
+            if _zone_check_skip:
+                break  # İlk taramada zone kontrolü atla
+            scan_r = result_map.get(sym)
+            if not scan_r:
+                continue
+
+            is_long = pos.side == OrderSide.BUY_LONG
+            # Doğrudan AT karşılaştırması (trend_color fallback'i flat trend'de
+            # yanlış pozitif üretebilir). at_now == at_2 → ikisi de False → aksiyon yok.
+            in_short_zone = scan_r.alpha_trend < scan_r.alpha_trend_2
+            in_long_zone = scan_r.alpha_trend > scan_r.alpha_trend_2
+
+            # LONG pozisyon SHORT bölgesinde — kaçırılmış SELL sinyali
+            if is_long and in_short_zone:
+                logger.warning(f"[SysN ZONE] {sym}: LONG pozisyon SHORT bölgesinde — "
+                               f"kaçırılmış SELL sinyali (AT={scan_r.alpha_trend:.6f} "
+                               f"< AT[2]={scan_r.alpha_trend_2:.6f})")
+                if reverse_enabled and short_enabled:
+                    ok = self._do_reverse_system_n(sym, pos, scan_r, "SHORT")
+                    self._log_n_decision(sym, "SELL", "ZONE_REVERSE→SHORT" if ok else "ZONE_REVERSE_BAŞARISIZ",
+                                         f"LONG→SHORT (kaçırılmış sinyal)", scan_r.price)
+                else:
+                    ok = self._do_close_system_n(sym, pos, "ZONE_MISMATCH_SELL")
+                    self._log_n_decision(sym, "SELL", "ZONE_KAPAT" if ok else "ZONE_KAPAT_BAŞARISIZ",
+                                         f"LONG kapatıldı (yanlış bölge)", scan_r.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items() if p.entry_mode == "SYSTEM_N"}
+
+            # SHORT pozisyon LONG bölgesinde — kaçırılmış BUY sinyali
+            elif not is_long and in_long_zone:
+                logger.warning(f"[SysN ZONE] {sym}: SHORT pozisyon LONG bölgesinde — "
+                               f"kaçırılmış BUY sinyali (AT={scan_r.alpha_trend:.6f} "
+                               f"> AT[2]={scan_r.alpha_trend_2:.6f})")
+                if reverse_enabled and short_enabled:
+                    ok = self._do_reverse_system_n(sym, pos, scan_r, "LONG")
+                    self._log_n_decision(sym, "BUY", "ZONE_REVERSE→LONG" if ok else "ZONE_REVERSE_BAŞARISIZ",
+                                         f"SHORT→LONG (kaçırılmış sinyal)", scan_r.price)
+                elif short_enabled:
+                    ok = self._do_close_system_n(sym, pos, "ZONE_MISMATCH_BUY")
+                    self._log_n_decision(sym, "BUY", "ZONE_KAPAT" if ok else "ZONE_KAPAT_BAŞARISIZ",
+                                         f"SHORT kapatıldı (yanlış bölge)", scan_r.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items() if p.entry_mode == "SYSTEM_N"}
+
+        # ── Yön limitleri ──
+        max_same_dir = pos_cfg.get("max_same_direction", 8)
+        dir_balance_on = pos_cfg.get("direction_balance_enabled", False)
+        dir_ratio_str = pos_cfg.get("direction_balance_ratio", "2-1")
+
+        def _count_directions() -> tuple[int, int]:
+            """Held System N pozisyonlarındaki LONG ve SHORT sayısı."""
+            longs = sum(1 for p in held_m.values() if p.side == OrderSide.BUY_LONG)
+            shorts = sum(1 for p in held_m.values() if p.side == OrderSide.SELL_SHORT)
+            return longs, shorts
+
+        def _direction_allowed(direction: str) -> tuple[bool, str]:
+            """Yön limitlerine göre yeni pozisyona izin var mı."""
+            longs, shorts = _count_directions()
+            count = longs if direction == "LONG" else shorts
+            if count >= max_same_dir:
+                return False, f"max aynı yön ({count}/{max_same_dir})"
+            if dir_balance_on:
+                try:
+                    parts = dir_ratio_str.split("-")
+                    majority_r, minority_r = int(parts[0]), int(parts[1])
+                except (ValueError, IndexError):
+                    majority_r, minority_r = 2, 1
+                majority = max(longs, shorts)
+                minority = min(longs, shorts)
+                new_majority = (longs + 1 if direction == "LONG" and longs >= shorts
+                                else shorts + 1 if direction == "SHORT" and shorts >= longs
+                                else majority)
+                limit = majority_r * (minority // minority_r + 1)
+                if new_majority > limit:
+                    return False, f"yön dengesi aşıldı ({longs}L/{shorts}S, oran {dir_ratio_str})"
+            return True, ""
+
+        # ── SELL sinyallerini işle (önce çıkış) ──
+        for sig in sell_signals:
+            sym = sig.symbol
+            pos = held_m.get(sym)
+
+            if not pos:
+                if short_enabled:
+                    current_count = len(held_m)
+                    if current_count >= max_pos:
+                        self._log_n_decision(sym, "SELL", "ATLA",
+                                             f"max pozisyon dolu ({current_count}/{max_pos})", sig.price)
+                    else:
+                        allowed, reason = _direction_allowed("SHORT")
+                        if not allowed:
+                            self._log_n_decision(sym, "SELL", "ATLA", reason, sig.price)
+                        else:
+                            ok = self._do_open_system_n(sig, "SHORT")
+                            self._log_n_decision(sym, "SELL", "SHORT_AÇ" if ok else "SHORT_BAŞARISIZ",
+                                                 f"poz yok, short açılıyor", sig.price)
+                            held = self._position_mgr.get_all_positions()
+                            held_m = {s: p for s, p in held.items()
+                                      if p.entry_mode == "SYSTEM_N"}
+                else:
+                    self._log_n_decision(sym, "SELL", "ATLA",
+                                         "short kapalı, pozisyon yok", sig.price)
+                continue
+
+            if pos.side == OrderSide.BUY_LONG:
+                if reverse_enabled and short_enabled:
+                    ok = self._do_reverse_system_n(sym, pos, sig, "SHORT")
+                    self._log_n_decision(sym, "SELL", "REVERSE→SHORT" if ok else "REVERSE_BAŞARISIZ",
+                                         "LONG→SHORT çeviriliyor", sig.price)
+                else:
+                    ok = self._do_close_system_n(sym, pos, "SELL_SIGNAL")
+                    self._log_n_decision(sym, "SELL", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
+                                         "LONG pozisyon kapatılıyor", sig.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items()
+                          if p.entry_mode == "SYSTEM_N"}
+
+        # ── BUY sinyallerini işle ──
+        for sig in buy_signals:
+            sym = sig.symbol
+            pos = held_m.get(sym)
+
+            if not pos:
+                current_count = len(held_m)
+                if current_count >= max_pos:
+                    self._log_n_decision(sym, "BUY", "ATLA",
+                                         f"max pozisyon dolu ({current_count}/{max_pos})", sig.price)
+                    continue
+                allowed, reason = _direction_allowed("LONG")
+                if not allowed:
+                    self._log_n_decision(sym, "BUY", "ATLA", reason, sig.price)
+                    continue
+                ok = self._do_open_system_n(sig, "LONG")
+                self._log_n_decision(sym, "BUY", "LONG_AÇ" if ok else "LONG_BAŞARISIZ",
+                                     "yeni LONG açılıyor", sig.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items()
+                          if p.entry_mode == "SYSTEM_N"}
+                continue
+
+            if pos.side == OrderSide.SELL_SHORT:
+                if reverse_enabled and short_enabled:
+                    ok = self._do_reverse_system_n(sym, pos, sig, "LONG")
+                    self._log_n_decision(sym, "BUY", "REVERSE→LONG" if ok else "REVERSE_BAŞARISIZ",
+                                         "SHORT→LONG çeviriliyor", sig.price)
+                elif short_enabled:
+                    ok = self._do_close_system_n(sym, pos, "BUY_SIGNAL")
+                    self._log_n_decision(sym, "BUY", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
+                                         "SHORT pozisyon kapatılıyor", sig.price)
+                held = self._position_mgr.get_all_positions()
+                held_m = {s: p for s, p in held.items()
+                          if p.entry_mode == "SYSTEM_N"}
+
+    def _do_open_system_n(self, sig, direction: str) -> bool:
+        """System N pozisyon aç — G-bazlı dinamik kaldıraç."""
+        sm_cfg = self._config.get("system_n", {})
+        pos_cfg = sm_cfg.get("position", {})
+        symbol = sig.symbol
+        side = OrderSide.BUY_LONG if direction == "LONG" else OrderSide.SELL_SHORT
+        order_side = "BUY" if direction == "LONG" else "SELL"
+
+        price = sig.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # Spot modda short açılamaz — erken çıkış
+        trading_mode = sm_cfg.get("trading_mode", "spot")
+        if trading_mode == "spot" and direction == "SHORT":
+            logger.debug(f"[SysN] {symbol}: spot modda SHORT açılamaz, skip")
+            return False
+
+        # Başka sistemin pozisyonu varsa açma (SL/TP emirleri silinir)
+        other_pos = self._position_mgr.get_position(symbol)
+        if other_pos and other_pos.entry_mode != "SYSTEM_N":
+            logger.warning(f"[SysN] {symbol}: başka sistem pozisyonu var "
+                           f"({other_pos.entry_mode}), açma atlanıyor")
+            return False
+
+        # G-bazlı dinamik kaldıraç (optimize cache'den)
+        if trading_mode == "spot":
+            leverage = 1
+        else:
+            scanner = self._system_n_scanner
+            coin_params = scanner.get_coin_params(symbol) if scanner else {}
+            g_leverage = coin_params.get("max_leverage", 1)
+            max_lev = sm_cfg.get("max_leverage", 125)
+            leverage = max(1, min(g_leverage, max_lev))
+            logger.info(f"[SysN] {symbol}: G-bazlı kaldıraç={leverage}x "
+                        f"(G={coin_params.get('G', 0):.3f}%, "
+                        f"TF={coin_params.get('tf', '?')}, "
+                        f"WR={coin_params.get('wr', 0):.0f}%)")
+
+        # Orphan emirleri temizle (bu sembolde sadece System N pozisyonu olabilir)
+        try:
+            self._rest.cancel_all_orders(symbol)
+        except Exception:
+            pass
+
+        # HER ZAMAN Binance'te leverage set et (onceki ayar farkli olabilir)
+        try:
+            self._rest.set_margin_type(symbol, "ISOLATED")
+        except Exception as e:
+            if "-4046" not in str(e):
+                logger.warning(f"[SysN] {symbol} set_margin_type failed: {e}")
+        try:
+            self._rest.set_leverage(symbol, max(leverage, 1))
+        except Exception as e:
+            logger.warning(f"[SysN] {symbol} set_leverage({leverage}) failed: {e}")
+
+        # Position sizing
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            real_balance = self._order_executor.get_balance()
+
+        # Erken bakiye kontrolü: Binance min notional 5 USDT + buffer
+        notional_buffer_pct = pos_cfg.get("min_notional_buffer_pct", 20)
+        min_notional = 5.0 * (1 + notional_buffer_pct / 100.0)
+        min_required = min_notional / max(leverage, 1)
+        if real_balance < min_required:
+            logger.debug(f"[SysN] {symbol}: bakiye yetersiz "
+                         f"(available={real_balance:.2f} < min_required={min_required:.2f} "
+                         f"[notional={min_notional:.1f}]), skip")
+            return False
+
+        locked_margin = self._position_mgr.get_total_locked_margin()
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 4.0)
+
+        scanner = self._system_n_scanner
+        margin_usdt = scanner.calculate_position_size(wallet, leverage)
+        margin_usdt = min(margin_usdt, real_balance * 0.90) if real_balance > 0 else margin_usdt
+        min_pos_usd = pos_cfg.get("min_position_usd", 1.0)
+        if margin_usdt < min_pos_usd:
+            logger.info(f"[SysN] {symbol}: margin {margin_usdt:.2f} < {min_pos_usd}, skip "
+                        f"(available={real_balance:.2f}, wallet={wallet:.2f})")
+            return False
+
+        # Qty
+        qty = margin_usdt * leverage / price if price > 0 else 0
+        if qty <= 0:
+            return False
+
+        pp, qp = 2, 3
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    pp = si.price_precision
+                    qp = si.quantity_precision
+            except Exception:
+                pass
+
+        qty = round(qty, qp)
+        if qty <= 0:
+            return False
+
+        # Min notional kontrolü: Binance 5 USDT + buffer%
+        notional = qty * price
+        if notional < min_notional:
+            qty = round((min_notional * 1.02) / price, qp)  # +%2 yuvarlama payı
+            notional = qty * price
+            margin_usdt = notional / leverage
+
+        # Son kontrol: gerçek bakiyeyi aşma
+        required_margin = notional / max(leverage, 1)
+        if required_margin > real_balance * 0.90:
+            logger.info(f"[SysN] {symbol}: margin yetersiz "
+                        f"(gerekli={required_margin:.2f} > available={real_balance * 0.90:.2f}), skip")
+            return False
+
+        # Market order
+        try:
+            result = self._rest.place_order(
+                symbol=symbol, side=order_side,
+                order_type="MARKET",
+                quantity=qty,
+            )
+            fill_price = float(result.get("avgPrice", price))
+            logger.info(f"[SysN MARKET] {symbol} {direction} @ {fill_price} "
+                        f"qty={qty} lev={leverage}x")
+
+            pos = self._position_mgr.open_position(
+                symbol=symbol, side=side, price=fill_price,
+                size=qty, atr=sig.atr, leverage=leverage,
+                margin_usdt=margin_usdt,
+                timeframe=sm_cfg.get("timeframe", "5m"),
+                entry_score=0, entry_mode="SYSTEM_N",
+                initial_sl_override=0, initial_tp_override=0,
+            )
+
+            if not pos:
+                logger.error(f"[SysN] Failed to open position for {symbol}")
+                return False
+
+            # Opsiyonel SL yerleştir
+            self._place_sl_system_n(symbol, pos, sig, leverage, pp)
+
+            # Hemen state kaydet (crash koruması)
+            try:
+                self._position_mgr.save_state()
+            except Exception:
+                pass
+
+            if self._order_logger:
+                self._order_logger.log_order(
+                    symbol=symbol, side=order_side, order_type="MARKET",
+                    price=fill_price, size=qty,
+                    notional_usdt=qty * fill_price,
+                    status="filled",
+                    trigger_source=f"system_n:{direction}",
+                )
+            return True
+
+        except Exception as e:
+            logger.error(f"[SysN MARKET] {symbol} {direction}: FAILED: {e} "
+                         f"(qty={qty}, notional={qty * price:.2f}, "
+                         f"available={real_balance:.2f})")
+            self._failed_symbols[symbol] = time.time()
+            return False
+
+    def _place_sl_system_n(self, symbol: str, pos, sig, leverage: int,
+                            price_precision: int = 2) -> None:
+        """System N opsiyonel SL yerleştirme (config: system_n.sl).
+
+        Modlar:
+            g_based:   G × sl_g_mult + fee → SL%
+            atr_based: ATR × sl_atr_mult / fiyat → SL%
+            fixed_pct: sabit yüzde
+        """
+        sl_cfg = self._config.get("system_n.sl", {})
+        if not sl_cfg.get("enabled", False):
+            return
+
+        mode = sl_cfg.get("mode", "g_based")
+        entry_price = pos.entry_price
+        if entry_price <= 0:
+            return
+
+        sl_pct = 0.0
+
+        if mode == "g_based":
+            scanner = self._system_n_scanner
+            coin_params = scanner.get_coin_params(symbol) if scanner else {}
+            cached_sl = coin_params.get("sl_pct", 0)
+            if cached_sl > 0:
+                sl_pct = cached_sl
+            else:
+                G = coin_params.get("G", 0)
+                g_mult = sl_cfg.get("g_mult", 1.5)
+                fee = sl_cfg.get("fee_total_pct", 0.12)
+                sl_pct = G * g_mult + fee
+        elif mode == "atr_based":
+            atr_mult = sl_cfg.get("atr_mult", 2.0)
+            atr = getattr(sig, "atr", 0) or 0
+            if atr > 0:
+                sl_pct = (atr / entry_price * 100) * atr_mult
+        elif mode == "fixed_pct":
+            sl_pct = sl_cfg.get("fixed_pct", 5.0)
+
+        if sl_pct <= 0:
+            logger.warning(f"[SysN SL] {symbol}: SL hesaplanamadı (mod={mode}, sl_pct=0)")
+            return
+
+        # SL fiyat hesapla
+        pp = price_precision
+        is_long = pos.side == OrderSide.BUY_LONG
+        if is_long:
+            sl_price = round(entry_price * (1 - sl_pct / 100), pp)
+        else:
+            sl_price = round(entry_price * (1 + sl_pct / 100), pp)
+
+        if sl_price <= 0:
+            return
+
+        # Server-side SL gönder
+        if sl_cfg.get("server_side", True):
+            close_side = "SELL" if is_long else "BUY"
+            try:
+                self._rest.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="STOP_MARKET",
+                    quantity=pos.size,
+                    stop_price=sl_price,
+                    reduce_only=True,
+                )
+                logger.info(f"[SysN SL] {symbol}: {mode} SL @ {sl_price} "
+                            f"(SL%={sl_pct:.3f}%, lev={leverage}x, "
+                            f"ROI%={sl_pct * leverage:.1f}%)")
+            except Exception as e:
+                logger.error(f"[SysN SL] {symbol}: SL placement FAILED: {e}")
+
+        # Position'a SL kaydet (software yedek için)
+        self._position_mgr.update_stop_loss(symbol, sl_price)
+
+    def _do_close_system_n(self, symbol: str, pos, reason: str) -> bool:
+        """System N pozisyon kapat."""
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        try:
+            try:
+                self._rest.cancel_all_orders(symbol)
+            except Exception:
+                pass
+
+            result = self._rest.place_order(
+                symbol=symbol, side=close_side,
+                order_type="MARKET",
+                quantity=pos.size,
+                reduce_only=True,
+            )
+            exit_price = float(result.get("avgPrice", pos.entry_price))
+            logger.info(f"[SysN CLOSE] {symbol} {reason} @ {exit_price}")
+
+            trade = self._position_mgr.close_position(symbol, exit_price, reason)
+
+            # Hemen state kaydet (crash koruması)
+            try:
+                self._position_mgr.save_state()
+            except Exception:
+                pass
+
+            if self._order_logger and trade:
+                from datetime import datetime as dt
+                entry_t = trade.get("entry_time", 0)
+                open_time = dt.fromtimestamp(entry_t).isoformat() if entry_t else ""
+                fee_pct = self._config.get("strategy.fee_pct", 0.10) / 100.0
+                fee_usdt = trade.get("notional_usdt", 0) * fee_pct
+                self._order_logger.log_trade(
+                    open_time=open_time,
+                    close_time=dt.now().isoformat(),
+                    symbol=symbol,
+                    side=trade.get("side", ""),
+                    leverage=trade.get("leverage", 1),
+                    margin_usdt=trade.get("margin_usdt", 0),
+                    notional_usdt=trade.get("notional_usdt", 0),
+                    entry_price=trade.get("entry_price", 0),
+                    exit_price=exit_price,
+                    size=trade.get("size", 0),
+                    pnl_usdt=trade.get("pnl_usdt", 0),
+                    pnl_percent=trade.get("pnl_percent", 0),
+                    roi_percent=trade.get("roi_percent", 0),
+                    fee_usdt=fee_usdt,
+                    exit_reason=reason,
+                    hold_seconds=trade.get("hold_seconds", 0),
+                    highest_price=trade.get("highest_price", 0),
+                    lowest_price=trade.get("lowest_price", 0),
+                    initial_sl=trade.get("initial_sl", 0),
+                    initial_tp=trade.get("initial_tp", 0),
+                    atr_at_entry=trade.get("atr_at_entry", 0),
+                    timeframe=trade.get("timeframe", ""),
+                    entry_score=trade.get("entry_score", 0),
+                    entry_confluence=trade.get("entry_confluence", 0),
+                    entry_adx=trade.get("entry_adx", 0),
+                    entry_rsi=trade.get("entry_rsi", 0),
+                    entry_regime=trade.get("entry_regime", ""),
+                    entry_regime_confidence=trade.get("entry_regime_confidence", 0),
+                    entry_bb_width=trade.get("entry_bb_width", 0),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"[SysN CLOSE] {symbol}: FAILED: {e}")
+            return False
+
+    def _do_reverse_system_n(self, symbol: str, pos, sig,
+                              new_direction: str) -> bool:
+        """System N reverse: mevcut pozisyonu kapat + ters yönde aç (2 ayrı emir)."""
+        sm_cfg = self._config.get("system_n", {})
+        pos_cfg = sm_cfg.get("position", {})
+        close_side = "SELL" if pos.side == OrderSide.BUY_LONG else "BUY"
+        new_side = OrderSide.BUY_LONG if new_direction == "LONG" else OrderSide.SELL_SHORT
+
+        real_balance = 0.0
+        if self._order_executor and hasattr(self._order_executor, "get_balance"):
+            real_balance = self._order_executor.get_balance()
+        locked_margin = self._position_mgr.get_total_locked_margin()
+        wallet = real_balance + locked_margin
+        if wallet <= 0:
+            wallet = self._config.get("risk.initial_balance", 4.0)
+
+        # Güncel fiyatı al (close öncesi — reverse timing gap minimize)
+        price = sig.price
+        try:
+            ticker = self._rest.get_ticker_price(symbol)
+            price = float(ticker.get("price", price))
+        except Exception:
+            pass
+
+        # G-bazlı dinamik kaldıraç (_do_open_system_n ile tutarlı)
+        trading_mode = sm_cfg.get("trading_mode", "spot")
+        if trading_mode == "spot":
+            leverage = 1
+        else:
+            coin_params = scanner.get_coin_params(symbol) if scanner else {}
+            g_leverage = coin_params.get("max_leverage", 1)
+            max_lev = sm_cfg.get("max_leverage", 125)
+            leverage = max(1, min(g_leverage, max_lev))
+            logger.info(f"[SysN REVERSE] {symbol}: G-bazlı kaldıraç={leverage}x "
+                        f"(G={coin_params.get('G', 0):.3f}%)")
+
+        scanner = self._system_n_scanner
+        new_margin = scanner.calculate_position_size(wallet, leverage)
+        new_margin = min(new_margin, real_balance * 0.90) if real_balance > 0 else new_margin
+
+        new_qty = new_margin * leverage / price if price > 0 else 0
+
+        qp = 3
+        if self._symbol_info_cache:
+            try:
+                si = self._symbol_info_cache.get(symbol)
+                if si:
+                    qp = si.quantity_precision
+            except Exception:
+                pass
+
+        new_qty = round(new_qty, qp)
+        if new_qty <= 0:
+            return self._do_close_system_n(symbol, pos, f"REVERSE_{new_direction}_FAIL")
+
+        # Min notional kontrolü: Binance 5 USDT + buffer%
+        notional_buffer_pct = pos_cfg.get("min_notional_buffer_pct", 20)
+        min_notional = 5.0 * (1 + notional_buffer_pct / 100.0)
+        new_notional = new_qty * price
+        if new_notional < min_notional:
+            new_qty = round((min_notional * 1.02) / price, qp)
+            new_notional = new_qty * price
+
+        # Reverse'te mevcut pos kapanıp margin serbest kalır ama yine de kontrol
+        freed_margin = pos.margin_usdt
+        available_after = real_balance + freed_margin
+        required_margin = new_notional / max(leverage, 1)
+        if required_margin > available_after * 0.90:
+            logger.warning(f"[SysN REVERSE] {symbol}: margin yetersiz "
+                           f"(gerekli={required_margin:.2f}, "
+                           f"available={real_balance:.2f}+freed={freed_margin:.2f}="
+                           f"{available_after:.2f}), sadece close yapılıyor")
+            return self._do_close_system_n(symbol, pos, f"REVERSE_{new_direction}_MARGIN")
+
+        try:
+            # 1. Önce mevcut emirleri iptal et
+            try:
+                self._rest.cancel_all_orders(symbol)
+            except Exception:
+                pass
+
+            # 2. Eski pozisyonu kapat (leverage değişmeden)
+            close_result = self._rest.place_order(
+                symbol=symbol, side=close_side,
+                order_type="MARKET",
+                quantity=pos.size,
+                reduce_only=True,
+            )
+            fill_price = float(close_result.get("avgPrice", price))
+            logger.info(f"[SysN REVERSE] {symbol}: "
+                        f"{'LONG→SHORT' if new_direction == 'SHORT' else 'SHORT→LONG'} "
+                        f"CLOSE @ {fill_price} qty={pos.size}")
+
+            trade = self._position_mgr.close_position(symbol, fill_price,
+                                                       f"REVERSE_{new_direction}")
+
+            if self._order_logger and trade:
+                from datetime import datetime as dt
+                entry_t = trade.get("entry_time", 0)
+                open_time = dt.fromtimestamp(entry_t).isoformat() if entry_t else ""
+                fee_pct = self._config.get("strategy.fee_pct", 0.10) / 100.0
+                fee_usdt = trade.get("notional_usdt", 0) * fee_pct
+                self._order_logger.log_trade(
+                    open_time=open_time,
+                    close_time=dt.now().isoformat(),
+                    symbol=symbol,
+                    side=trade.get("side", ""),
+                    leverage=trade.get("leverage", 1),
+                    margin_usdt=trade.get("margin_usdt", 0),
+                    notional_usdt=trade.get("notional_usdt", 0),
+                    entry_price=trade.get("entry_price", 0),
+                    exit_price=fill_price,
+                    size=trade.get("size", 0),
+                    pnl_usdt=trade.get("pnl_usdt", 0),
+                    pnl_percent=trade.get("pnl_percent", 0),
+                    roi_percent=trade.get("roi_percent", 0),
+                    fee_usdt=fee_usdt,
+                    exit_reason=f"REVERSE_{new_direction}",
+                    hold_seconds=trade.get("hold_seconds", 0),
+                    highest_price=trade.get("highest_price", 0),
+                    lowest_price=trade.get("lowest_price", 0),
+                    initial_sl=trade.get("initial_sl", 0),
+                    initial_tp=trade.get("initial_tp", 0),
+                    atr_at_entry=trade.get("atr_at_entry", 0),
+                    timeframe=trade.get("timeframe", ""),
+                    entry_score=trade.get("entry_score", 0),
+                    entry_confluence=trade.get("entry_confluence", 0),
+                    entry_adx=trade.get("entry_adx", 0),
+                    entry_rsi=trade.get("entry_rsi", 0),
+                    entry_regime=trade.get("entry_regime", ""),
+                    entry_regime_confidence=trade.get("entry_regime_confidence", 0),
+                    entry_bb_width=trade.get("entry_bb_width", 0),
+                )
+
+            # 3. Leverage'ı güncelle + hemen yeni yönde aç (gap minimize)
+            try:
+                self._rest.set_leverage(symbol, max(leverage, 1))
+            except Exception as e:
+                logger.warning(f"[SysN REVERSE] {symbol} set_leverage({leverage}) failed: {e}")
+
+            # 4. Yeni yönde pozisyon aç — ek ticker çekme yok (timing gap minimize)
+            new_order_side = "BUY" if new_direction == "LONG" else "SELL"
+            open_price = fill_price  # close fill'den devam — ek API gecikme yok
+
+            open_result = self._rest.place_order(
+                symbol=symbol, side=new_order_side,
+                order_type="MARKET",
+                quantity=new_qty,
+            )
+            new_fill_price = float(open_result.get("avgPrice", open_price))
+            logger.info(f"[SysN REVERSE] {symbol}: OPEN {new_direction} "
+                        f"@ {new_fill_price} qty={new_qty} lev={leverage}x")
+
+            new_pos = self._position_mgr.open_position(
+                symbol=symbol, side=new_side, price=new_fill_price,
+                size=new_qty, atr=sig.atr, leverage=leverage,
+                margin_usdt=new_margin,
+                timeframe=sm_cfg.get("timeframe", "5m"),
+                entry_score=0, entry_mode="SYSTEM_N",
+                initial_sl_override=0, initial_tp_override=0,
+            )
+
+            if not new_pos:
+                logger.error(f"[SysN REVERSE] {symbol}: new pos failed")
+            else:
+                # Opsiyonel SL yerleştir
+                pp = 2
+                if self._symbol_info_cache:
+                    try:
+                        si = self._symbol_info_cache.get(symbol)
+                        if si:
+                            pp = si.price_precision
+                    except Exception:
+                        pass
+                self._place_sl_system_n(symbol, new_pos, sig, leverage, pp)
+
+            # Hemen state kaydet (crash koruması)
+            try:
+                self._position_mgr.save_state()
+            except Exception:
+                pass
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[SysN REVERSE] {symbol}: FAILED: {e} "
+                         f"(new_qty={new_qty}, "
+                         f"available={real_balance:.2f})")
+            return self._do_close_system_n(symbol, pos, f"REVERSE_{new_direction}_ERR")
+
+    def _check_held_positions_system_n(self) -> None:
+        """System N pozisyon kontrolü — sadece external close tespiti.
+        Sinyal bazlı çıkış _do_trading_system_n'de yapılır."""
+        self._detect_external_closes()

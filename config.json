@@ -746,8 +746,9 @@
     }
   },
   "system_j": {
-    "enabled": true,
+    "enabled": false,
     "coin_sayisi": 50,
+    "max_spikes": 20,
     "swing_n": 5,
     "scan_interval_seconds": 60,
     "min_buy_score": 48,
@@ -792,8 +793,8 @@
       "ranging_tp_g_mult": 2.0
     },
     "ev": {
-      "min_p_win": 0.4,
-      "min_rr": 2.5,
+      "min_p_win": 0.35,
+      "min_rr": 2.0,
       "ev_min_threshold": 0.0,
       "sl_candidates": [
         1.0,
@@ -825,10 +826,10 @@
       "coin_daily_ban_hours": 8
     },
     "filters": {
-      "funding_rate_max": 0.0003,
+      "funding_rate_max": 0.001,
       "max_spread_pct": 0.05,
-      "min_depth_usd": 100000,
-      "min_volume_ratio": 1.0,
+      "min_depth_usd": 0,
+      "min_volume_ratio": 0.5,
       "min_wave_count": 3,
       "fee_rate": 0.0004
     },
@@ -849,6 +850,16 @@
       "ev_quality": 0.3,
       "regime_clarity": 0.2,
       "wave_quality": 0.2
+    },
+    "elliott": {
+      "enabled": true,
+      "min_confidence": 0.35,
+      "max_stale_bars": 30,
+      "trail_trigger_g_mult": 1.0,
+      "trail_callback_g_mult": 0.3,
+      "skip_ev": true,
+      "min_tf_minutes": 15,
+      "min_g_pct": 1.0
     }
   },
   "trading": {
@@ -949,6 +960,94 @@
       "ranging_min_score": 60,
       "volatile_min_score": 55,
       "choppy_min_score": 50
+    }
+  },
+  "system_n": {
+    "enabled": true,
+    "coin_mode": "top_n",
+    "coin_sayisi": 50,
+    "coin_list": [],
+    "scan_interval_seconds": 300,
+    "kline_limit": 300,
+    "timeframe": "5m",
+    "trading_mode": "spot",
+    "short_enabled": true,
+    "reverse_enabled": true,
+    "max_leverage": 150,
+    "indicators": {
+      "coeff": 3.6,
+      "period": 27,
+      "rsi_length": 14,
+      "use_mfi": true,
+      "use_adx_static": true,
+      "adx_length": 14,
+      "adx_threshold": 18.0,
+      "use_adx_dynamic": true,
+      "adx_dyn_mult": 1.0,
+      "use_slope": false,
+      "slope_factor": 0.1
+    },
+    "position": {
+      "sizing_mode": "divider",
+      "portfolio_divider": 12,
+      "min_notional_usd": 5.0,
+      "min_notional_buffer_pct": 20,
+      "max_positions": 12,
+      "min_position_usd": 1.0,
+      "max_same_direction": 8,
+      "direction_balance_enabled": false,
+      "direction_balance_ratio": "2-1"
+    },
+    "filters": {
+      "min_volume_24h_usdt": 5000000,
+      "funding_rate_max": 0.001
+    },
+    "sl": {
+      "enabled": false,
+      "mode": "g_based",
+      "g_mult": 1.5,
+      "atr_mult": 2.0,
+      "fixed_pct": 5.0,
+      "fee_total_pct": 0.12,
+      "server_side": true
+    }
+  },
+  "system_m": {
+    "enabled": false,
+    "coin_mode": "top_n",
+    "coin_sayisi": 50,
+    "coin_list": [],
+    "scan_interval_seconds": 300,
+    "kline_limit": 300,
+    "timeframe": "5m",
+    "trading_mode": "spot",
+    "short_enabled": true,
+    "reverse_enabled": true,
+    "leverage": 10,
+    "max_leverage": 10,
+    "indicators": {
+      "coeff": 3.6,
+      "period": 27,
+      "use_mfi": true,
+      "use_adx_static": true,
+      "adx_length": 14,
+      "adx_threshold": 18.0,
+      "use_adx_dynamic": true,
+      "adx_dyn_mult": 1.0,
+      "use_slope": false,
+      "slope_factor": 0.1
+    },
+    "position": {
+      "portfolio_divider": 1,
+      "max_positions": 12,
+      "min_position_usd": 1.0,
+      "max_same_direction": 8,
+      "direction_balance_enabled": false,
+      "direction_balance_ratio": "2-1"
+    },
+    "filters": {
+      "min_volume_24h_usdt": 5000000,
+      "funding_rate_max": 0.001
     }
   }
 }
