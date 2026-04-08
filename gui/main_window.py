@@ -1,96 +1,122 @@
 import keyboard
 import customtkinter as ctk
 from loguru import logger
-from core.constants import EventType, OrderSide, OrderType
+from core.constants import EventType
 from gui.widgets.status_bar import StatusBar
-from gui.panels.quick_order_panel import QuickOrderPanel
-from gui.panels.strategy_panel import StrategyPanel
-from gui.panels.market_panel import MarketPanel
-from gui.panels.activity_panel import ActivityPanel
-from gui.panels.settings_panel import SettingsPanel
 from gui.panels.scanner_panel import ScannerPanel
 from gui.panels.system_b_panel import SystemBPanel
 from gui.panels.system_c_panel import SystemCPanel
 from gui.panels.system_d_panel import SystemDPanel
 from gui.panels.system_e_panel import SystemEPanel
 from gui.panels.system_f_panel import SystemFPanel
-from gui.panels.strategy_settings_panel import StrategySettingsPanel
-from gui.panels.indicator_analysis_panel import IndicatorAnalysisPanel
-from gui.panels.indicator_detail_panel import IndicatorDetailPanel
-from gui.panels.trade_report_panel import TradeReportPanel
-from gui.panels.backtest_panel import BacktestPanel
-from gui.panels.heatmap_panel import HeatmapPanel
 from gui.panels.system_g_panel import SystemGPanel
 from gui.panels.system_h_panel import SystemHPanel
 from gui.panels.system_i_panel import SystemIPanel
+from gui.panels.system_j_panel import SystemJPanel
+from gui.panels.system_m_panel import SystemMPanel
+from gui.panels.system_n_panel import SystemNPanel
+from gui.panels.quick_order_panel import QuickOrderPanel
+from gui.panels.market_panel import MarketPanel
+from gui.panels.strategy_panel import StrategyPanel
+from gui.panels.strategy_settings_panel import StrategySettingsPanel
+from gui.panels.trade_report_panel import TradeReportPanel
+from gui.panels.activity_panel import ActivityPanel
+from gui.panels.settings_panel import SettingsPanel
 
 
 class MainWindow(ctk.CTk):
     """Root CustomTkinter window with tabbed interface."""
 
     def __init__(self, controller):
+        # Set appearance BEFORE creating window
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+
+        # Override _windows_set_titlebar_color to avoid withdraw/deiconify race
+        # that causes invisible window on Windows with many panels
+        _orig_set_titlebar = ctk.CTk._windows_set_titlebar_color
+        def _safe_set_titlebar(self_inner, color_mode):
+            """Set dark titlebar without withdraw/deiconify cycle."""
+            import sys as _sys
+            if not _sys.platform.startswith("win"):
+                return
+            try:
+                import ctypes as _ctypes
+                hwnd = _ctypes.windll.user32.GetParent(self_inner.winfo_id())
+                value = 1 if color_mode.lower() == "dark" else 0
+                _ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 20, _ctypes.byref(_ctypes.c_int(value)),
+                    _ctypes.sizeof(_ctypes.c_int(value)))
+            except Exception:
+                pass
+        ctk.CTk._windows_set_titlebar_color = _safe_set_titlebar
+
         super().__init__()
         self.controller = controller
 
         self.title("Crypthos Trading Bot")
         self.geometry("1200x800")
         self.minsize(900, 600)
-        self.after(50, lambda: self.state("zoomed"))  # maximize on startup
-
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
 
         # Status bar
         self._status_bar = StatusBar(self, controller)
         self._status_bar.pack(fill="x", padx=5, pady=(5, 0))
 
-        # Tab view
-        self._tabview = ctk.CTkTabview(self)
-        self._tabview.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+        # ═══ VIEW SWITCHER: Sistemler / Araclar ═══
+        self._view_switch = ctk.CTkSegmentedButton(
+            self, values=["Sistemler", "Araclar"],
+            command=self._switch_view,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=28,
+        )
+        self._view_switch.set("Sistemler")
+        self._view_switch.pack(fill="x", padx=10, pady=(2, 0))
 
-        tab_scanner = self._tabview.add("System A")
-        tab_system_b = self._tabview.add("System B")
-        tab_system_c = self._tabview.add("System C")
-        tab_system_d = self._tabview.add("System D")
-        tab_system_e = self._tabview.add("System E")
-        tab_system_f = self._tabview.add("Son Kursun")
-        tab_system_g = self._tabview.add("System G")
-        tab_system_h = self._tabview.add("System H")
-        tab_system_i = self._tabview.add("System I")
-        tab_quick = self._tabview.add("Hizli Emir")
-        tab_market = self._tabview.add("Piyasa")
-        tab_strategy = self._tabview.add("Strateji")
-        tab_strat_settings = self._tabview.add("Strateji Ayarlari")
-        tab_analysis = self._tabview.add("Grafik Analiz")
-        tab_ind_detail = self._tabview.add("Indikator Detay")
-        tab_report = self._tabview.add("Islem Raporu")
-        tab_backtest = self._tabview.add("Backtest")
-        tab_heatmap = self._tabview.add("TF Harita")
-        tab_activity = self._tabview.add("Aktivite")
-        tab_settings = self._tabview.add("Ayarlar")
+        # ═══ SYSTEM TABS (12 tab) ═══
+        self._sys_tabview = ctk.CTkTabview(self)
 
-        self._scanner_panel = ScannerPanel(tab_scanner, controller)
-        self._system_b_panel = SystemBPanel(tab_system_b, controller)
-        self._system_c_panel = SystemCPanel(tab_system_c, controller)
-        self._system_d_panel = SystemDPanel(tab_system_d, controller)
-        self._system_e_panel = SystemEPanel(tab_system_e, controller)
-        self._system_f_panel = SystemFPanel(tab_system_f, controller)
-        self._system_g_panel = SystemGPanel(tab_system_g, controller)
-        self._system_h_panel = SystemHPanel(tab_system_h, controller)
-        self._system_i_panel = SystemIPanel(tab_system_i, controller)
-        self._quick_panel = QuickOrderPanel(tab_quick, controller)
-        self._market_panel = MarketPanel(tab_market, controller)
-        self._strategy_panel = StrategyPanel(tab_strategy, controller)
-        self._strategy_settings_panel = StrategySettingsPanel(tab_strat_settings, controller)
-        self._analysis_panel = IndicatorAnalysisPanel(tab_analysis, controller)
-        self._analysis_panel.pack(fill="both", expand=True)
-        self._ind_detail_panel = IndicatorDetailPanel(tab_ind_detail, controller)
-        self._ind_detail_panel.pack(fill="both", expand=True)
-        self._report_panel = TradeReportPanel(tab_report, controller)
-        self._backtest_panel = BacktestPanel(tab_backtest, controller)
-        self._heatmap_panel = HeatmapPanel(tab_heatmap, controller)
-        self._activity_panel = ActivityPanel(tab_activity, controller)
-        self._settings_panel = SettingsPanel(tab_settings, controller)
+        tab_n = self._sys_tabview.add("N")
+        tab_m = self._sys_tabview.add("M")
+        tab_j = self._sys_tabview.add("J")
+        tab_i = self._sys_tabview.add("I")
+        tab_a = self._sys_tabview.add("A")
+        tab_b = self._sys_tabview.add("B")
+        tab_c = self._sys_tabview.add("C")
+        tab_d = self._sys_tabview.add("D")
+        tab_e = self._sys_tabview.add("E")
+        tab_f = self._sys_tabview.add("F")
+        tab_g = self._sys_tabview.add("G")
+        tab_h = self._sys_tabview.add("H")
+
+        self._system_n_panel = SystemNPanel(tab_n, controller)
+        self._system_m_panel = SystemMPanel(tab_m, controller)
+        self._system_j_panel = SystemJPanel(tab_j, controller)
+        self._system_i_panel = SystemIPanel(tab_i, controller)
+        self._scanner_panel = ScannerPanel(tab_a, controller)
+        self._system_b_panel = SystemBPanel(tab_b, controller)
+        self._system_c_panel = SystemCPanel(tab_c, controller)
+        self._system_d_panel = SystemDPanel(tab_d, controller)
+        self._system_e_panel = SystemEPanel(tab_e, controller)
+        self._system_f_panel = SystemFPanel(tab_f, controller)
+        self._system_g_panel = SystemGPanel(tab_g, controller)
+        self._system_h_panel = SystemHPanel(tab_h, controller)
+        self._sys_tabview.set("N")
+
+        # ═══ TOOL TABS (lazy — built on first Araclar click) ═══
+        self._tool_tabview = None
+        self._tools_built = False
+        # Placeholders for event handlers
+        class _Noop:
+            def add_log_entry(self, *a, **kw): pass
+            def refresh_orders(self): pass
+        self._activity_panel = _Noop()
+        self._quick_panel = None
+        self._market_panel = None
+
+        # Default: Sistemler gorunur
+        self._sys_tabview.pack(after=self._view_switch,
+                               fill="both", expand=True, padx=5, pady=(0, 5))
+        self._active_view = "Sistemler"
 
         # Register global hotkeys
         self._register_hotkeys()
@@ -111,8 +137,77 @@ class MainWindow(ctk.CTk):
         # Start UI refresh
         self._refresh_ui()
 
+        # Maximize after mainloop starts
+        self.after(100, self._ensure_visible)
+
         # On close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _switch_view(self, value: str) -> None:
+        """Switch between Sistemler and Araclar views."""
+        if value == self._active_view:
+            return
+        if value == "Sistemler":
+            if self._tool_tabview:
+                self._tool_tabview.pack_forget()
+            self._sys_tabview.pack(after=self._view_switch,
+                                   fill="both", expand=True, padx=5, pady=(0, 5))
+        else:
+            self._sys_tabview.pack_forget()
+            if not self._tools_built:
+                self._build_tool_tabs()
+            self._tool_tabview.pack(after=self._view_switch,
+                                    fill="both", expand=True, padx=5, pady=(0, 5))
+        self._active_view = value
+
+    def _build_tool_tabs(self) -> None:
+        """Build tool tabs on first Araclar click (lightweight panels only)."""
+        self._tool_tabview = ctk.CTkTabview(self)
+        ctrl = self.controller
+        tv = self._tool_tabview
+
+        tab_report = tv.add("Rapor")
+        tab_strat_s = tv.add("Str.Ayar")
+        tab_act = tv.add("Aktivite")
+        tab_set = tv.add("Ayarlar")
+        tab_quick = tv.add("Emir")
+        tab_market = tv.add("Piyasa")
+        tab_strat = tv.add("Strateji")
+
+        self._report_panel = TradeReportPanel(tab_report, ctrl)
+        self._strategy_settings_panel = StrategySettingsPanel(tab_strat_s, ctrl)
+        self._activity_panel = ActivityPanel(tab_act, ctrl)
+        self._settings_panel = SettingsPanel(tab_set, ctrl)
+        self._quick_panel = QuickOrderPanel(tab_quick, ctrl)
+        self._market_panel = MarketPanel(tab_market, ctrl)
+        self._strategy_panel = StrategyPanel(tab_strat, ctrl)
+
+        self._tools_built = True
+        logger.info("Tool tabs built (7 panels)")
+
+    def _ensure_visible(self):
+        """Force window visible and maximized, then refresh tabview."""
+        try:
+            self.state("zoomed")
+            self.after(500, self._refresh_tabview)
+            self.after(1500, self._refresh_tabview)
+            self.after(3000, self._refresh_tabview)
+        except Exception:
+            pass
+
+    def _refresh_tabview(self):
+        """Force CTkTabview to re-render tab bar after window resize."""
+        try:
+            # Re-pack sys tabview to force geometry recalculation
+            if self._active_view == "Sistemler":
+                self._sys_tabview.pack_forget()
+                self._sys_tabview.pack(after=self._view_switch,
+                                       fill="both", expand=True, padx=5, pady=(0, 5))
+            current = self._sys_tabview.get()
+            self._sys_tabview.set(current)
+            self.update_idletasks()
+        except Exception:
+            pass
 
     def _register_hotkeys(self) -> None:
         hotkeys = self.controller.config.get("hotkeys", {})
@@ -134,10 +229,14 @@ class MainWindow(ctk.CTk):
             logger.warning(f"Hotkey registration failed: {e}")
 
     def _hotkey_buy(self) -> None:
-        self.after(0, lambda: self._quick_panel._on_order(OrderSide.BUY_LONG))
+        if self._quick_panel:
+            from core.constants import OrderSide
+            self.after(0, lambda: self._quick_panel._on_order(OrderSide.BUY_LONG))
 
     def _hotkey_sell(self) -> None:
-        self.after(0, lambda: self._quick_panel._on_order(OrderSide.SELL_SHORT))
+        if self._quick_panel:
+            from core.constants import OrderSide
+            self.after(0, lambda: self._quick_panel._on_order(OrderSide.SELL_SHORT))
 
     def _hotkey_kill(self) -> None:
         self.after(0, self.controller.activate_kill_switch)
@@ -198,18 +297,19 @@ class MainWindow(ctk.CTk):
             )
 
             # Update panels based on active tab
-            active_tab = self._tabview.get()
-            if active_tab == "Hizli Emir":
-                self._quick_panel.update_display(
-                    price=price,
-                    mark_price=market_data.get("mark_price", 0),
-                    funding_rate=market_data.get("funding_rate", 0),
-                )
-            elif active_tab == "Piyasa":
-                klines = None
-                if self.controller.market_service:
-                    klines = self.controller.market_service.get_klines(symbol)
-                self._market_panel.update_data(market_data, indicator_values, klines)
+            if self._active_view == "Araclar" and self._tool_tabview:
+                active_tab = self._tool_tabview.get()
+                if active_tab == "Emir" and self._quick_panel:
+                    self._quick_panel.update_display(
+                        price=price,
+                        mark_price=market_data.get("mark_price", 0),
+                        funding_rate=market_data.get("funding_rate", 0),
+                    )
+                elif active_tab == "Piyasa" and self._market_panel:
+                    klines = None
+                    if self.controller.market_service:
+                        klines = self.controller.market_service.get_klines(symbol)
+                    self._market_panel.update_data(market_data, indicator_values, klines)
 
         except Exception as e:
             logger.debug(f"UI refresh error: {e}")

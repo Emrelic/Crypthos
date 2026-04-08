@@ -150,15 +150,20 @@ class BinanceRestClient:
         try:
             resp = self._session.get(url, params=params, timeout=10)
             if resp.status_code >= 400:
+                # 404 → endpoint mevcut değil, debug seviyesinde logla (spam önleme)
+                log_fn = logger.debug if resp.status_code == 404 else logger.error
                 try:
                     err_body = resp.json()
-                    logger.error(f"API error {resp.status_code} [{endpoint}]: {err_body}")
+                    log_fn(f"API error {resp.status_code} [{endpoint}]: {err_body}")
                 except Exception:
-                    logger.error(f"API error {resp.status_code} [{endpoint}]: {resp.text}")
+                    log_fn(f"API error {resp.status_code} [{endpoint}]: {resp.text[:200]}")
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as e:
-            logger.error(f"Signed GET error [{endpoint}]: {e}")
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 404:
+                logger.debug(f"Signed GET 404 [{endpoint}]")
+            else:
+                logger.error(f"Signed GET error [{endpoint}]: {e}")
             raise
 
     def _signed_post(self, endpoint: str, params: dict = None) -> dict | list:
@@ -272,16 +277,25 @@ class BinanceRestClient:
 
     def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> dict:
         """POST /fapi/v1/marginType — ISOLATED or CROSSED."""
+        params = self._sign({"symbol": symbol, "marginType": margin_type})
+        url = f"{self.BASE_URL}/fapi/v1/marginType"
         try:
-            return self._signed_post("/fapi/v1/marginType", {
-                "symbol": symbol,
-                "marginType": margin_type,
-            })
+            resp = self._session.post(url, params=params, timeout=10)
+            if resp.status_code >= 400:
+                try:
+                    err_body = resp.json()
+                    # -4046: "No need to change margin type" — zaten ayarlı, sessizce geç
+                    if err_body.get("code") == -4046:
+                        return {"msg": "already_set"}
+                    logger.error(f"API error {resp.status_code} [/fapi/v1/marginType]: {err_body}")
+                except Exception:
+                    pass
+                resp.raise_for_status()
+            return resp.json()
         except requests.HTTPError as e:
-            # -4046: "No need to change margin type" — already set
-            err_str = str(e)
-            if "4046" in err_str or "400" in err_str:
-                return {"msg": "already_set"}
+            raise
+        except requests.RequestException as e:
+            logger.error(f"set_margin_type error [{symbol}]: {e}")
             raise
 
     def get_leverage_bracket(self, symbol: str) -> list:
@@ -453,6 +467,8 @@ class BinanceRestClient:
             return None  # Okuma başarısız → None
 
         # 2. Algo/conditional orders: birden fazla endpoint dene
+        #    NOT: Binance Futures çoğu hesapta algo endpoint'i desteklemez (404).
+        #    404 = endpoint yok → algo emri yok kabul et, trading'i engelleme.
         algo_ok = False
         for endpoint in ["/fapi/v1/algo/openOrders",
                          "/fapi/v1/openAlgoOrders",
@@ -478,15 +494,20 @@ class BinanceRestClient:
                 algo_ok = True
                 logger.debug(f"Algo orders from {endpoint}: {len(algo_list)} orders")
                 break  # İlk başarılı endpoint yeterli
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    logger.debug(f"Algo endpoint {endpoint} not available (404), skipping")
+                else:
+                    logger.debug(f"Algo endpoint {endpoint} failed: {e}")
+                continue
             except Exception as e:
                 logger.debug(f"Algo endpoint {endpoint} failed: {e}")
                 continue
 
         if not algo_ok:
-            logger.warning("Tüm algo order endpoint'leri başarısız — "
-                           "sadece regular orders okundu. "
-                           "Emir KONMAYACAK (güvenlik).")
-            return None  # Algo okunamadı → None (güvenlik)
+            # 404 = Binance bu hesapta algo desteklemiyor → algo emri yok kabul et
+            logger.debug("Algo order endpoint'leri mevcut değil — "
+                         "sadece regular orders okundu (normal).")
 
         return combined
 
@@ -541,6 +562,11 @@ class BinanceRestClient:
                 combined.extend(algo_list)
                 algo_ok = True
                 break
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    algo_ok = True  # 404 = endpoint yok → algo emri yok
+                    break
+                continue
             except Exception:
                 continue
 
@@ -550,7 +576,7 @@ class BinanceRestClient:
 
     def get_algo_open_orders(self, symbol: str = None):
         """Algo/conditional open orders. Birden fazla endpoint dener.
-        Returns list on success, None on error."""
+        Returns list on success, None on error, [] on 404 (endpoint yok)."""
         for endpoint in ["/fapi/v1/algo/openOrders",
                          "/fapi/v1/openAlgoOrders",
                          "/fapi/v1/conditional/openOrders"]:
@@ -565,6 +591,10 @@ class BinanceRestClient:
                     result = (data.get("orders") or data.get("dataList")
                               or data.get("rows") or [])
                     return result if isinstance(result, list) else []
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    return []  # Endpoint mevcut değil → algo emri yok
+                continue
             except Exception:
                 continue
         logger.warning("get_algo_open_orders: tüm endpoint'ler başarısız")

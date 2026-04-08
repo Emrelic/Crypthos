@@ -283,6 +283,36 @@ class AppController:
             return self.scanner.get_system_i_results()
         return []
 
+    def get_system_j_results(self) -> list:
+        """Return System J scan results."""
+        if self.scanner:
+            return getattr(self.scanner, '_last_system_j_results', [])
+        return []
+
+    def get_system_m_results(self) -> list:
+        """Return System M (AlphaTrend) scan results."""
+        if self.scanner:
+            return self.scanner.get_system_m_results()
+        return []
+
+    def get_system_m_decisions(self) -> list[dict]:
+        """Return System M trade decision log."""
+        if self.scanner:
+            return self.scanner.get_system_m_decisions()
+        return []
+
+    def get_system_n_results(self) -> list:
+        """Return System N (AlphaTrend v2) scan results."""
+        if self.scanner:
+            return self.scanner.get_system_n_results()
+        return []
+
+    def get_system_n_decisions(self) -> list[dict]:
+        """Return System N trade decision log."""
+        if self.scanner:
+            return self.scanner.get_system_n_decisions()
+        return []
+
     def place_breakeven_tp_all(self) -> list[dict]:
         """Tüm pozisyonlara breakeven TP emri gönder (SL'ye dokunmaz)."""
         if self.scanner:
@@ -443,9 +473,22 @@ class AppController:
             self.market_service.start(self._current_symbol)
         if self.binance_app:
             self.binance_app.connect()
+        # atexit: process kill/crash durumunda da state kaydet
+        import atexit
+        atexit.register(self._save_position_state)
         logger.info("AppController started")
 
+    def _save_position_state(self) -> None:
+        """atexit + shutdown ortak: pozisyon state'ini kaydet."""
+        if self.strategy_engine and hasattr(self.strategy_engine, '_position_mgr'):
+            try:
+                self.strategy_engine._position_mgr.save_state()
+            except Exception:
+                pass
+
     def shutdown(self) -> None:
+        # Pozisyon state'ini kaydet (atexit de çağırır ama explicit daha güvenli)
+        self._save_position_state()
         if self.strategy_engine:
             self.strategy_engine.stop()
         if self.market_service:

@@ -109,6 +109,60 @@ class PositionManager:
         with self._lock:
             return symbol in self._positions
 
+    # ── State persistence ────────────────────────────────────
+    STATE_FILE = "data/positions_state.json"
+
+    def save_state(self) -> None:
+        """Shutdown sırasında pozisyon state'ini diske kaydet."""
+        import json, dataclasses
+        with self._lock:
+            if not self._positions:
+                # Pozisyon yoksa dosyayı temizle
+                try:
+                    with open(self.STATE_FILE, "w") as f:
+                        json.dump([], f)
+                except Exception:
+                    pass
+                return
+            state = []
+            for sym, pos in self._positions.items():
+                d = dataclasses.asdict(pos)
+                # OrderSide enum → string
+                d["side"] = pos.side.value
+                state.append(d)
+        try:
+            import os
+            os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
+            with open(self.STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2, default=str)
+            from loguru import logger
+            logger.info(f"[STATE] {len(state)} pozisyon kaydedildi → {self.STATE_FILE}")
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"[STATE] Kaydetme hatası: {e}")
+
+    def load_state(self) -> dict:
+        """Restart sırasında önceki state'i oku. Pozisyon AÇMAZ, sadece bilgiyi döner.
+        Returns: {symbol: {field: value, ...}} dict veya boş dict."""
+        import json, os
+        if not os.path.exists(self.STATE_FILE):
+            return {}
+        try:
+            with open(self.STATE_FILE, "r") as f:
+                state = json.load(f)
+            result = {}
+            for d in state:
+                sym = d.get("symbol", "")
+                if sym:
+                    result[sym] = d
+            from loguru import logger
+            logger.info(f"[STATE] {len(result)} pozisyon state'i okundu ← {self.STATE_FILE}")
+            return result
+        except Exception as e:
+            from loguru import logger
+            logger.warning(f"[STATE] State okuma hatası: {e}")
+            return {}
+
     def get_held_symbols(self) -> list[str]:
         with self._lock:
             return list(self._positions.keys())
@@ -121,6 +175,18 @@ class PositionManager:
         """Return a snapshot copy of all positions. Thread-safe."""
         with self._lock:
             return dict(self._positions)
+
+    def get_total_locked_margin(self) -> float:
+        """Tüm açık pozisyonların toplam kilitli margin'i. Thread-safe."""
+        with self._lock:
+            return sum(p.margin_usdt for p in self._positions.values())
+
+    def update_stop_loss(self, symbol: str, sl_price: float) -> None:
+        """Update position stop loss. Thread-safe."""
+        with self._lock:
+            p = self._positions.get(symbol)
+            if p:
+                p.stop_loss = sl_price
 
     def update_position_size(self, symbol: str, new_size: float) -> None:
         """Update position size after partial close."""
@@ -156,14 +222,20 @@ class PositionManager:
                       entry_regime_confidence: float = 0.0,
                       entry_bb_width: float = 0.0,
                       entry_mode: str = "TREND",
-                      mr_tp_price: float = 0.0) -> ActivePosition:
-        """Create and track a new position."""
+                      mr_tp_price: float = 0.0,
+                      initial_sl_override: float = 0.0,
+                      initial_tp_override: float = 0.0) -> ActivePosition:
+        """Create and track a new position.
+        initial_sl_override/initial_tp_override: System I gibi kendi SL/TP
+        hesabini yapan sistemler icin — position_manager'in System A
+        formullerini bypass eder."""
         with self._lock:
             return self._open_position_locked(
                 symbol, side, price, size, atr, leverage, margin_usdt,
                 timeframe, entry_score, entry_confluence, entry_adx, entry_rsi,
                 entry_regime, entry_regime_confidence, entry_bb_width,
-                entry_mode, mr_tp_price)
+                entry_mode, mr_tp_price,
+                initial_sl_override, initial_tp_override)
 
     def _open_position_locked(self, symbol: str, side: OrderSide, price: float,
                               size: float, atr: float,
@@ -178,68 +250,87 @@ class PositionManager:
                               entry_regime_confidence: float = 0.0,
                               entry_bb_width: float = 0.0,
                               entry_mode: str = "TREND",
-                              mr_tp_price: float = 0.0) -> ActivePosition:
-        """Internal: create position (caller must hold lock)."""
+                              mr_tp_price: float = 0.0,
+                              initial_sl_override: float = 0.0,
+                              initial_tp_override: float = 0.0) -> ActivePosition:
+        """Internal: create position (caller must hold lock).
+        initial_sl_override/initial_tp_override: non-zero ise System A
+        formullerini bypass eder (System I gibi kendi hesabini yapan sistemler icin)."""
         if symbol in self._positions:
             logger.warning(f"Already holding {symbol}, skipping duplicate")
             return self._positions[symbol]
 
-        lev_enabled = leverage >= 1  # All leverages use fee-aware SL (including 1x)
+        lev_enabled = leverage >= 1
 
-        # Read from strategy config (with sensible defaults)
-        strat = self._config.get("strategy", {})
-
-        # === DYNAMIC CALCULATION FROM LEVERAGE (FEE-AWARE) ===
-        fee_pct = strat.get("fee_pct", 0.10) / 100.0  # config: 0.10 = %0.10 round-trip
-        fee_roi = fee_pct * leverage * 100  # fee as % of margin
-        slippage_mult = strat.get("slippage_mult", 0.5)
-        slippage_roi = fee_roi * slippage_mult  # estimated slippage
-
-        # Liquidation: (1/L) with practical factor (maintenance margin eats rest)
-        liq_factor = strat.get("liq_factor", 70) / 100.0
-        liq_pct = (1.0 / leverage) * liq_factor
-        sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
-        emergency_liq_pct = strat.get("emergency_liq_percent", 80) / 100.0
-        tp_liq_mult = strat.get("tp_liq_multiplier", 3.0)
-
-        # Fee-aware SL: gerçek kayıp = SL fiyat hareketi + fee + slippage
-        # Hedef toplam kayıp ROI'den fee ve slippage düşülür
-        raw_sl_roi = liq_pct * sl_liq_pct * leverage * 100
-        net_sl_roi = max(raw_sl_roi - fee_roi - slippage_roi, fee_roi)
-        sl_pct = net_sl_roi / (leverage * 100)
-
-        emergency_pct = liq_pct * emergency_liq_pct
-
-        # TP: 3×ATR bazlı (config: tp_atr_mult, fallback: tp_liq_multiplier)
-        tp_atr_mult = strat.get("tp_atr_mult", 3.0)
-        if atr > 0 and price > 0:
-            tp_pct = (atr * tp_atr_mult) / price
-        else:
-            tp_pct = liq_pct * tp_liq_mult
-
-        # ROI calculations for logging
-        sl_roi = net_sl_roi
-        total_sl_roi = raw_sl_roi  # fee dahil toplam kayıp
-        emergency_roi = emergency_pct * leverage * 100
-        tp_roi = tp_pct * leverage * 100
-
-        logger.info(f"[{leverage}x] Liq={liq_pct*100:.3f}% "
-                    f"SL={sl_pct*100:.3f}%(ROI-{sl_roi:.0f}%) "
-                    f"fee={fee_roi:.0f}%+slip={slippage_roi:.0f}% "
-                    f"toplam_kayip={total_sl_roi:.0f}% "
-                    f"TP={tp_atr_mult}xATR({tp_pct*100:.3f}%, ROI={tp_roi:.0f}%) "
-                    f"Emergency={emergency_pct*100:.3f}%(ROI-{emergency_roi:.0f}%)")
-
-        if side == OrderSide.BUY_LONG:
-            sl = price * (1 - sl_pct)
-            tp = price * (1 + tp_pct)
+        # ── System I (veya baska izole sistem) kendi SL/TP'sini geciyor ──
+        if initial_sl_override > 0 and initial_tp_override > 0:
+            sl = initial_sl_override
+            tp = initial_tp_override
             liq_price = price * (1 - 1.0 / leverage * 0.95) if leverage > 1 else 0.0
-            emergency_price = price * (1 - emergency_pct)
+            emergency_liq_pct = 0.80
+            liq_factor = 0.70
+            liq_pct = (1.0 / leverage) * liq_factor
+            emergency_pct = liq_pct * emergency_liq_pct
+            if side == OrderSide.BUY_LONG:
+                emergency_price = price * (1 - emergency_pct)
+                if leverage > 1:
+                    liq_price = price * (1 - 1.0 / leverage * 0.95)
+            else:
+                emergency_price = price * (1 + emergency_pct)
+                if leverage > 1:
+                    liq_price = price * (1 + 1.0 / leverage * 0.95)
+            sl_pct = abs(price - sl) / price if price > 0 else 0
+            tp_pct = abs(tp - price) / price if price > 0 else 0
+            logger.info(f"[{leverage}x] OVERRIDE SL={sl:.6f} ({sl_pct*100:.3f}%) "
+                        f"TP={tp:.6f} ({tp_pct*100:.3f}%) "
+                        f"R:R={tp_pct/sl_pct:.2f}" if sl_pct > 0 else "")
         else:
-            sl = price * (1 + sl_pct)
-            tp = price * (1 - tp_pct)
-            liq_price = price * (1 + 1.0 / leverage * 0.95) if leverage > 1 else 0.0
-            emergency_price = price * (1 + emergency_pct)
+            # ── System A / eski sistemler: liq bazli SL, ATR bazli TP ──
+            strat = self._config.get("strategy", {})
+            fee_pct = strat.get("fee_pct", 0.10) / 100.0
+            fee_roi = fee_pct * leverage * 100
+            slippage_mult = strat.get("slippage_mult", 0.5)
+            slippage_roi = fee_roi * slippage_mult
+
+            liq_factor = strat.get("liq_factor", 70) / 100.0
+            liq_pct = (1.0 / leverage) * liq_factor
+            sl_liq_pct = strat.get("sl_liq_percent", 50) / 100.0
+            emergency_liq_pct = strat.get("emergency_liq_percent", 80) / 100.0
+            tp_liq_mult = strat.get("tp_liq_multiplier", 3.0)
+
+            raw_sl_roi = liq_pct * sl_liq_pct * leverage * 100
+            net_sl_roi = max(raw_sl_roi - fee_roi - slippage_roi, fee_roi)
+            sl_pct = net_sl_roi / (leverage * 100)
+            emergency_pct = liq_pct * emergency_liq_pct
+
+            tp_atr_mult = strat.get("tp_atr_mult", 3.0)
+            if atr > 0 and price > 0:
+                tp_pct = (atr * tp_atr_mult) / price
+            else:
+                tp_pct = liq_pct * tp_liq_mult
+
+            sl_roi = net_sl_roi
+            total_sl_roi = raw_sl_roi
+            emergency_roi = emergency_pct * leverage * 100
+            tp_roi = tp_pct * leverage * 100
+
+            logger.info(f"[{leverage}x] Liq={liq_pct*100:.3f}% "
+                        f"SL={sl_pct*100:.3f}%(ROI-{sl_roi:.0f}%) "
+                        f"fee={fee_roi:.0f}%+slip={slippage_roi:.0f}% "
+                        f"toplam_kayip={total_sl_roi:.0f}% "
+                        f"TP={tp_atr_mult}xATR({tp_pct*100:.3f}%, ROI={tp_roi:.0f}%) "
+                        f"Emergency={emergency_pct*100:.3f}%(ROI-{emergency_roi:.0f}%)")
+
+            if side == OrderSide.BUY_LONG:
+                sl = price * (1 - sl_pct)
+                tp = price * (1 + tp_pct)
+                liq_price = price * (1 - 1.0 / leverage * 0.95) if leverage > 1 else 0.0
+                emergency_price = price * (1 - emergency_pct)
+            else:
+                sl = price * (1 + sl_pct)
+                tp = price * (1 - tp_pct)
+                liq_price = price * (1 + 1.0 / leverage * 0.95) if leverage > 1 else 0.0
+                emergency_price = price * (1 + emergency_pct)
 
         pos = ActivePosition(
             symbol=symbol,
@@ -351,6 +442,19 @@ class PositionManager:
                 pos.initial_sl = pos.emergency_close_price
                 pos.trailing_stop = pos.emergency_close_price
                 logger.info(f"  [SysG] No SL — emergency only @ {pos.emergency_close_price:.6f}")
+
+        # System J mode: SL% doğrudan entry_bb_width'te (System I ile aynı mekanizma)
+        elif entry_mode == "SYSTEM_J":
+            sl_pct_value = entry_bb_width
+            if sl_pct_value > 0 and price > 0:
+                sj_sl_pct = sl_pct_value / 100.0
+                if side == OrderSide.BUY_LONG:
+                    pos.initial_sl = price * (1 - sj_sl_pct)
+                else:
+                    pos.initial_sl = price * (1 + sj_sl_pct)
+                pos.trailing_stop = pos.initial_sl
+                logger.info(f"  [SysJ] SL from G-based: {sl_pct_value:.3f}% → "
+                            f"SL={pos.initial_sl:.6f}")
 
         # System I mode: EV-optimal SL% doğrudan entry_bb_width'te (server SL ile tutarlı)
         elif entry_mode == "SYSTEM_I":
@@ -491,7 +595,15 @@ class PositionManager:
             if current_price < pos.lowest_price:
                 pos.lowest_price = current_price
 
-        # === SYSTEM I MODE (en yuksek oncelik) ===
+        # === SYSTEM M/N MODE (AlphaTrend — sinyal bazlı, SL/TP yok) ===
+        if pos.entry_mode in ("SYSTEM_M", "SYSTEM_N"):
+            return self._check_system_n_m(pos, current_price)
+
+        # === SYSTEM J MODE (en yuksek oncelik) ===
+        if pos.entry_mode == "SYSTEM_J":
+            return self._check_system_j(pos, current_price, confluence, divergences)
+
+        # === SYSTEM I MODE ===
         if pos.entry_mode == "SYSTEM_I":
             return self._check_system_i(pos, current_price, confluence, divergences)
 
@@ -595,10 +707,8 @@ class PositionManager:
             if self._handle_regime_change(pos, current_price, regime):
                 return self.EXIT_REGIME
 
-        # === 7. TIME LIMIT (her seviyede) ===
-        if strat.get("time_limit_enabled", True):
-            if self._check_time_limit(pos, current_price):
-                return self.EXIT_TIME
+        # === 7. TIME LIMIT — DEVRE DIŞI ===
+        # Pozisyon çıkışı borsadaki SL/trailing emrine bırakılır.
 
         # Publish position update
         self._event_bus.publish(EventType.POSITION_UPDATE, {
@@ -963,24 +1073,8 @@ class PositionManager:
                                 f"(PnL={pnl:+.2f}%)")
                     return self.EXIT_REGIME_SHIFT if hasattr(self, 'EXIT_REGIME_SHIFT') else "REGIME_SHIFT"
 
-        # === 8. TIME LIMIT ===
-        time_limit_hours = opt.get("time_limit_hours",
-                                    si_cfg.get("time_limit_hours", 8))
-        time_limit_enabled = opt.get("time_limit_enabled", True)
-        if time_limit_enabled and time_limit_hours > 0:
-            elapsed_min = (time.time() - pos.entry_time) / 60
-            elapsed_hours = elapsed_min / 60
-            if elapsed_hours >= time_limit_hours:
-                pnl = self._get_pnl_pct(pos, price)
-                if pnl >= 0:
-                    logger.info(f"[SysI] {pos.symbol} time limit {time_limit_hours}h, "
-                                f"kârda → kapat (PnL={pnl:+.2f}%)")
-                    return self.EXIT_TIME
-                elif elapsed_hours >= time_limit_hours * 2:
-                    # 2x süre geçti, zararda da kapat (sonsuz beklemeyi önle)
-                    logger.warning(f"[SysI] {pos.symbol} time limit 2x ({time_limit_hours*2}h), "
-                                   f"zararda da kapat (PnL={pnl:+.2f}%)")
-                    return self.EXIT_TIME
+        # === 8. TIME LIMIT — DEVRE DIŞI ===
+        # Pozisyon çıkışı borsadaki SL/trailing emrine bırakılır.
 
         return "HOLD"
 
@@ -1027,20 +1121,8 @@ class PositionManager:
             if self._check_trailing(pos, price):
                 return self.EXIT_TRAILING_RENEW
 
-        # === 4. TIME LIMIT ===
-        time_limit_minutes = sh.get("time_limit_minutes",
-                                     strat.get("time_limit_minutes", 480))
-        time_limit_enabled = sh.get("time_limit_enabled",
-                                     strat.get("time_limit_enabled", True))
-        if time_limit_enabled and time_limit_minutes > 0:
-            elapsed_min = (time.time() - pos.entry_time) / 60
-            if elapsed_min >= time_limit_minutes:
-                pnl = self._get_pnl_pct(pos, price)
-                if pnl >= 0:
-                    logger.info(f"[SysH] {pos.symbol} time limit {time_limit_minutes}m, "
-                                f"karda → kapat (PnL={pnl:+.2f}%)")
-                    return self.EXIT_TIME
-                # Zararda: server SL/trailing kapatacak
+        # === 4. TIME LIMIT — DEVRE DIŞI ===
+        # Pozisyon çıkışı borsadaki SL/trailing emrine bırakılır.
 
         return "HOLD"
 
@@ -1069,17 +1151,8 @@ class PositionManager:
             if self._check_stop_loss(pos, price):
                 return self.EXIT_SL
 
-        # === 2. TIME LIMIT ===
-        max_hold_hours = pos_cfg.get("max_hold_hours", 24)
-        if max_hold_hours > 0:
-            elapsed_min = (time.time() - pos.entry_time) / 60
-            if elapsed_min >= max_hold_hours * 60:
-                pnl = self._get_pnl_pct(pos, price)
-                if pnl >= 0:
-                    logger.info(f"[SysG] {pos.symbol} time limit {max_hold_hours}h, "
-                                f"karda → kapat (PnL={pnl:+.2f}%)")
-                    return self.EXIT_TIME
-                # Zararda: server SL veya TP kapatacak, biz kapatmiyoruz
+        # === 2. TIME LIMIT — DEVRE DIŞI ===
+        # Pozisyon çıkışı borsadaki SL/trailing emrine bırakılır.
 
         return "HOLD"
 
@@ -1105,18 +1178,8 @@ class PositionManager:
             if self._check_stop_loss(pos, price):
                 return self.EXIT_SL
 
-        # === 2. TIME LIMIT ===
-        time_limit_enabled = sd.get("time_limit_enabled", True)
-        time_limit_minutes = sd.get("time_limit_minutes", 480)
-        if time_limit_enabled and time_limit_minutes > 0:
-            elapsed_min = (time.time() - pos.entry_time) / 60
-            if elapsed_min >= time_limit_minutes:
-                pnl = self._get_pnl_pct(pos, price)
-                if pnl >= 0:
-                    logger.info(f"[SysD] {pos.symbol} time limit {time_limit_minutes}m, "
-                                f"karda → kapat (PnL={pnl:+.2f}%)")
-                    return self.EXIT_TIME
-                # Zararda: server SL veya trailing kapatacak, biz kapatmıyoruz
+        # === 2. TIME LIMIT — DEVRE DIŞI ===
+        # Pozisyon çıkışı borsadaki SL/trailing emrine bırakılır.
 
         return "HOLD"
 
@@ -1142,20 +1205,8 @@ class PositionManager:
             if self._check_stop_loss(pos, price):
                 return self.EXIT_SL
 
-        # === 2. TIME LIMIT (System B: 8 saat varsayılan) ===
-        time_limit_minutes = sb.get("time_limit_minutes", 480)
-        if time_limit_minutes > 0:
-            elapsed_min = (time.time() - pos.entry_time) / 60
-            if elapsed_min >= time_limit_minutes:
-                pnl = self._get_pnl_pct(pos, price)
-                if pnl >= 0:
-                    logger.info(f"[SysB] {pos.symbol} time limit {time_limit_minutes}m, "
-                                f"kârda → kapat (PnL={pnl:+.2f}%)")
-                    return self.EXIT_TIME
-                else:
-                    # Zararda: SL sıkılaştır (breakeven'a yaklaştır)
-                    # Ama kapama — server SL veya trailing kapatacak
-                    pass
+        # === 2. TIME LIMIT — DEVRE DIŞI ===
+        # Pozisyon çıkışı borsadaki SL/trailing emrine bırakılır.
 
         return "HOLD"
 
@@ -1257,14 +1308,8 @@ class PositionManager:
             if self._check_confluence_reversal(pos, confluence, price):
                 return self.EXIT_CONFLUENCE
 
-        # === 5. TIME LIMIT (MR-specific, shorter) ===
-        if strat.get("time_limit_enabled", True):
-            mr_time_limit = strat.get("mr_time_limit_minutes", 240) * 60
-            hold_time = time.time() - pos.entry_time
-            if hold_time >= mr_time_limit:
-                logger.info(f"[MR] {pos.symbol} MR time limit reached "
-                            f"({hold_time/60:.0f}min >= {mr_time_limit/60:.0f}min)")
-                return self.EXIT_TIME
+        # === 5. TIME LIMIT — DEVRE DIŞI ===
+        # Pozisyon çıkışı borsadaki SL/trailing emrine bırakılır.
 
         # Publish position update
         self._event_bus.publish(EventType.POSITION_UPDATE, {
@@ -1750,26 +1795,8 @@ class PositionManager:
         return False
 
     def _check_time_limit(self, pos: ActivePosition, price: float) -> bool:
-        strat = self._config.get("strategy", {})
-        max_hold = strat.get("time_limit_minutes", 480) * 60
-        held = time.time() - pos.entry_time
-        if held >= max_hold:
-            # If trailing is active and config says extend, trust trailing
-            if pos.trailing_active and strat.get("time_limit_extend_trailing", True):
-                logger.debug(f"{pos.symbol} time limit hit but trailing active, "
-                             f"letting trailing handle exit")
-                return False
-            # If near breakeven and config says extend, give 2x more time
-            if strat.get("time_limit_extend_breakeven", True):
-                lev = max(pos.leverage, 1)
-                fee_roi = strat.get("fee_pct", 0.10) / 100.0 * lev * 100
-                if pos.side == OrderSide.BUY_LONG:
-                    roi = (price - pos.entry_price) / pos.entry_price * lev * 100
-                else:
-                    roi = (pos.entry_price - price) / pos.entry_price * lev * 100
-                if roi > -fee_roi and held < max_hold * 2:
-                    return False
-            return True
+        # TIME_LIMIT devre dışı: pozisyon çıkışı borsadaki SL/trailing emrine bırakılır.
+        # Yazılım tarafında süre bazlı kapatma yapılmaz.
         return False
 
     # ──── PnL helpers ────
@@ -1884,3 +1911,116 @@ class PositionManager:
             "entry_bb_width": pos.entry_bb_width,
             "regime_switched": pos.regime_switched,
         }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SYSTEM M — AlphaTrend PRO: sinyal bazlı (SL/TP yok)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _check_system_n_m(self, pos: ActivePosition, price: float) -> str:
+        """System M/N exit logic — sinyal bazlı, opsiyonel SL.
+
+        Çıkış kararları state_machine tarafından yapılır.
+        Burada emergency (likidasyon koruması) + software SL yedek kontrol edilir.
+        """
+        tag = "SysN" if pos.entry_mode == "SYSTEM_N" else "SysM"
+        # Emergency: likidasyon koruması (kaldıraçlı işlemler için)
+        if pos.emergency_close_price > 0:
+            if pos.side == OrderSide.BUY_LONG and price <= pos.emergency_close_price:
+                logger.warning(f"[{tag}] {pos.symbol}: EMERGENCY CLOSE (LONG) "
+                               f"price={price:.4f} <= emergency={pos.emergency_close_price:.4f}")
+                return "EMERGENCY"
+            if pos.side == OrderSide.SELL_SHORT and price >= pos.emergency_close_price:
+                logger.warning(f"[{tag}] {pos.symbol}: EMERGENCY CLOSE (SHORT) "
+                               f"price={price:.4f} >= emergency={pos.emergency_close_price:.4f}")
+                return "EMERGENCY"
+
+        # Software SL yedek (server SL çalışmazsa — ağ kopması vb.)
+        sl_price = pos.initial_sl
+        if sl_price > 0:
+            if pos.side == OrderSide.BUY_LONG and price <= sl_price:
+                logger.warning(f"[{tag}] {pos.symbol}: SOFTWARE SL (LONG) "
+                               f"price={price:.4f} <= SL={sl_price:.4f}")
+                return self.EXIT_SL
+            if pos.side == OrderSide.SELL_SHORT and price >= sl_price:
+                logger.warning(f"[{tag}] {pos.symbol}: SOFTWARE SL (SHORT) "
+                               f"price={price:.4f} >= SL={sl_price:.4f}")
+                return self.EXIT_SL
+
+        return "HOLD"
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SYSTEM J — Max Leverage First: 5-level exit cascade
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _check_system_j(self, pos: ActivePosition, price: float,
+                        confluence: dict = None, divergences: list = None) -> str:
+        """System J exit logic — 5-level priority cascade.
+
+        Server-side: SL (STOP_MARKET) + trailing/TP Binance'de çalışır.
+        Software tarafı yedek kontrol:
+        0. Emergency anti-liquidation
+        1. Software SL (yedek)
+        2. Signal exit (confluence reversal)
+        3. TP target (ranging sabit TP)
+        4. Trailing stop (software yedek)
+        5. Time limit (opsiyonel)
+        """
+        strat = self._config.get("strategy", {})
+        sj_cfg = self._config.get("system_j", {})
+        opt = sj_cfg.get("optional", {})
+        confluence = confluence or {}
+
+        # === 0. EMERGENCY (always active) ===
+        if strat.get("emergency_enabled", True):
+            if self._check_emergency_close(pos, price):
+                return self.EXIT_EMERGENCY
+
+        # === 1. SOFTWARE SL (yedek — server SL birincil) ===
+        if strat.get("sl_enabled", True):
+            if self._check_stop_loss(pos, price):
+                return self.EXIT_SL
+
+        # === 2. SIGNAL EXIT (confluence reversal) ===
+        if opt.get("signal_exit_enabled", True):
+            if self._check_confluence_reversal(pos, confluence, price):
+                return self.EXIT_CONFLUENCE
+
+        # === 3. TP TARGET (server-side ile tutarlı: initial_tp kullan) ===
+        sl_pct_stored = getattr(pos, 'entry_bb_width', 0)
+        entry_regime = getattr(pos, 'entry_regime', '')
+
+        if pos.initial_tp and pos.initial_tp > 0:
+            if pos.side == OrderSide.BUY_LONG:
+                if price >= pos.initial_tp:
+                    logger.info(f"[SysJ] {pos.symbol} TP hit: "
+                                f"price={price:.6f} >= tp={pos.initial_tp:.6f}")
+                    return self.EXIT_TP
+            else:
+                if price <= pos.initial_tp:
+                    logger.info(f"[SysJ] {pos.symbol} TP hit: "
+                                f"price={price:.6f} <= tp={pos.initial_tp:.6f}")
+                    return self.EXIT_TP
+
+        # === 4. TRAILING (software yedek) ===
+        if sl_pct_stored > 0 and strat.get("trailing_enabled", True):
+            self._update_trailing(pos, price)
+            if self._check_trailing(pos, price):
+                return self.EXIT_TRAILING_RENEW
+
+        # === 5. TIME LIMIT ===
+        if opt.get("time_limit_enabled", True):
+            max_hours = opt.get("time_limit_hours", 8)
+            elapsed = time.time() - pos.entry_time
+            pnl = self._get_pnl_pct(pos, price)
+            if elapsed >= max_hours * 3600 and pnl >= 0:
+                # Kârda + süre doldu → kapat
+                logger.info(f"[SysJ] {pos.symbol} time limit ({max_hours}h), "
+                            f"kârda → kapat (PnL={pnl:+.2f}%)")
+                return self.EXIT_TIME
+            elif elapsed >= max_hours * 2 * 3600:
+                # Zararda 2x süre geçtiyse → zorla kapat (sonsuz beklemeyi önle)
+                logger.info(f"[SysJ] {pos.symbol} extended time limit ({max_hours*2}h), "
+                            f"zararda → zorla kapat (PnL={pnl:+.2f}%)")
+                return self.EXIT_TIME
+
+        return "HOLD"

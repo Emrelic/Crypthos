@@ -136,13 +136,8 @@ class SystemNPanel(ctk.CTkFrame):
         self._start_refresh()
 
     def _build_ui(self) -> None:
-        # ═══ TEK SCROLLABLE FRAME — her sey bunun icinde ═══
-        self._main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self._main_scroll.pack(fill="both", expand=True, padx=0, pady=0)
-        _root = self._main_scroll
-
         # ═══ TOP BAR: Mode + Stats ═══
-        top = ctk.CTkFrame(_root, fg_color="transparent")
+        top = ctk.CTkFrame(self)
         top.pack(fill="x", padx=8, pady=(6, 2))
 
         self._mode_label = ctk.CTkLabel(
@@ -158,7 +153,7 @@ class SystemNPanel(ctk.CTkFrame):
         self._stats_label.pack(side="right")
 
         # ═══ TAB BUTTONS (kendi segmented button'umuz) ═══
-        tab_bar = ctk.CTkFrame(_root, fg_color="transparent")
+        tab_bar = ctk.CTkFrame(self)
         tab_bar.pack(fill="x", padx=8, pady=(4, 2))
 
         self._tab_btns = {}
@@ -177,32 +172,28 @@ class SystemNPanel(ctk.CTkFrame):
             btn.pack(side="left", padx=3)
             self._tab_btns[key] = btn
 
-        # ═══ CONTENT AREA — tab icerik frameleri buraya ═══
-        self._content_area = ctk.CTkFrame(_root, fg_color="transparent")
-        self._content_area.pack(fill="both", expand=True, padx=0, pady=0)
-
-        # ═══ CONTENT FRAMES ═══
+        # ═══ CONTENT FRAMES (her biri ayri, show/hide ile) ═══
 
         # --- SCAN ---
-        self._scan_frame = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        self._scan_frame = ctk.CTkFrame(self)
         ctk.CTkLabel(
             self._scan_frame, text="ALPHATREND PRO TARAMA",
             font=ctk.CTkFont(size=_TITLE_FONT_SZ, weight="bold"),
             text_color="#FFFFFF",
         ).pack(anchor="w", padx=8, pady=(4, 0))
         _make_header_row(self._scan_frame, SN_SCAN_HEADERS, SN_SCAN_WIDTHS, _SN_IMP)
-        self._scan_scroll = ctk.CTkScrollableFrame(self._scan_frame, fg_color="transparent")
+        self._scan_scroll = ctk.CTkScrollableFrame(self._scan_frame)
         self._scan_scroll.pack(fill="both", expand=True, padx=4, pady=(2, 4))
 
         # --- POS ---
-        self._pos_frame = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        self._pos_frame = ctk.CTkFrame(self)
         ctk.CTkLabel(
             self._pos_frame, text="AKTIF POZISYONLAR",
             font=ctk.CTkFont(size=_TITLE_FONT_SZ, weight="bold"),
             text_color="#FFFFFF",
         ).pack(anchor="w", padx=8, pady=(4, 0))
         _make_header_row(self._pos_frame, SN_POS_HEADERS, SN_POS_WIDTHS, _SN_POS_IMP)
-        self._pos_scroll = ctk.CTkScrollableFrame(self._pos_frame, fg_color="transparent")
+        self._pos_scroll = ctk.CTkScrollableFrame(self._pos_frame)
         self._pos_scroll.pack(fill="both", expand=True, padx=4, pady=(2, 4))
         self._pos_empty_label = ctk.CTkLabel(
             self._pos_scroll, text="Henuz aktif pozisyon yok",
@@ -211,9 +202,9 @@ class SystemNPanel(ctk.CTkFrame):
         self._pos_empty_label.pack(pady=30)
 
         # --- DEC ---
-        self._dec_frame = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        self._dec_frame = ctk.CTkFrame(self)
 
-        dec_bar = ctk.CTkFrame(self._dec_frame, fg_color="transparent")
+        dec_bar = ctk.CTkFrame(self._dec_frame)
         dec_bar.pack(fill="x", padx=8, pady=(4, 0))
         ctk.CTkLabel(
             dec_bar, text="TRADE KARARLARI",
@@ -221,7 +212,7 @@ class SystemNPanel(ctk.CTkFrame):
             text_color="#FFFFFF",
         ).pack(side="left")
 
-        filter_box = ctk.CTkFrame(dec_bar, fg_color="transparent")
+        filter_box = ctk.CTkFrame(dec_bar)
         filter_box.pack(side="right")
         self._filter_btns = {}
         for label, key in [("Tumu", "all"), ("Sinyaller", "signals"), ("Islemler", "trades")]:
@@ -236,11 +227,11 @@ class SystemNPanel(ctk.CTkFrame):
             self._filter_btns[key] = btn
 
         _make_header_row(self._dec_frame, SN_DEC_HEADERS, SN_DEC_WIDTHS, _SN_DEC_IMP)
-        self._dec_scroll = ctk.CTkScrollableFrame(self._dec_frame, fg_color="transparent")
+        self._dec_scroll = ctk.CTkScrollableFrame(self._dec_frame)
         self._dec_scroll.pack(fill="both", expand=True, padx=4, pady=(2, 4))
 
         # --- SETTINGS ---
-        self._settings_frame = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        self._settings_frame = ctk.CTkFrame(self)
         self._build_settings(self._settings_frame)
 
         # Baslangicta SCAN goster
@@ -271,7 +262,7 @@ class SystemNPanel(ctk.CTkFrame):
     def _build_settings(self, parent) -> None:
         """Tum System N ayarlari — trade modu, indikatorler, pozisyon, SL, filtreler."""
         cfg = self.controller.config
-        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll = ctk.CTkScrollableFrame(parent)
         scroll.pack(fill="both", expand=True, padx=8, pady=4)
 
         lbl_font = ctk.CTkFont(size=13)
@@ -282,7 +273,7 @@ class SystemNPanel(ctk.CTkFrame):
 
         def _row(parent_frame, label, var_widget_fn, hint=""):
             """Yardimci: label + widget + hint satiri."""
-            r = ctk.CTkFrame(parent_frame, fg_color="transparent")
+            r = ctk.CTkFrame(parent_frame)
             r.pack(fill="x", pady=2)
             ctk.CTkLabel(r, text=label, font=lbl_font,
                          text_color=dc, width=180).pack(side="left")
@@ -343,6 +334,17 @@ class SystemNPanel(ctk.CTkFrame):
                  command=self._save_settings,
              ).pack(side="left"),
              "(sinyal gelince pozisyonu cevir)")
+
+        # Reverse sizing mode
+        self._reverse_sizing_var = ctk.StringVar(
+            value=cfg.get("system_n.reverse_sizing", "fresh"))
+        _row(scroll, "Reverse Boyut:",
+             lambda r: ctk.CTkOptionMenu(
+                 r, variable=self._reverse_sizing_var,
+                 values=["fresh", "full"],
+                 width=120, command=lambda _: self._save_settings(),
+             ).pack(side="left"),
+             "(fresh: yeni hesap, full: eski miktarla)")
 
         # Max leverage
         self._max_lev_var = ctk.StringVar(
@@ -498,14 +500,22 @@ class SystemNPanel(ctk.CTkFrame):
 
         # Sizing mode
         self._sizing_mode_var = ctk.StringVar(
-            value=cfg.get("system_n.position.sizing_mode", "divider"))
+            value=cfg.get("system_n.position.sizing_mode", "hybrid"))
         _row(scroll, "Pozisyon Modu:",
              lambda r: ctk.CTkOptionMenu(
                  r, variable=self._sizing_mode_var,
-                 values=["divider", "min_notional"],
+                 values=["hybrid", "divider", "min_notional"],
                  width=140, command=lambda _: self._save_settings(),
              ).pack(side="left"),
-             "(divider: bakiye/N, min_notional: min tutar bazli)")
+             "(hybrid: esik altinda min, ustunde 1/N)")
+
+        # Hybrid threshold (hibrit mod icin esik deger)
+        self._hybrid_threshold_var = ctk.StringVar(
+            value=str(cfg.get("system_n.position.hybrid_threshold_usd", 12.0)))
+        _row(scroll, "Hibrit Esik ($):",
+             lambda r: ctk.CTkEntry(r, textvariable=self._hybrid_threshold_var,
+                                     width=80).pack(side="left"),
+             "(bakiye < esik: minimum, >= esik: 1/N)")
 
         # Portfolio divider
         self._divider_var = ctk.StringVar(
@@ -678,6 +688,7 @@ class SystemNPanel(ctk.CTkFrame):
             cfg.set("system_n.trading_mode", self._trading_mode_var.get())
             cfg.set("system_n.short_enabled", self._short_enabled_var.get())
             cfg.set("system_n.reverse_enabled", self._reverse_enabled_var.get())
+            cfg.set("system_n.reverse_sizing", self._reverse_sizing_var.get())
             cfg.set("system_n.coin_mode", self._coin_mode_var.get())
             cfg.set("system_n.timeframe", self._default_tf_var.get())
 
@@ -715,6 +726,7 @@ class SystemNPanel(ctk.CTkFrame):
                 ("system_n.indicators.adx_dyn_mult", self._adx_dyn_mult_var, float),
                 ("system_n.indicators.slope_factor", self._slope_factor_var, float),
                 ("system_n.position.portfolio_divider", self._divider_var, int),
+                ("system_n.position.hybrid_threshold_usd", self._hybrid_threshold_var, float),
                 ("system_n.position.min_notional_usd", self._min_notional_usd_var, float),
                 ("system_n.position.max_positions", self._max_pos_var, int),
                 ("system_n.position.min_position_usd", self._min_pos_var, float),
@@ -754,9 +766,9 @@ class SystemNPanel(ctk.CTkFrame):
         self.after(2000, self._refresh_loop)
 
     def _update_all(self) -> None:
-        results = self.controller.get_system_n_results()
-        positions = self.controller.get_all_scanner_positions()
-        decisions = self.controller.get_system_n_decisions()
+        results = self.controller.get_system_n_results() or []
+        positions = self.controller.get_all_scanner_positions() or []
+        decisions = self.controller.get_system_n_decisions() or []
 
         # Mode
         cfg = self.controller.config

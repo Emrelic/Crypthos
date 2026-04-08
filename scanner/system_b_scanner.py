@@ -141,6 +141,33 @@ def compute_efficiency_ratio(closes: np.ndarray) -> float:
     return net_move / total_move
 
 
+def compute_rolling_er(closes: np.ndarray, window: int = 20,
+                       median_count: int = 10) -> float:
+    """Rolling ER: son `window` mumlu pencerelerden `median_count` tanesinin medyani.
+
+    Tek uzun pencere yerine kisa pencereler kullanir. Kripto piyasasinda
+    uzun pencere (200-500 mum) ER'yi her zaman ~0'a ceker cunku her mum
+    geri-ileri saliniyor. Kisa pencere (20 mum) gercek rejimi yakalar.
+
+    Returns:
+        Son N rolling ER'nin medyani (0.0 - 1.0).
+    """
+    if len(closes) < window + median_count:
+        # Yetersiz veri — fallback: son `window` mumun ER'si
+        return compute_efficiency_ratio(closes[-window:] if len(closes) >= window else closes)
+
+    ers = []
+    for i in range(len(closes) - window + 1):
+        segment = closes[i:i + window]
+        net = abs(segment[-1] - segment[0])
+        total = np.sum(np.abs(np.diff(segment)))
+        ers.append(net / total if total > 0 else 0.0)
+
+    # Son median_count pencerenin medyani (yakin gecmis rejim)
+    recent = ers[-median_count:]
+    return float(np.median(recent))
+
+
 def compute_hurst_exponent(closes: np.ndarray) -> float:
     """R/S analizi ile Hurst exponent hesaplama.
     H < 0.45 → ranging, H 0.45-0.55 → belirsiz, H > 0.55 → trend."""
@@ -174,6 +201,52 @@ def compute_hurst_exponent(closes: np.ndarray) -> float:
     x = np.array([v[0] for v in rs_values])
     y = np.array([v[1] for v in rs_values])
     # Linear regression: y = H * x + c
+    n_pts = len(x)
+    H = (n_pts * np.sum(x * y) - np.sum(x) * np.sum(y)) / \
+        (n_pts * np.sum(x ** 2) - np.sum(x) ** 2)
+
+    return float(np.clip(H, 0.0, 1.0))
+
+
+def compute_hurst_improved(closes: np.ndarray) -> float:
+    """Gelistirilmis Hurst: 11 chunk size, overlapping pencereler.
+
+    Mevcut 4-chunk versiyonuna gore daha stabil (dusuk std, dar range).
+    Overlapping pencereler daha fazla veri noktasi saglar, regresyon
+    guvenilirligi artar.
+
+    Returns:
+        Hurst exponent (0.0 - 1.0). 0.5 = random walk.
+    """
+    if len(closes) < 128:
+        return 0.5
+
+    log_returns = np.diff(np.log(closes))
+    ns = [8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+    ns = [n for n in ns if n <= len(log_returns)]
+    if len(ns) < 4:
+        return 0.5
+
+    rs_values = []
+    for n in ns:
+        rs_list = []
+        step = max(1, n // 2)  # overlapping: %50 overlap
+        for start in range(0, len(log_returns) - n + 1, step):
+            chunk = log_returns[start:start + n]
+            mean_chunk = np.mean(chunk)
+            deviations = np.cumsum(chunk - mean_chunk)
+            R = np.max(deviations) - np.min(deviations)
+            S = np.std(chunk, ddof=1)
+            if S > 0:
+                rs_list.append(R / S)
+        if rs_list:
+            rs_values.append((np.log(n), np.log(np.mean(rs_list))))
+
+    if len(rs_values) < 4:
+        return 0.5
+
+    x = np.array([v[0] for v in rs_values])
+    y = np.array([v[1] for v in rs_values])
     n_pts = len(x)
     H = (n_pts * np.sum(x * y) - np.sum(x) * np.sum(y)) / \
         (n_pts * np.sum(x ** 2) - np.sum(x) ** 2)

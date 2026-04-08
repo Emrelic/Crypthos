@@ -1,10 +1,85 @@
 import sys
 import os
+import atexit
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from loguru import logger
+
+# ── Single Instance Lock ──
+_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", ".crypthos.lock")
+_lock_fh = None
+
+
+def _is_crypthos_process(pid: int) -> bool:
+    """PID'nin gerçekten bir Crypthos (python) process'i olup olmadığını kontrol et."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        output = result.stdout.strip().lower()
+        return "python" in output
+    except Exception:
+        return False
+
+
+def _kill_old_instance(pid: int):
+    """Eski Crypthos instance'ını kapat."""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # PROCESS_TERMINATE = 0x0001
+        handle = kernel32.OpenProcess(0x0001, False, pid)
+        if handle:
+            kernel32.TerminateProcess(handle, 0)
+            kernel32.CloseHandle(handle)
+            print(f"Eski Crypthos instance kapatildi (PID {pid}).")
+            import time
+            time.sleep(1)  # Process'in kapanmasını bekle
+    except Exception as e:
+        print(f"Eski instance kapatma hatasi: {e}")
+
+
+def _acquire_lock():
+    """Dosya kilidi ile çoklu instance'ı engelle.
+
+    Eski instance çalışıyorsa otomatik kapatır ve yenisini başlatır.
+    """
+    global _lock_fh
+    os.makedirs(os.path.dirname(_LOCK_FILE), exist_ok=True)
+    try:
+        if os.path.exists(_LOCK_FILE):
+            try:
+                with open(_LOCK_FILE, "r") as f:
+                    old_pid = int(f.read().strip())
+                if old_pid == os.getpid():
+                    pass  # Kendi PID'imiz, devam et
+                elif _is_crypthos_process(old_pid):
+                    print(f"Eski Crypthos instance bulundu (PID {old_pid}), kapatiliyor...")
+                    _kill_old_instance(old_pid)
+                # else: PID artık Crypthos değil, lock dosyası stale
+            except (ValueError, OSError):
+                pass  # Eski lock dosyası geçersiz, devam et
+        _lock_fh = open(_LOCK_FILE, "w")
+        _lock_fh.write(str(os.getpid()))
+        _lock_fh.flush()
+    except Exception as e:
+        print(f"Lock dosyası oluşturulamadı: {e}")
+
+
+def _release_lock():
+    """Çıkışta lock dosyasını sil."""
+    global _lock_fh
+    try:
+        if _lock_fh:
+            _lock_fh.close()
+        if os.path.exists(_LOCK_FILE):
+            os.remove(_LOCK_FILE)
+    except Exception:
+        pass
 from core.config_manager import ConfigManager
 from core.event_bus import EventBus
 from core.app_controller import AppController
@@ -30,6 +105,10 @@ logger.add("data/crypthos.log", rotation="10 MB", retention="7 days", level="DEB
 
 
 def main():
+    # Tek instance kontrolü
+    _acquire_lock()
+    atexit.register(_release_lock)
+
     logger.info("Crypthos Trading Bot starting...")
 
     # Initialize core
@@ -149,6 +228,19 @@ def main():
     # Launch GUI (blocking mainloop)
     app = MainWindow(controller)
     app.mainloop()
+
+    # Temiz shutdown: scanner ve servisleri durdur (interpreter shutdown hatasını önler)
+    logger.info("Shutting down...")
+    try:
+        if hasattr(controller, 'scanner') and controller.scanner:
+            controller.scanner.stop()
+            logger.info("Scanner stopped")
+    except Exception as e:
+        logger.debug(f"Scanner stop error: {e}")
+    try:
+        controller.stop()
+    except Exception:
+        pass
 
     logger.info("Crypthos Trading Bot stopped.")
 

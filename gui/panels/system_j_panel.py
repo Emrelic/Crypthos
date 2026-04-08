@@ -88,7 +88,7 @@ class SystemJPanel(ctk.CTkFrame):
 
     def _build_ui(self) -> None:
         # ═══ STATS BAR ═══
-        stats_frame = ctk.CTkFrame(self, fg_color="transparent")
+        stats_frame = ctk.CTkFrame(self)
         stats_frame.pack(fill="x", padx=4, pady=(2, 0))
 
         self._stats_label = ctk.CTkLabel(
@@ -116,7 +116,7 @@ class SystemJPanel(ctk.CTkFrame):
         ).pack(anchor="w", padx=4, pady=(1, 0))
 
         # Legend
-        legend = ctk.CTkFrame(tab_scan, fg_color="transparent", height=16)
+        legend = ctk.CTkFrame(tab_scan, height=16)
         legend.pack(fill="x", padx=4)
         for p, (label, color) in enumerate(
             [(f"T1: Max Kaldirac", _PASS_COLORS[1]),
@@ -242,7 +242,7 @@ class SystemJPanel(ctk.CTkFrame):
         self._scan_rows.clear()
 
         for i, row_data in enumerate(new_cache):
-            row_frame = ctk.CTkFrame(self._scan_scroll, fg_color="transparent", height=20)
+            row_frame = ctk.CTkFrame(self._scan_scroll, height=20)
             row_frame.pack(fill="x", padx=1, pady=0)
             for j, (text, color, width) in enumerate(row_data):
                 ctk.CTkLabel(
@@ -342,7 +342,7 @@ class SystemJPanel(ctk.CTkFrame):
         row_list.clear()
 
         for row_data in new_cache:
-            row_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent", height=20)
+            row_frame = ctk.CTkFrame(scroll_frame, height=20)
             row_frame.pack(fill="x", padx=1, pady=0)
             for text, color, width in row_data:
                 ctk.CTkLabel(

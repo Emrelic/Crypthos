@@ -98,32 +98,56 @@ class TradeReportPanel(ctk.CTkFrame):
                       fg_color="#FF9800", hover_color="#FFB74D",
                       command=self._import_from_binance).pack(side="right", padx=5)
 
-        # ── Summary Cards ──
-        self._summary_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self._summary_frame.pack(fill="x", padx=10, pady=5)
+        # ── Summary Cards (2 rows) ──
         self._summary_cards = {}
-        card_defs = [
+
+        # Row 1: Temel metrikler
+        row1 = ctk.CTkFrame(self, fg_color="transparent")
+        row1.pack(fill="x", padx=10, pady=(5, 1))
+        row1_defs = [
             ("total_trades", "Toplam Islem", "0", "#2196F3"),
+            ("total_volume", "Islem Hacmi", "$0", "#42A5F5"),
             ("win_rate", "Kazanma Orani", "%0", "#00C853"),
+            ("total_profit", "Toplam Kar", "$0.00", "#00E676"),
+            ("total_loss", "Toplam Zarar", "$0.00", "#FF5252"),
             ("total_pnl", "Net Kar/Zarar", "$0.00", "#FF9800"),
-            ("total_fee", "Toplam Fee", "$0.00", "#FF1744"),
-            ("avg_hold", "Ort. Pozisyon", "0dk", "#9C27B0"),
-            ("best_trade", "En Iyi", "$0.00", "#00E676"),
-            ("worst_trade", "En Kotu", "$0.00", "#FF5252"),
-            ("avg_leverage", "Ort. Kaldirac", "0x", "#607D8B"),
+            ("total_fee", "Toplam Fee", "$0.00", "#E91E63"),
+            ("profit_factor", "Kar Faktoru", "0.0", "#FFC107"),
         ]
-        for i, (key, label, default, color) in enumerate(card_defs):
-            card = ctk.CTkFrame(self._summary_frame, fg_color="#1a1a2e",
-                                corner_radius=8, width=140, height=70)
-            card.pack(side="left", fill="x", expand=True, padx=3)
-            card.pack_propagate(False)
-            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=10),
-                         text_color="gray").pack(pady=(8, 0))
-            val_lbl = ctk.CTkLabel(card, text=default,
-                                    font=ctk.CTkFont(size=16, weight="bold"),
-                                    text_color=color)
-            val_lbl.pack(pady=(0, 5))
-            self._summary_cards[key] = val_lbl
+        for key, label, default, color in row1_defs:
+            self._make_card(row1, key, label, default, color)
+
+        # Row 2: Detay metrikler
+        row2 = ctk.CTkFrame(self, fg_color="transparent")
+        row2.pack(fill="x", padx=10, pady=(1, 5))
+        row2_defs = [
+            ("sl_total", "Stop Loss", "$0.00", "#FF1744"),
+            ("tp_total", "Take Profit", "$0.00", "#00C853"),
+            ("trail_total", "Trailing Stop", "$0.00", "#FF9800"),
+            ("liq_total", "Likidasyon", "$0.00", "#D50000"),
+            ("signal_total", "Sinyal Cikis", "$0.00", "#2196F3"),
+            ("avg_hold", "Ort. Sure", "0dk", "#9C27B0"),
+            ("avg_leverage", "Ort. Kaldirac", "0x", "#607D8B"),
+            ("long_short", "Long/Short", "0/0", "#00BCD4"),
+        ]
+        for key, label, default, color in row2_defs:
+            self._make_card(row2, key, label, default, color)
+
+        # Row 3: Streak + risk metrikleri
+        row3 = ctk.CTkFrame(self, fg_color="transparent")
+        row3.pack(fill="x", padx=10, pady=(1, 5))
+        row3_defs = [
+            ("best_trade", "En Iyi Islem", "$0.00", "#00E676"),
+            ("worst_trade", "En Kotu Islem", "$0.00", "#FF5252"),
+            ("avg_win", "Ort. Kazanc", "$0.00", "#66BB6A"),
+            ("avg_loss", "Ort. Kayip", "$0.00", "#EF5350"),
+            ("max_win_streak", "Max Kazanc Serisi", "0", "#00C853"),
+            ("max_loss_streak", "Max Kayip Serisi", "0", "#FF1744"),
+            ("max_drawdown", "Max Drawdown", "$0.00", "#D50000"),
+            ("best_coin", "En Iyi Coin", "--", "#FFD600"),
+        ]
+        for key, label, default, color in row3_defs:
+            self._make_card(row3, key, label, default, color)
 
         # ── Exit Reason Breakdown ──
         self._breakdown_frame = ctk.CTkFrame(self, fg_color="#1a1a2e", corner_radius=8)
@@ -156,6 +180,21 @@ class TradeReportPanel(ctk.CTkFrame):
 
         self._table_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self._table_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _make_card(self, parent, key: str, label: str,
+                   default: str, color: str) -> None:
+        """Create a summary stat card."""
+        card = ctk.CTkFrame(parent, fg_color="#1a1a2e",
+                            corner_radius=8, height=62)
+        card.pack(side="left", fill="x", expand=True, padx=2)
+        card.pack_propagate(False)
+        ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=9),
+                     text_color="gray").pack(pady=(6, 0))
+        val_lbl = ctk.CTkLabel(card, text=default,
+                                font=ctk.CTkFont(size=14, weight="bold"),
+                                text_color=color)
+        val_lbl.pack(pady=(0, 4))
+        self._summary_cards[key] = val_lbl
 
     def _quick_range(self, hours: int) -> None:
         self._start_entry.delete(0, "end")
@@ -198,33 +237,147 @@ class TradeReportPanel(ctk.CTkFrame):
             return
 
         total = len(trades)
-        wins = sum(1 for t in trades if t.get("pnl_usdt", 0) > 0)
-        losses = sum(1 for t in trades if t.get("pnl_usdt", 0) < 0)
-        breakeven = total - wins - losses
-        win_rate = (wins / total * 100) if total > 0 else 0
-        total_pnl = sum(t.get("pnl_usdt", 0) for t in trades)
-        total_fee = sum(t.get("fee_usdt", 0) for t in trades)
-        avg_hold = sum(t.get("hold_seconds", 0) for t in trades) / total if total else 0
         pnls = [t.get("pnl_usdt", 0) for t in trades]
-        best = max(pnls) if pnls else 0
-        worst = min(pnls) if pnls else 0
+        wins = sum(1 for p in pnls if p > 0)
+        losses = sum(1 for p in pnls if p < 0)
+        win_rate = (wins / total * 100) if total > 0 else 0
+
+        total_profit = sum(p for p in pnls if p > 0)
+        total_loss = sum(p for p in pnls if p < 0)
+        total_pnl = sum(pnls)
+        total_fee = sum(t.get("fee_usdt", 0) for t in trades)
+        total_volume = sum(t.get("notional_usdt", 0) or
+                           (t.get("margin_usdt", 0) * t.get("leverage", 1))
+                           for t in trades)
+        profit_factor = abs(total_profit / total_loss) if total_loss != 0 else 0.0
+
+        avg_hold = sum(t.get("hold_seconds", 0) for t in trades) / total
         leverages = [t.get("leverage", 1) for t in trades if t.get("leverage", 0) > 0]
         avg_lev = sum(leverages) / len(leverages) if leverages else 0
 
+        best = max(pnls)
+        worst = min(pnls)
+        avg_win = total_profit / wins if wins > 0 else 0
+        avg_loss = total_loss / losses if losses > 0 else 0
+
+        # Long/Short sayisi
+        long_count = sum(1 for t in trades
+                         if "Buy" in t.get("side", "") or "LONG" in t.get("side", "").upper())
+        short_count = total - long_count
+
+        # Exit reason bazli PnL toplami
+        exit_pnl = {}
+        exit_count = {}
+        for t in trades:
+            r = t.get("exit_reason", "unknown")
+            exit_pnl[r] = exit_pnl.get(r, 0) + t.get("pnl_usdt", 0)
+            exit_count[r] = exit_count.get(r, 0) + 1
+
+        sl_pnl = exit_pnl.get("STOP_LOSS", 0)
+        tp_pnl = exit_pnl.get("TAKE_PROFIT", 0) + exit_pnl.get("PARTIAL_TP", 0)
+        trail_pnl = (exit_pnl.get("TRAILING_STOP", 0) +
+                     exit_pnl.get("TRAILING_RENEW", 0))
+        liq_pnl = (exit_pnl.get("EMERGENCY_ANTI_LIQ", 0) +
+                   exit_pnl.get("LIQUIDATION", 0))
+        signal_pnl = (exit_pnl.get("CONFLUENCE_REVERSAL", 0) +
+                      exit_pnl.get("DIVERGENCE_WARNING", 0))
+
+        sl_n = exit_count.get("STOP_LOSS", 0)
+        tp_n = exit_count.get("TAKE_PROFIT", 0) + exit_count.get("PARTIAL_TP", 0)
+        trail_n = exit_count.get("TRAILING_STOP", 0) + exit_count.get("TRAILING_RENEW", 0)
+        liq_n = exit_count.get("EMERGENCY_ANTI_LIQ", 0) + exit_count.get("LIQUIDATION", 0)
+        signal_n = (exit_count.get("CONFLUENCE_REVERSAL", 0) +
+                    exit_count.get("DIVERGENCE_WARNING", 0))
+
+        # Max consecutive win/loss streak
+        max_w_streak = max_l_streak = cur_w = cur_l = 0
+        for p in pnls:
+            if p > 0:
+                cur_w += 1
+                cur_l = 0
+            elif p < 0:
+                cur_l += 1
+                cur_w = 0
+            else:
+                cur_w = cur_l = 0
+            max_w_streak = max(max_w_streak, cur_w)
+            max_l_streak = max(max_l_streak, cur_l)
+
+        # Max drawdown (equity curve)
+        equity = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for p in pnls:
+            equity += p
+            if equity > peak:
+                peak = equity
+            dd = peak - equity
+            if dd > max_dd:
+                max_dd = dd
+
+        # Best coin
+        coin_pnl = {}
+        for t in trades:
+            sym = t.get("symbol", "").replace("USDT", "")
+            coin_pnl[sym] = coin_pnl.get(sym, 0) + t.get("pnl_usdt", 0)
+        best_coin = max(coin_pnl, key=coin_pnl.get) if coin_pnl else "--"
+        best_coin_pnl = coin_pnl.get(best_coin, 0)
+
+        # ── Row 1 ──
         self._summary_cards["total_trades"].configure(
             text=f"{total} ({wins}K/{losses}Z)")
+        self._summary_cards["total_volume"].configure(
+            text=f"${total_volume:.2f}")
         self._summary_cards["win_rate"].configure(
             text=f"%{win_rate:.0f}",
             text_color="#00C853" if win_rate >= 50 else "#FF9800" if win_rate >= 30 else "#FF1744")
+        self._summary_cards["total_profit"].configure(
+            text=f"${total_profit:+.4f}")
+        self._summary_cards["total_loss"].configure(
+            text=f"${total_loss:+.4f}")
         self._summary_cards["total_pnl"].configure(
             text=f"${total_pnl:+.4f}",
             text_color="#00C853" if total_pnl >= 0 else "#FF1744")
-        self._summary_cards["total_fee"].configure(text=f"${total_fee:.4f}")
+        self._summary_cards["total_fee"].configure(
+            text=f"${total_fee:.4f}")
+        pf_color = "#00C853" if profit_factor >= 1.5 else "#FF9800" if profit_factor >= 1.0 else "#FF1744"
+        self._summary_cards["profit_factor"].configure(
+            text=f"{profit_factor:.2f}", text_color=pf_color)
+
+        # ── Row 2 ──
+        self._summary_cards["sl_total"].configure(
+            text=f"${sl_pnl:+.4f} ({sl_n})")
+        self._summary_cards["tp_total"].configure(
+            text=f"${tp_pnl:+.4f} ({tp_n})")
+        self._summary_cards["trail_total"].configure(
+            text=f"${trail_pnl:+.4f} ({trail_n})")
+        self._summary_cards["liq_total"].configure(
+            text=f"${liq_pnl:+.4f} ({liq_n})",
+            text_color="#D50000" if liq_n > 0 else "gray")
+        self._summary_cards["signal_total"].configure(
+            text=f"${signal_pnl:+.4f} ({signal_n})")
         avg_m = int(avg_hold // 60)
         self._summary_cards["avg_hold"].configure(text=f"{avg_m}dk")
+        self._summary_cards["avg_leverage"].configure(text=f"{avg_lev:.0f}x")
+        self._summary_cards["long_short"].configure(
+            text=f"{long_count}L / {short_count}S")
+
+        # ── Row 3 ──
         self._summary_cards["best_trade"].configure(text=f"${best:+.4f}")
         self._summary_cards["worst_trade"].configure(text=f"${worst:+.4f}")
-        self._summary_cards["avg_leverage"].configure(text=f"{avg_lev:.0f}x")
+        self._summary_cards["avg_win"].configure(text=f"${avg_win:+.4f}")
+        self._summary_cards["avg_loss"].configure(text=f"${avg_loss:+.4f}")
+        self._summary_cards["max_win_streak"].configure(text=f"{max_w_streak}")
+        self._summary_cards["max_loss_streak"].configure(
+            text=f"{max_l_streak}",
+            text_color="#FF1744" if max_l_streak >= 3 else "#FF9800" if max_l_streak >= 2 else "gray")
+        self._summary_cards["max_drawdown"].configure(
+            text=f"${max_dd:.4f}",
+            text_color="#D50000" if max_dd > 0.5 else "#FF9800" if max_dd > 0.1 else "gray")
+        bc_text = f"{best_coin}" if best_coin != "--" else "--"
+        if best_coin != "--":
+            bc_text += f" ({best_coin_pnl:+.3f})"
+        self._summary_cards["best_coin"].configure(text=bc_text)
 
     def _update_breakdown(self, trades: list) -> None:
         for w in self._breakdown_inner.winfo_children():

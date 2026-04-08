@@ -27,7 +27,9 @@ from scanner.system_b_scanner import (
     detect_zigzag_swings,
     analyze_waves,
     compute_efficiency_ratio,
+    compute_rolling_er,
     compute_hurst_exponent,
+    compute_hurst_improved,
     SwingPoint,
     WaveAnalysis,
 )
@@ -298,6 +300,10 @@ class SystemIScanner:
     def _cfg_tp(self, key: str, default=None):
         """system_i.tp config'den oku."""
         return self._config.get(f"system_i.tp.{key}", default)
+
+    def _cfg_ev(self, key: str, default=None):
+        """system_i.ev config'den oku."""
+        return self._config.get(f"system_i.ev.{key}", default)
 
     def _cfg_scanner(self, key: str, default=None):
         """system_i.scanner config'den oku."""
@@ -740,10 +746,13 @@ class SystemIScanner:
 
         closes = np.array([float(k[4]) for k in klines_yon_tf])
 
-        # ER hesapla
-        result.er = compute_efficiency_ratio(closes)
-        er_trending = self._cfg_regime("er_trending", 0.35)
-        er_ranging = self._cfg_regime("er_ranging", 0.20)
+        # ER hesapla — rolling window (W=20, son 10 medyan)
+        er_window = self._cfg_regime("er_window", 20)
+        er_median_count = self._cfg_regime("er_median_count", 10)
+        result.er = compute_rolling_er(closes, window=er_window,
+                                       median_count=er_median_count)
+        er_trending = self._cfg_regime("er_trending", 0.25)
+        er_ranging = self._cfg_regime("er_ranging", 0.08)
 
         if result.er > er_trending:
             result.er_class = "TRENDING"
@@ -752,10 +761,10 @@ class SystemIScanner:
         else:
             result.er_class = "GRAY"
 
-        # Hurst hesapla
-        result.hurst = compute_hurst_exponent(closes)
-        hurst_trending = self._cfg_regime("hurst_trending", 0.55)
-        hurst_ranging = self._cfg_regime("hurst_ranging", 0.45)
+        # Hurst hesapla — improved (11 chunk, overlapping)
+        result.hurst = compute_hurst_improved(closes)
+        hurst_trending = self._cfg_regime("hurst_trending", 0.60)
+        hurst_ranging = self._cfg_regime("hurst_ranging", 0.50)
 
         if result.hurst > hurst_trending:
             result.hurst_class = "TRENDING"
@@ -1073,6 +1082,11 @@ class SystemIScanner:
 
                     rr = test_tp / test_sl if test_sl > 0 else 0
 
+                    # Strateji belgesi 10.4: R:R < ev_min_rr elenir
+                    min_rr = self._cfg_ev("ev_min_rr", 1.5)
+                    if rr < min_rr:
+                        continue
+
                     sw, sl, st = simulate(test_sl, test_tp)
                     stotal = sw + sl
                     if stotal < 3:
@@ -1139,7 +1153,7 @@ class SystemIScanner:
             market_ctx = {}
 
         # 1. Funding Rate
-        fr_max = self._cfg_filter("funding_rate_max", 0.001)  # 0.1%
+        fr_max = self._cfg_filter("funding_rate_max", 0.0003)  # 0.03%
         fr = market_ctx.get("funding_rate", 0.0)
         result.funding_rate = fr
         if result.direction == "LONG" and fr > fr_max:
@@ -1155,7 +1169,7 @@ class SystemIScanner:
             return False, f"spread_too_high ({spread:.3f}%)"
 
         # 3. Thin book (derinlik)
-        min_depth = self._cfg_filter("min_depth_usd", 50000)
+        min_depth = self._cfg_filter("min_depth_usd", 100000)
         depth = market_ctx.get("depth_usd", 0.0)
         if 0 < depth < min_depth:
             result.ob_thin_book = True
@@ -1166,7 +1180,7 @@ class SystemIScanner:
         result.volume_ratio = vol_ratio
         vol_filter_on = self._cfg_filter("volume_filter_enabled", True)
         if vol_filter_on:
-            min_vol_ratio = self._cfg_filter("min_volume_ratio", 0.5)
+            min_vol_ratio = self._cfg_filter("min_volume_ratio", 1.2)
             if vol_ratio < min_vol_ratio:
                 return False, f"low_volume ({vol_ratio:.2f} < {min_vol_ratio})"
 
@@ -1176,7 +1190,7 @@ class SystemIScanner:
             return False, f"insufficient_waves ({result.zoom.wave_count} < {min_waves})"
 
         # 6. Wall blocking (orderbook imbalance)
-        max_wall = self._cfg_filter("max_wall_imbalance", 0.3)
+        max_wall = self._cfg_filter("max_wall_imbalance", 0.4)
         wall_imbalance = market_ctx.get("wall_imbalance", 0.0)
         result.ob_imbalance = wall_imbalance
         if abs(wall_imbalance) > max_wall:
@@ -1185,10 +1199,11 @@ class SystemIScanner:
                (result.direction == "SHORT" and wall_imbalance > max_wall):
                 return False, f"wall_blocking ({wall_imbalance:.2f})"
 
-        # 7. EV hard gate (opsiyonel — ev_hard_gate_enabled ile kontrol edilir)
-        ev_gate = self._cfg("ev_hard_gate_enabled", False)
-        if ev_gate and result.probability.sufficient:
-            min_ev = self._cfg("ev_min", 0.0)
+        # 7. EV gate (strateji belgesi 10.5: gate ve optimizer modunda EV<0 engel)
+        ev_mode = self._cfg_ev("ev_mode", "optimizer")
+        ev_gate_legacy = self._cfg("ev_hard_gate_enabled", False)
+        if (ev_mode in ("gate", "optimizer") or ev_gate_legacy) and result.probability.sufficient:
+            min_ev = self._cfg_ev("ev_min_threshold", 0.0)
             if result.probability.ev_pct < min_ev:
                 return False, f"ev_low ({result.probability.ev_pct:.1f}% < {min_ev}%)"
 
@@ -1235,7 +1250,9 @@ class SystemIScanner:
 
             elif tp_mode == "single":
                 single_mult = self._cfg_tp("single_tp_g_mult", 2.5)
-                result.tp_pct = G * single_mult
+                fee_total = (self._cfg_lev("fee_pct", 0.08)
+                             + self._cfg_lev("slippage_pct", 0.04))
+                result.tp_pct = G * single_mult + fee_total
                 result.trailing_trigger_pct = 0.0
                 result.trailing_callback_pct = 0.0
 
@@ -1252,19 +1269,23 @@ class SystemIScanner:
 
             elif tp_mode == "ev_optimized":
                 # EV'den en iyi TP hesapla
+                fee_total = (self._cfg_lev("fee_pct", 0.08)
+                             + self._cfg_lev("slippage_pct", 0.04))
                 if result.probability.sufficient and result.probability.ev_pct > 0:
                     # P(win) yüksekse daha uzak TP
                     ev_mult = 1.0 + min(result.probability.ev_pct / 20.0, 1.0)
-                    result.tp_pct = G * 2.0 * ev_mult
+                    result.tp_pct = G * 2.0 * ev_mult + fee_total
                 else:
-                    result.tp_pct = G * 2.5  # fallback
+                    result.tp_pct = G * 2.5 + fee_total  # fallback
                 result.trailing_trigger_pct = 0.0
                 result.trailing_callback_pct = 0.0
 
         else:
-            # RANGING: sabit TP
+            # RANGING: sabit TP (fee-aware — SL ile tutarlı)
             ranging_target = self._cfg_tp("ranging_tp_target", "bb_middle")
             ranging_g_mult = self._cfg_tp("ranging_tp_g_mult", 2.0)
+            fee_total = (self._cfg_lev("fee_pct", 0.08)
+                         + self._cfg_lev("slippage_pct", 0.04))
 
             if ranging_target == "bb_middle" and result.bb_middle > 0 and result.price > 0:
                 if result.direction == "LONG":
@@ -1272,17 +1293,29 @@ class SystemIScanner:
                 else:
                     bb_tp = (result.price - result.bb_middle) / result.price * 100
 
-                g_tp = G * ranging_g_mult
+                g_tp = G * ranging_g_mult + fee_total
                 # BB middle pozitifse kullan, değilse G bazlı
                 if bb_tp > 0:
-                    result.tp_pct = min(bb_tp, g_tp)
+                    # BB middle R:R'yi bozmayacak kadar büyükse kullan
+                    result.tp_pct = max(min(bb_tp, g_tp), result.sl_pct)
                 else:
                     result.tp_pct = g_tp
             else:
-                result.tp_pct = G * ranging_g_mult
+                result.tp_pct = G * ranging_g_mult + fee_total
 
             result.trailing_trigger_pct = 0.0
             result.trailing_callback_pct = 0.0
+
+        # ── Minimum R:R koruması: TP asla SL'den küçük olmamalı ──
+        effective_tp = result.tp_pct if result.tp_pct > 0 else result.trailing_trigger_pct
+        if effective_tp > 0 and result.sl_pct > 0 and effective_tp < result.sl_pct:
+            self._log.warning(
+                f"[TP Guard] {result.symbol}: TP={effective_tp:.3f}% < "
+                f"SL={result.sl_pct:.3f}% — TP yukarı çekiliyor")
+            if result.tp_pct > 0:
+                result.tp_pct = result.sl_pct
+            if result.trailing_trigger_pct > 0:
+                result.trailing_trigger_pct = result.sl_pct
 
         # ROI bazlı TP (opsiyonel, rejimden bağımsız)
         roi_tp_enabled = self._cfg_tp("roi_based_tp_enabled", False)
@@ -1329,7 +1362,7 @@ class SystemIScanner:
             ev_score = max(0.0, min(100.0, ev_norm))
 
         # 3. Regime clarity (0-100)
-        # ER'nin gray zone sınırlarından (0.20 ve 0.35) uzaklığı
+        # ER'nin gray zone sınırlarından (0.08 ve 0.25) uzaklığı
         er = result.regime.er
         er_low = self._cfg_regime("er_ranging", 0.20)
         er_high = self._cfg_regime("er_trending", 0.35)
@@ -1556,8 +1589,8 @@ class SystemIScanner:
             result.reject_reason = "leverage_zero"
             return result
 
-        # User max kaldıraç
-        user_max = self._config.get("strategy.max_leverage", 20)
+        # User max kaldıraç (System I kendi config'inden oku, System A'ya bulaşma)
+        user_max = self._cfg_lev("max_leverage", 125)
         if result.leverage > user_max:
             result.leverage = user_max
 
@@ -1574,31 +1607,68 @@ class SystemIScanner:
             ev_tp, result.leverage, klines_yon
         )
 
-        # 8. Optimal SL/TP'yi sonuca yansit
-        # EV pozitif optimal bulunduysa VE yeterli trade sayısı varsa güncelle
+        # 8. EV mode'a gore SL/TP ayarla (strateji belgesi 10.5)
+        ev_mode = self._cfg_ev("ev_mode", "optimizer")
         prob = result.probability
         min_trades_for_override = 5
         total_sim_trades = prob.sim_wins + prob.sim_losses
-        if (prob.sufficient and prob.ev_pct > 0 and prob.optimal_sl_pct > 0
-                and total_sim_trades >= min_trades_for_override):
-            result.sl_pct = prob.optimal_sl_pct
-            result.leverage = min(prob.optimal_leverage,
-                                  self._config.get("strategy.max_leverage", 20))
-            # TP guncelle
-            if prob.optimal_tp_pct > 0:
-                result.tp_pct = prob.optimal_tp_pct
-                # Trailing trigger da optimal TP'ye gore ayarla
-                if result.trailing_trigger_pct > 0:
-                    result.trailing_trigger_pct = prob.optimal_tp_pct
-                    result.trailing_callback_pct = result.G * self._cfg_tp(
-                        "trailing_callback_g_mult", 0.5)
 
+        if ev_mode == "optimizer":
+            # OPTIMIZER: EV'den en iyi SL/TP bul ve override et
+            if (prob.sufficient and prob.ev_pct > 0 and prob.optimal_sl_pct > 0
+                    and total_sim_trades >= min_trades_for_override):
+                result.sl_pct = prob.optimal_sl_pct
+                result.leverage = min(prob.optimal_leverage,
+                                      self._cfg_lev("max_leverage", 125))
+                if prob.optimal_tp_pct > 0:
+                    result.tp_pct = prob.optimal_tp_pct
+                    if result.trailing_trigger_pct > 0:
+                        result.trailing_trigger_pct = prob.optimal_tp_pct
+                        result.trailing_callback_pct = result.G * self._cfg_tp(
+                            "trailing_callback_g_mult", 0.5)
+
+                self._log.info(
+                    f"[EV-Opt] {symbol}: SL={result.sl_pct:.3f}% "
+                    f"({prob.optimal_sl_g_mult:.2f}xG) "
+                    f"TP={result.tp_pct:.3f}% ({prob.optimal_tp_g_mult:.1f}xG) "
+                    f"Lev={result.leverage}x R:R={prob.optimal_rr:.2f} "
+                    f"P(w)={prob.p_win:.0%} EV={prob.ev_pct:+.1f}%")
+
+        elif ev_mode == "soft":
+            # SOFT: SL/TP degismez, sadece skor bonus/ceza
+            if prob.sufficient:
+                ev_max_bonus = self._cfg_ev("ev_max_bonus", 1.3)
+                ev_min_penalty = self._cfg_ev("ev_min_penalty", 0.7)
+                if prob.ev_pct > 0:
+                    mult = min(1.0 + prob.ev_pct / 100.0, ev_max_bonus)
+                elif prob.ev_pct < -10:
+                    mult = max(1.0 + prob.ev_pct / 100.0, ev_min_penalty)
+                else:
+                    mult = 1.0
+                result.score *= mult
+                self._log.info(
+                    f"[EV-Soft] {symbol}: EV={prob.ev_pct:+.1f}% "
+                    f"skor x{mult:.2f} P(w)={prob.p_win:.0%}")
+
+        # elif ev_mode == "gate": gate logic is in check_hard_filters
+
+        # R:R koruması (tum modlar icin)
+        eff_tp = result.tp_pct if result.tp_pct > 0 else result.trailing_trigger_pct
+        if eff_tp > 0 and result.sl_pct > 0 and eff_tp < result.sl_pct:
+            self._log.warning(
+                f"[R:R Guard] {symbol}: TP={eff_tp:.3f}% < "
+                f"SL={result.sl_pct:.3f}% — TP yukari cekiliyor")
+            if result.tp_pct > 0:
+                result.tp_pct = result.sl_pct
+            if result.trailing_trigger_pct > 0:
+                result.trailing_trigger_pct = result.sl_pct
+
+        # EV log (optimizer disinda da)
+        if ev_mode != "optimizer" and prob.sufficient:
             self._log.info(
-                f"[EV-Opt] {symbol}: SL={result.sl_pct:.3f}% "
-                f"({prob.optimal_sl_g_mult:.2f}xG) "
-                f"TP={result.tp_pct:.3f}% ({prob.optimal_tp_g_mult:.1f}xG) "
-                f"Lev={result.leverage}x R:R={prob.optimal_rr:.2f} "
-                f"P(w)={prob.p_win:.0%} EV={prob.ev_pct:+.1f}%"
+                f"[EV] {symbol}: EV={prob.ev_pct:+.1f}% "
+                f"P(w)={prob.p_win:.0%} R:R={prob.optimal_rr:.2f} "
+                f"mode={ev_mode}"
             )
 
         # 9. Giris tipi

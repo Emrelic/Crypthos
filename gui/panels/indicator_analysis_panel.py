@@ -1,27 +1,31 @@
-"""Indicator Analysis Panel - comprehensive chart-based indicator and confluence visualization.
+"""Advanced Chart Panel - Interactive candlestick chart with dynamic indicator selection.
 
-Provides static (one-shot) and live (auto-refresh) modes for analyzing
-indicator values and confluence scores over time for any Binance Futures symbol.
+Features:
+- Fixed candlestick chart with overlay indicators (EMA, BB, Ichimoku, etc.)
+- Scrollable indicator subplot area (RSI, MACD, ADX, etc.)
+- Dynamic indicator add/remove with live parameter editing
+- Crosshair with synchronized cursor across all charts
+- Static (refresh) and live auto-refresh modes
+- 29 indicators: 10 overlay + 19 subplot
 """
 
 import threading
 import time
-from datetime import datetime, timedelta
+from collections import OrderedDict
+from datetime import datetime
 
 import customtkinter as ctk
 import numpy as np
 import pandas as pd
 from loguru import logger
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.dates import AutoDateLocator, DateFormatter
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
-from analysis.confluence import ConfluenceScorer, GROUP_NEUTRAL_THRESHOLD
-from analysis.market_regime import MarketRegimeDetector
-from indicators.indicator_engine import IndicatorEngine
+# ══════════════════════════════════════════════════════════════════════════════
+# COLORS
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Color constants ──────────────────────────────────────────────────────────
 CLR_BG = "#1a1a2e"
 CLR_SUBPLOT = "#16213e"
 CLR_GRID = "#333333"
@@ -30,10 +34,16 @@ CLR_RED = "#FF1744"
 CLR_BLUE = "#2196F3"
 CLR_ORANGE = "#FF9800"
 CLR_PURPLE = "#9C27B0"
+CLR_CYAN = "#00BCD4"
+CLR_YELLOW = "#FFEB3B"
+CLR_PINK = "#E91E63"
 CLR_GRAY = "#9E9E9E"
 CLR_LIGHT_GREEN = "#81C784"
 CLR_LIGHT_RED = "#EF5350"
 CLR_TEXT = "#E0E0E0"
+CLR_WHITE = "#FFFFFF"
+CLR_TEAL = "#009688"
+CLR_INDIGO = "#3F51B5"
 
 DEFAULT_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -42,234 +52,618 @@ DEFAULT_SYMBOLS = [
     "APTUSDT", "ARBUSDT", "OPUSDT", "SEIUSDT", "SUIUSDT",
 ]
 
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d", "1w"]
 
-# Candle interval -> seconds mapping for live mode
-_INTERVAL_SECONDS = {
+_INTERVAL_SEC = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
-    "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400,
+    "1h": 3600, "2h": 7200, "4h": 14400, "8h": 28800, "12h": 43200,
+    "1d": 86400, "1w": 604800,
 }
 
 
-class _ParamConfig:
-    """Lightweight config wrapper accepted by IndicatorEngine."""
+# ══════════════════════════════════════════════════════════════════════════════
+# VECTORIZED SERIES COMPUTATION
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def __init__(self, indicator_params: dict):
-        self._params = indicator_params
+def _ema(data, period):
+    return pd.Series(data).ewm(span=period, adjust=False).mean().values
 
-    def get(self, key: str, default=None):
-        if key == "indicators":
-            return self._params
-        # Support dot-notation for nested keys
-        parts = key.split(".")
-        if parts[0] == "indicators" and len(parts) == 2:
-            return self._params.get(parts[1], default)
-        return default
 
+def _sma(data, period):
+    return pd.Series(data).rolling(period, min_periods=1).mean().values
+
+
+def _wma(data, period):
+    w = np.arange(1, period + 1, dtype=float)
+    return pd.Series(data).rolling(period).apply(
+        lambda x: np.dot(x, w) / w.sum(), raw=True
+    ).values
+
+
+def _rsi(close, period=14):
+    delta = np.diff(close, prepend=close[0])
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    ag = pd.Series(gain).ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean().values
+    al = pd.Series(loss).ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean().values
+    r = 100.0 - 100.0 / (1.0 + ag / (al + 1e-10))
+    r[:period] = 50.0
+    return r
+
+
+def _macd(close, fast=12, slow=26, signal=9):
+    ml = _ema(close, fast) - _ema(close, slow)
+    sl = _ema(ml, signal)
+    return ml, sl, ml - sl
+
+
+def _atr(high, low, close, period=14):
+    pc = np.roll(close, 1)
+    pc[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - pc), np.abs(low - pc)))
+    return pd.Series(tr).ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean().values
+
+
+def _adx(high, low, close, period=14):
+    up = np.diff(high, prepend=high[0])
+    dn = -np.diff(low, prepend=low[0])
+    pdm = np.where((up > dn) & (up > 0), up, 0.0)
+    ndm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    a = _atr(high, low, close, period)
+    spdm = pd.Series(pdm).ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean().values
+    sndm = pd.Series(ndm).ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean().values
+    pdi = 100.0 * spdm / (a + 1e-10)
+    ndi = 100.0 * sndm / (a + 1e-10)
+    dx = 100.0 * np.abs(pdi - ndi) / (pdi + ndi + 1e-10)
+    adx_val = pd.Series(dx).ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean().values
+    return adx_val, pdi, ndi
+
+
+def _stochastic(high, low, close, period=14, k_sm=3, d_sm=3):
+    hh = pd.Series(high).rolling(period).max().values
+    ll = pd.Series(low).rolling(period).min().values
+    rk = 100.0 * (close - ll) / (hh - ll + 1e-10)
+    k = pd.Series(rk).rolling(k_sm, min_periods=1).mean().values
+    d = pd.Series(k).rolling(d_sm, min_periods=1).mean().values
+    return k, d
+
+
+def _stoch_rsi(close, rsi_p=14, stoch_p=14, k_sm=3, d_sm=3):
+    r = _rsi(close, rsi_p)
+    rh = pd.Series(r).rolling(stoch_p).max().values
+    rl = pd.Series(r).rolling(stoch_p).min().values
+    rk = 100.0 * (r - rl) / (rh - rl + 1e-10)
+    k = pd.Series(rk).rolling(k_sm, min_periods=1).mean().values
+    d = pd.Series(k).rolling(d_sm, min_periods=1).mean().values
+    return k, d
+
+
+def _mfi(high, low, close, volume, period=14):
+    tp = (high + low + close) / 3.0
+    mf = tp * volume
+    delta = np.diff(tp, prepend=tp[0])
+    pmf = pd.Series(np.where(delta > 0, mf, 0.0)).rolling(period).sum().values
+    nmf = pd.Series(np.where(delta < 0, mf, 0.0)).rolling(period).sum().values
+    return 100.0 - 100.0 / (1.0 + pmf / (nmf + 1e-10))
+
+
+def _cci(high, low, close, period=20):
+    tp = (high + low + close) / 3.0
+    s = pd.Series(tp)
+    sm = s.rolling(period).mean().values
+    mad = s.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True).values
+    return (tp - sm) / (0.015 * mad + 1e-10)
+
+
+def _williams_r(high, low, close, period=14):
+    hh = pd.Series(high).rolling(period).max().values
+    ll = pd.Series(low).rolling(period).min().values
+    return -100.0 * (hh - close) / (hh - ll + 1e-10)
+
+
+def _roc(close, period=12):
+    prev = np.roll(close, period)
+    prev[:period] = close[:period]
+    return 100.0 * (close - prev) / (prev + 1e-10)
+
+
+def _ultimate_osc(high, low, close, p1=7, p2=14, p3=28):
+    pc = np.roll(close, 1)
+    pc[0] = close[0]
+    bp = close - np.minimum(low, pc)
+    tr = np.maximum(high, pc) - np.minimum(low, pc)
+    a1 = pd.Series(bp).rolling(p1).sum().values / (pd.Series(tr).rolling(p1).sum().values + 1e-10)
+    a2 = pd.Series(bp).rolling(p2).sum().values / (pd.Series(tr).rolling(p2).sum().values + 1e-10)
+    a3 = pd.Series(bp).rolling(p3).sum().values / (pd.Series(tr).rolling(p3).sum().values + 1e-10)
+    return 100.0 * (4 * a1 + 2 * a2 + a3) / 7.0
+
+
+def _obv(close, volume):
+    d = np.sign(np.diff(close, prepend=close[0]))
+    return np.cumsum(d * volume)
+
+
+def _cvd(volume, taker_buy_vol):
+    return np.cumsum(2 * taker_buy_vol - volume)
+
+
+def _cmf(high, low, close, volume, period=20):
+    clv = ((close - low) - (high - close)) / (high - low + 1e-10)
+    cv = clv * volume
+    return pd.Series(cv).rolling(period).sum().values / (
+        pd.Series(volume).rolling(period).sum().values + 1e-10
+    )
+
+
+def _ad_line(high, low, close, volume):
+    clv = ((close - low) - (high - close)) / (high - low + 1e-10)
+    return np.cumsum(clv * volume)
+
+
+def _elder_force(close, volume, period=13):
+    delta = np.diff(close, prepend=close[0])
+    return _ema(delta * volume, period)
+
+
+def _bollinger(close, period=20, std_dev=2.0):
+    s = pd.Series(close)
+    mid = s.rolling(period).mean().values
+    st = s.rolling(period).std().values
+    return mid + std_dev * st, mid, mid - std_dev * st
+
+
+def _keltner(high, low, close, ema_p=20, atr_p=14, mult=2.0):
+    mid = _ema(close, ema_p)
+    a = _atr(high, low, close, atr_p)
+    return mid + mult * a, mid, mid - mult * a
+
+
+def _donchian(high, low, period=20):
+    u = pd.Series(high).rolling(period).max().values
+    lo = pd.Series(low).rolling(period).min().values
+    return u, (u + lo) / 2, lo
+
+
+def _vwap(high, low, close, volume):
+    tp = (high + low + close) / 3.0
+    return np.cumsum(tp * volume) / (np.cumsum(volume) + 1e-10)
+
+
+def _ichimoku(high, low, tenkan=9, kijun=26, senkou_b=52):
+    h, lo = pd.Series(high), pd.Series(low)
+    tk = (h.rolling(tenkan).max().values + lo.rolling(tenkan).min().values) / 2
+    kj = (h.rolling(kijun).max().values + lo.rolling(kijun).min().values) / 2
+    sa = (tk + kj) / 2
+    sb = (h.rolling(senkou_b).max().values + lo.rolling(senkou_b).min().values) / 2
+    return tk, kj, sa, sb
+
+
+def _psar(high, low, close, af_start=0.02, af_step=0.02, af_max=0.2):
+    n = len(close)
+    psar = np.zeros(n)
+    trend = np.ones(n)
+    af = af_start
+    ep = high[0]
+    psar[0] = low[0]
+    for i in range(1, n):
+        if trend[i - 1] == 1:
+            psar[i] = psar[i - 1] + af * (ep - psar[i - 1])
+            psar[i] = min(psar[i], low[i - 1])
+            if i >= 2:
+                psar[i] = min(psar[i], low[i - 2])
+            if low[i] < psar[i]:
+                trend[i], psar[i], af, ep = -1, ep, af_start, low[i]
+            else:
+                trend[i] = 1
+                if high[i] > ep:
+                    ep = high[i]
+                    af = min(af + af_step, af_max)
+        else:
+            psar[i] = psar[i - 1] + af * (ep - psar[i - 1])
+            psar[i] = max(psar[i], high[i - 1])
+            if i >= 2:
+                psar[i] = max(psar[i], high[i - 2])
+            if high[i] > psar[i]:
+                trend[i], psar[i], af, ep = 1, ep, af_start, high[i]
+            else:
+                trend[i] = -1
+                if low[i] < ep:
+                    ep = low[i]
+                    af = min(af + af_step, af_max)
+    return psar, trend
+
+
+def _supertrend(high, low, close, period=10, mult=3.0):
+    a = _atr(high, low, close, period)
+    hl2 = (high + low) / 2.0
+    up_band = hl2 + mult * a
+    lo_band = hl2 - mult * a
+    n = len(close)
+    st = np.zeros(n)
+    d = np.ones(n)
+    fu, fl = up_band.copy(), lo_band.copy()
+    for i in range(1, n):
+        fl[i] = lo_band[i] if (lo_band[i] > fl[i - 1] or close[i - 1] < fl[i - 1]) else fl[i - 1]
+        fu[i] = up_band[i] if (up_band[i] < fu[i - 1] or close[i - 1] > fu[i - 1]) else fu[i - 1]
+        if d[i - 1] == 1:
+            d[i], st[i] = (-1, fu[i]) if close[i] < fl[i] else (1, fl[i])
+        else:
+            d[i], st[i] = (1, fl[i]) if close[i] > fu[i] else (-1, fu[i])
+    return st, d
+
+
+def _aroon(high, low, period=25):
+    n = len(high)
+    au, ad = np.full(n, np.nan), np.full(n, np.nan)
+    for i in range(period, n):
+        au[i] = 100.0 * np.argmax(high[i - period:i + 1]) / period
+        ad[i] = 100.0 * np.argmin(low[i - period:i + 1]) / period
+    return au, ad
+
+
+def _hma(close, period=20):
+    hp = max(1, int(period / 2))
+    sp = max(1, int(np.sqrt(period)))
+    wh = _wma(close, hp)
+    wf = _wma(close, period)
+    diff = 2 * wh - wf
+    diff_clean = np.nan_to_num(diff, nan=np.nanmean(close))
+    return _wma(diff_clean, sp)
+
+
+def _bb_width(close, period=20, std_dev=2.0):
+    u, m, lo = _bollinger(close, period, std_dev)
+    return (u - lo) / (m + 1e-10) * 100
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INDICATOR REGISTRY
+# ══════════════════════════════════════════════════════════════════════════════
+
+INDICATOR_DEFS = OrderedDict([
+    # ── OVERLAY (price chart) ── arrows indicate overlay type
+    ("EMA \u2191", {"type": "overlay", "params": OrderedDict([("P1", 9), ("P2", 21)])}),
+    ("SMA \u2191", {"type": "overlay", "params": OrderedDict([("P1", 20), ("P2", 200)])}),
+    ("Bollinger Bands \u2191", {"type": "overlay",
+                                "params": OrderedDict([("Periyot", 20), ("Std", 2.0)])}),
+    ("Keltner \u2191", {"type": "overlay",
+                        "params": OrderedDict([("EMA P", 20), ("ATR P", 14), ("\u00c7arpan", 2.0)])}),
+    ("Donchian \u2191", {"type": "overlay", "params": OrderedDict([("Periyot", 20)])}),
+    ("Ichimoku \u2191", {"type": "overlay",
+                         "params": OrderedDict([("Tenkan", 9), ("Kijun", 26), ("Senkou B", 52)])}),
+    ("PSAR \u2191", {"type": "overlay",
+                     "params": OrderedDict([("AF Start", 0.02), ("AF Ad\u0131m", 0.02), ("AF Max", 0.2)])}),
+    ("Supertrend \u2191", {"type": "overlay",
+                           "params": OrderedDict([("Periyot", 10), ("\u00c7arpan", 3.0)])}),
+    ("VWAP \u2191", {"type": "overlay", "params": OrderedDict()}),
+    ("HMA \u2191", {"type": "overlay", "params": OrderedDict([("Periyot", 20)])}),
+    # ── SUBPLOT ──
+    ("RSI", {"type": "subplot", "params": OrderedDict([("Periyot", 14)])}),
+    ("MACD", {"type": "subplot", "params": OrderedDict([("Fast", 12), ("Slow", 26), ("Signal", 9)])}),
+    ("ADX", {"type": "subplot", "params": OrderedDict([("Periyot", 14)])}),
+    ("Stochastic", {"type": "subplot",
+                    "params": OrderedDict([("Periyot", 14), ("K", 3), ("D", 3)])}),
+    ("Stochastic RSI", {"type": "subplot",
+                        "params": OrderedDict([("RSI P", 14), ("Stoch P", 14), ("K", 3), ("D", 3)])}),
+    ("MFI", {"type": "subplot", "params": OrderedDict([("Periyot", 14)])}),
+    ("CCI", {"type": "subplot", "params": OrderedDict([("Periyot", 20)])}),
+    ("Williams %R", {"type": "subplot", "params": OrderedDict([("Periyot", 14)])}),
+    ("ROC", {"type": "subplot", "params": OrderedDict([("Periyot", 12)])}),
+    ("Ultimate Osc", {"type": "subplot",
+                      "params": OrderedDict([("P1", 7), ("P2", 14), ("P3", 28)])}),
+    ("OBV", {"type": "subplot", "params": OrderedDict()}),
+    ("CVD", {"type": "subplot", "params": OrderedDict()}),
+    ("CMF", {"type": "subplot", "params": OrderedDict([("Periyot", 20)])}),
+    ("A/D Line", {"type": "subplot", "params": OrderedDict()}),
+    ("Elder Force", {"type": "subplot", "params": OrderedDict([("Periyot", 13)])}),
+    ("Hacim", {"type": "subplot", "params": OrderedDict()}),
+    ("ATR", {"type": "subplot", "params": OrderedDict([("Periyot", 14)])}),
+    ("BB Width", {"type": "subplot", "params": OrderedDict([("Periyot", 20), ("Std", 2.0)])}),
+    ("Aroon", {"type": "subplot", "params": OrderedDict([("Periyot", 25)])}),
+])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PANEL CLASS
+# ══════════════════════════════════════════════════════════════════════════════
 
 class IndicatorAnalysisPanel(ctk.CTkFrame):
-    """Full-featured indicator analysis panel with matplotlib charts."""
+    """Interactive chart panel with fixed candlestick + scrollable indicators."""
 
     def __init__(self, parent, controller, **kwargs):
         super().__init__(parent, **kwargs)
         self.controller = controller
 
-        # State
-        self._ts_df: pd.DataFrame | None = None  # timeseries result
+        # ── Data ──
+        self._df: pd.DataFrame | None = None
+        self._open = self._high = self._low = self._close = self._volume = None
+        self._taker_buy_vol = None
+        self._timestamps = None
+        self._n = 0
+        self._x = None
+
+        # ── Active indicators ──
+        self._active: list[dict] = []
+        self._selected_idx = -1
+
+        # ── Matplotlib figures ──
+        self._price_fig: Figure | None = None
+        self._price_canvas: FigureCanvasTkAgg | None = None
+        self._price_ax = None
+        self._ind_fig: Figure | None = None
+        self._ind_canvas: FigureCanvasTkAgg | None = None
+        self._ind_axes: list = []
+
+        # ── Zoom state (TradingView-style scroll zoom) ──
+        self._view_start: int = 0       # first visible candle index
+        self._view_end: int = 0         # last visible candle index (exclusive)
+        self._min_visible: int = 10     # minimum candles visible when zoomed in
+        self._drag_active: bool = False
+        self._drag_start_x: int | None = None
+        self._drag_view_start: int = 0
+
+        # ── Crosshair ──
+        self._price_vline = None
+        self._price_hline = None
+        self._ind_vlines: list = []
+        self._value_texts: list = []
+        self._last_cross_idx = -1
+
+        # ── Live mode ──
         self._live_running = False
         self._live_thread: threading.Thread | None = None
         self._computation_lock = threading.Lock()
-        self._fig: Figure | None = None
-        self._canvas: FigureCanvasTkAgg | None = None
+
+        # ── UI vars ──
+        self._info_var = ctk.StringVar(value="")
         self._progress_var = ctk.StringVar(value="")
+        self._param_entries: dict[str, ctk.StringVar] = {}
 
-        # Parameter variables (set defaults before building UI)
-        self._param_vars: dict[str, ctk.StringVar] = {}
-        self._init_param_vars()
+        # ── Build UI ──
+        self._build_ui()
 
-        # Build UI
-        self._build_controls()
-        self._build_param_section()
-        self._build_chart_area()
+        # ── Default indicators ──
+        self._add_indicator("RSI")
+        self._add_indicator("MACD")
+        self._add_indicator("Hacim")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # PARAMETER DEFAULTS
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _init_param_vars(self):
-        defaults = {
-            "RSI Period": "14",
-            "MACD Fast": "12",
-            "MACD Slow": "26",
-            "MACD Signal": "9",
-            "ADX Period": "14",
-            "BB Period": "20",
-            "BB Std": "2.0",
-            "Supertrend Period": "10",
-            "Supertrend Mult": "3.0",
-            "Ichimoku Tenkan": "9",
-            "Ichimoku Kijun": "26",
-            "Ichimoku Senkou": "52",
-            "StochRSI Period": "14",
-            "MFI Period": "14",
-            "CMF Period": "20",
-            "SMA Slow": "200",
-        }
-        for k, v in defaults.items():
-            self._param_vars[k] = ctk.StringVar(value=v)
-
-    # ══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════
     # UI BUILDING
-    # ══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════
 
-    def _build_controls(self):
-        bar = ctk.CTkFrame(self, height=40)
-        bar.pack(fill="x", padx=6, pady=(6, 2))
+    def _build_ui(self):
+        font_s = ctk.CTkFont(size=11)
+        font_m = ctk.CTkFont(size=12)
 
-        # Symbol
-        ctk.CTkLabel(bar, text="Coin:", width=35).pack(side="left", padx=(4, 2))
+        # ── Row 1: Control bar ──
+        bar = ctk.CTkFrame(self, height=36)
+        bar.pack(fill="x", padx=4, pady=(4, 2))
+
+        ctk.CTkLabel(bar, text="Coin:", width=30, font=font_m).pack(side="left", padx=(4, 2))
         self._symbol_var = ctk.StringVar(value="BTCUSDT")
         self._symbol_cb = ctk.CTkComboBox(
             bar, variable=self._symbol_var, values=DEFAULT_SYMBOLS,
-            width=120, state="normal"
+            width=115, state="normal"
         )
         self._symbol_cb.pack(side="left", padx=2)
 
-        # Timeframe
-        ctk.CTkLabel(bar, text="TF:", width=25).pack(side="left", padx=(8, 2))
+        ctk.CTkLabel(bar, text="TF:", width=22, font=font_m).pack(side="left", padx=(6, 2))
         self._tf_var = ctk.StringVar(value="15m")
-        ctk.CTkComboBox(
-            bar, variable=self._tf_var, values=TIMEFRAMES, width=70
+        ctk.CTkComboBox(bar, variable=self._tf_var, values=TIMEFRAMES, width=65).pack(
+            side="left", padx=2
+        )
+
+        ctk.CTkLabel(bar, text="Mum:", width=30, font=font_m).pack(side="left", padx=(6, 2))
+        self._count_var = ctk.StringVar(value="200")
+        count_entry = ctk.CTkEntry(bar, textvariable=self._count_var, width=50)
+        count_entry.pack(side="left", padx=2)
+        count_entry.bind("<Return>", lambda _: self._on_refresh())
+
+        ctk.CTkButton(
+            bar, text="Yenile", width=65, command=self._on_refresh, fg_color="#0D47A1"
+        ).pack(side="left", padx=(8, 2))
+
+        self._live_btn = ctk.CTkButton(
+            bar, text="Canl\u0131: Kapal\u0131", width=95, command=self._toggle_live,
+            fg_color="#333333"
+        )
+        self._live_btn.pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            bar, text="Zoom S\u0131f\u0131rla", width=80, command=self._reset_zoom,
+            fg_color="#555555", hover_color="#777777"
         ).pack(side="left", padx=2)
 
-        # Candle count
-        ctk.CTkLabel(bar, text="Mum:", width=35).pack(side="left", padx=(8, 2))
-        self._count_var = ctk.StringVar(value="200")
-        ctk.CTkEntry(bar, textvariable=self._count_var, width=55).pack(side="left", padx=2)
+        ctk.CTkLabel(
+            bar, textvariable=self._progress_var, width=220, font=font_s
+        ).pack(side="right", padx=4)
 
-        # Mode selector
-        ctk.CTkLabel(bar, text="Mod:", width=30).pack(side="left", padx=(8, 2))
-        self._mode_var = ctk.StringVar(value="Statik")
-        self._mode_cb = ctk.CTkComboBox(
-            bar, variable=self._mode_var, values=["Statik", "Canli"],
-            width=80, command=self._on_mode_changed
+        # ── Row 2: Indicator selector ──
+        sel = ctk.CTkFrame(self, height=32)
+        sel.pack(fill="x", padx=4, pady=(2, 0))
+
+        ctk.CTkLabel(sel, text="\u0130ndikat\u00f6r:", width=60, font=font_m).pack(
+            side="left", padx=(4, 2)
         )
-        self._mode_cb.pack(side="left", padx=2)
-
-        # Update mode (live only)
-        self._update_label = ctk.CTkLabel(bar, text="Guncelleme:", width=75)
-        self._update_var = ctk.StringVar(value="Her 5 sn")
-        self._update_cb = ctk.CTkComboBox(
-            bar, variable=self._update_var, values=["Her 5 sn", "Mum Kapanisi"],
-            width=100
+        self._ind_var = ctk.StringVar(value="RSI")
+        self._ind_cb = ctk.CTkComboBox(
+            sel, variable=self._ind_var, values=list(INDICATOR_DEFS.keys()), width=170
         )
+        self._ind_cb.pack(side="left", padx=2)
+        ctk.CTkButton(
+            sel, text="Ekle", width=50, command=self._on_add_click, fg_color="#1B5E20"
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            sel, text="T\u00fcm\u00fcn\u00fc Temizle", width=105,
+            command=self._clear_all, fg_color="#B71C1C", hover_color="#D32F2F"
+        ).pack(side="right", padx=4)
 
-        # Analiz Et button (static)
-        self._analyze_btn = ctk.CTkButton(
-            bar, text="Analiz Et", width=80, command=self._on_analyze_click,
-            fg_color="#0D47A1"
+        # ── Row 3: Active indicator chips ──
+        self._chips_frame = ctk.CTkFrame(self, height=30, fg_color="transparent")
+        self._chips_frame.pack(fill="x", padx=4, pady=(2, 0))
+
+        # ── Row 4: Parameter editing (hidden initially) ──
+        self._params_frame = ctk.CTkFrame(self, height=30)
+        # not packed yet — shown when a chip is selected
+
+        # ── Row 5: Info bar (crosshair tooltip) ──
+        self._info_label = ctk.CTkLabel(
+            self, textvariable=self._info_var,
+            font=ctk.CTkFont(size=11, family="Consolas"), anchor="w", height=18
         )
-        self._analyze_btn.pack(side="left", padx=(12, 2))
+        self._info_label.pack(fill="x", padx=6, pady=(2, 0))
 
-        # Start/Stop button (live)
-        self._live_btn = ctk.CTkButton(
-            bar, text="Baslat", width=70, command=self._on_live_toggle,
-            fg_color="#1B5E20"
-        )
+        # ── Row 6: FIXED price chart ──
+        self._price_frame = ctk.CTkFrame(self, fg_color=CLR_BG, height=320)
+        self._price_frame.pack(fill="x", padx=2, pady=(2, 0))
+        self._price_frame.pack_propagate(False)
 
-        # Progress label
-        self._progress_lbl = ctk.CTkLabel(bar, textvariable=self._progress_var, width=180)
-        self._progress_lbl.pack(side="right", padx=6)
+        # ── Row 7: SCROLLABLE indicator subplots ──
+        self._ind_scroll = ctk.CTkScrollableFrame(self, fg_color=CLR_BG)
+        self._ind_scroll.pack(fill="both", expand=True, padx=2, pady=(0, 2))
 
-        self._on_mode_changed(self._mode_var.get())
+    # ══════════════════════════════════════════════════════════════════════
+    # INDICATOR MANAGEMENT
+    # ══════════════════════════════════════════════════════════════════════
 
-    def _on_mode_changed(self, mode: str):
-        if mode == "Canli":
-            self._analyze_btn.pack_forget()
-            self._update_label.pack(side="left", padx=(8, 2))
-            self._update_cb.pack(side="left", padx=2)
-            self._live_btn.pack(side="left", padx=(12, 2))
+    def _on_add_click(self):
+        name = self._ind_var.get()
+        if name not in INDICATOR_DEFS:
+            return
+        self._add_indicator(name)
+        if self._df is not None:
+            self._recompute_and_draw()
+
+    def _add_indicator(self, name):
+        defn = INDICATOR_DEFS.get(name)
+        if not defn:
+            return
+        params = OrderedDict((k, v) for k, v in defn["params"].items())
+        self._active.append({"name": name, "params": params, "data": {}})
+        self._rebuild_chips()
+
+    def _remove_indicator(self, idx):
+        if 0 <= idx < len(self._active):
+            self._active.pop(idx)
+            if self._selected_idx == idx:
+                self._selected_idx = -1
+                self._hide_params()
+            elif self._selected_idx > idx:
+                self._selected_idx -= 1
+            self._rebuild_chips()
+            if self._df is not None:
+                self._recompute_and_draw()
+
+    def _clear_all(self):
+        self._active.clear()
+        self._selected_idx = -1
+        self._rebuild_chips()
+        self._hide_params()
+        if self._df is not None:
+            self._recompute_and_draw()
+
+    def _rebuild_chips(self):
+        for w in self._chips_frame.winfo_children():
+            w.destroy()
+
+        for i, ind in enumerate(self._active):
+            name = ind["name"]
+            p_str = ",".join(str(v) for v in ind["params"].values())
+            label = f"{name}({p_str})" if p_str else name
+
+            chip = ctk.CTkFrame(self._chips_frame, height=26, corner_radius=12)
+            chip.pack(side="left", padx=2, pady=2)
+
+            is_sel = (i == self._selected_idx)
+            idx = i
+
+            ctk.CTkButton(
+                chip, text=label, width=max(len(label) * 7 + 16, 60), height=24,
+                corner_radius=12, font=ctk.CTkFont(size=11),
+                fg_color="#1565C0" if is_sel else "#37474F",
+                hover_color="#1976D2",
+                command=lambda ii=idx: self._select_chip(ii),
+            ).pack(side="left", padx=(2, 0))
+
+            ctk.CTkButton(
+                chip, text="\u00d7", width=22, height=24, corner_radius=12,
+                fg_color="#B71C1C", hover_color="#D32F2F",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                command=lambda ii=idx: self._remove_indicator(ii),
+            ).pack(side="left", padx=(0, 2))
+
+    def _select_chip(self, idx):
+        if self._selected_idx == idx:
+            self._selected_idx = -1
+            self._hide_params()
         else:
-            self._update_label.pack_forget()
-            self._update_cb.pack_forget()
-            self._live_btn.pack_forget()
-            self._analyze_btn.pack(side="left", padx=(12, 2))
-            # Stop live if switching back
-            if self._live_running:
-                self._stop_live()
+            self._selected_idx = idx
+            self._show_params(idx)
+        self._rebuild_chips()
 
-    def _build_param_section(self):
-        """Collapsible indicator parameter section."""
-        self._param_visible = False
-        toggle_frame = ctk.CTkFrame(self, height=28)
-        toggle_frame.pack(fill="x", padx=6, pady=(2, 0))
-        self._param_toggle_btn = ctk.CTkButton(
-            toggle_frame, text="Indicator Parametreleri  [+]", width=220,
-            height=24, command=self._toggle_params,
-            fg_color="transparent", text_color=CLR_TEXT, anchor="w",
-            font=ctk.CTkFont(size=12)
-        )
-        self._param_toggle_btn.pack(side="left", padx=4)
+    def _show_params(self, idx):
+        for w in self._params_frame.winfo_children():
+            w.destroy()
+        self._param_entries.clear()
 
-        self._param_frame = ctk.CTkFrame(self)
-        # Build param grid inside (not packed yet)
-        params_layout = [
-            ("RSI Period", "MACD Fast", "MACD Slow", "MACD Signal"),
-            ("ADX Period", "BB Period", "BB Std", "SMA Slow"),
-            ("Supertrend Period", "Supertrend Mult", "StochRSI Period", "MFI Period"),
-            ("Ichimoku Tenkan", "Ichimoku Kijun", "Ichimoku Senkou", "CMF Period"),
-        ]
-        for row_idx, row_params in enumerate(params_layout):
-            for col_idx, name in enumerate(row_params):
-                ctk.CTkLabel(
-                    self._param_frame, text=f"{name}:", width=110, anchor="e",
-                    font=ctk.CTkFont(size=11)
-                ).grid(row=row_idx, column=col_idx * 2, padx=(6, 2), pady=2, sticky="e")
-                ctk.CTkEntry(
-                    self._param_frame, textvariable=self._param_vars[name],
-                    width=55, font=ctk.CTkFont(size=11)
-                ).grid(row=row_idx, column=col_idx * 2 + 1, padx=(0, 8), pady=2, sticky="w")
+        ind = self._active[idx]
+        if not ind["params"]:
+            self._hide_params()
+            return
 
-    def _toggle_params(self):
-        self._param_visible = not self._param_visible
-        if self._param_visible:
-            self._param_frame.pack(fill="x", padx=6, pady=(0, 2))
-            self._param_toggle_btn.configure(text="Indicator Parametreleri  [-]")
-        else:
-            self._param_frame.pack_forget()
-            self._param_toggle_btn.configure(text="Indicator Parametreleri  [+]")
+        self._params_frame.pack(fill="x", padx=4, pady=(2, 0), after=self._chips_frame)
 
-    def _build_chart_area(self):
-        """Scrollable chart frame for matplotlib."""
-        self._chart_frame = ctk.CTkScrollableFrame(self, fg_color=CLR_BG)
-        self._chart_frame.pack(fill="both", expand=True, padx=1, pady=(1, 2))
+        ctk.CTkLabel(
+            self._params_frame, text=f"{ind['name']}:",
+            width=90, font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(side="left", padx=(4, 2))
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ENGINE CREATION
-    # ══════════════════════════════════════════════════════════════════════════
+        for key, val in ind["params"].items():
+            ctk.CTkLabel(
+                self._params_frame, text=f"{key}:", width=50,
+                font=ctk.CTkFont(size=11),
+            ).pack(side="left", padx=(4, 1))
+            var = ctk.StringVar(value=str(val))
+            entry = ctk.CTkEntry(
+                self._params_frame, textvariable=var, width=50,
+                font=ctk.CTkFont(size=11),
+            )
+            entry.pack(side="left", padx=1)
+            entry.bind("<Return>", lambda _, ii=idx: self._apply_params(ii))
+            self._param_entries[key] = var
 
-    def _create_engine(self) -> IndicatorEngine:
-        """Create IndicatorEngine with current UI parameter values."""
-        pv = self._param_vars
-        params = {
-            "rsi_period": int(pv["RSI Period"].get()),
-            "macd_fast": int(pv["MACD Fast"].get()),
-            "macd_slow": int(pv["MACD Slow"].get()),
-            "macd_signal": int(pv["MACD Signal"].get()),
-            "ma_fast": 20,
-            "ma_slow": int(pv["SMA Slow"].get()),
-            "kline_interval": "15m",
-            "kline_limit": 500,
-        }
-        cfg = _ParamConfig(params)
-        return IndicatorEngine(cfg)
+        ctk.CTkButton(
+            self._params_frame, text="Uygula", width=60, height=24,
+            fg_color="#0D47A1", font=ctk.CTkFont(size=11),
+            command=lambda: self._apply_params(idx),
+        ).pack(side="left", padx=(8, 4))
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # DATA FETCHING
-    # ══════════════════════════════════════════════════════════════════════════
+    def _hide_params(self):
+        self._params_frame.pack_forget()
+
+    def _apply_params(self, idx):
+        if idx >= len(self._active):
+            return
+        ind = self._active[idx]
+        for key, var in self._param_entries.items():
+            try:
+                val = float(var.get())
+                orig = ind["params"].get(key)
+                if isinstance(orig, int):
+                    val = int(val)
+                ind["params"][key] = val
+            except ValueError:
+                pass
+        self._rebuild_chips()
+        if self._df is not None:
+            ind["data"] = self._compute_indicator(ind)
+            self._refresh_charts()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # DATA
+    # ══════════════════════════════════════════════════════════════════════
 
     def _fetch_klines(self) -> pd.DataFrame | None:
-        """Fetch klines from Binance REST API."""
         try:
             rest = self.controller.market_service._rest
             symbol = self._symbol_var.get().strip().upper()
@@ -283,131 +677,881 @@ class IndicatorAnalysisPanel(ctk.CTkFrame):
             logger.error(f"Kline fetch error: {e}")
             return None
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # TIMESERIES COMPUTATION
-    # ══════════════════════════════════════════════════════════════════════════
+    def _prepare_data(self, df: pd.DataFrame):
+        self._df = df
+        self._open = df["open"].values.astype(float)
+        self._high = df["high"].values.astype(float)
+        self._low = df["low"].values.astype(float)
+        self._close = df["close"].values.astype(float)
+        self._volume = df["volume"].values.astype(float)
+        self._taker_buy_vol = (
+            df["taker_buy_volume"].values.astype(float)
+            if "taker_buy_volume" in df.columns
+            else self._volume * 0.5
+        )
+        self._timestamps = df["timestamp"].values
+        self._n = len(df)
+        self._x = np.arange(self._n)
+        # Reset zoom to show all candles
+        self._view_start = 0
+        self._view_end = self._n
 
-    def _compute_timeseries(self, df: pd.DataFrame, min_warmup: int = 55,
-                            progress_cb=None) -> pd.DataFrame:
-        """Compute indicator values and confluence scores for each candle."""
-        engine = self._create_engine()
-        confluence = ConfluenceScorer(threshold=4.0)
-        regime_detector = MarketRegimeDetector()
+    # ══════════════════════════════════════════════════════════════════════
+    # COMPUTE
+    # ══════════════════════════════════════════════════════════════════════
 
-        total = len(df) - min_warmup
-        records = []
+    def _compute_indicator(self, ind: dict) -> dict:
+        name = ind["name"]
+        p = ind["params"]
+        c, h, lo, v = self._close, self._high, self._low, self._volume
+        tbv = self._taker_buy_vol
 
-        for i in range(min_warmup, len(df)):
-            if progress_cb and (i - min_warmup) % 5 == 0:
-                pct = int(((i - min_warmup) / max(total, 1)) * 100)
-                progress_cb(pct)
+        try:
+            if name == "EMA \u2191":
+                return {"ema1": _ema(c, int(p.get("P1", 9))),
+                        "ema2": _ema(c, int(p.get("P2", 21)))}
+            if name == "SMA \u2191":
+                return {"sma1": _sma(c, int(p.get("P1", 20))),
+                        "sma2": _sma(c, int(p.get("P2", 200)))}
+            if name == "Bollinger Bands \u2191":
+                u, m, l = _bollinger(c, int(p.get("Periyot", 20)), float(p.get("Std", 2.0)))
+                return {"upper": u, "middle": m, "lower": l}
+            if name == "Keltner \u2191":
+                u, m, l = _keltner(h, lo, c, int(p.get("EMA P", 20)),
+                                   int(p.get("ATR P", 14)), float(p.get("\u00c7arpan", 2.0)))
+                return {"upper": u, "middle": m, "lower": l}
+            if name == "Donchian \u2191":
+                u, m, l = _donchian(h, lo, int(p.get("Periyot", 20)))
+                return {"upper": u, "middle": m, "lower": l}
+            if name == "Ichimoku \u2191":
+                tk, kj, sa, sb = _ichimoku(h, lo, int(p.get("Tenkan", 9)),
+                                           int(p.get("Kijun", 26)), int(p.get("Senkou B", 52)))
+                return {"tenkan": tk, "kijun": kj, "senkou_a": sa, "senkou_b": sb}
+            if name == "PSAR \u2191":
+                ps, tr = _psar(h, lo, c, float(p.get("AF Start", 0.02)),
+                               float(p.get("AF Ad\u0131m", 0.02)), float(p.get("AF Max", 0.2)))
+                return {"psar": ps, "trend": tr}
+            if name == "Supertrend \u2191":
+                st, d = _supertrend(h, lo, c, int(p.get("Periyot", 10)),
+                                    float(p.get("\u00c7arpan", 3.0)))
+                return {"supertrend": st, "direction": d}
+            if name == "VWAP \u2191":
+                return {"vwap": _vwap(h, lo, c, v)}
+            if name == "HMA \u2191":
+                return {"hma": _hma(c, int(p.get("Periyot", 20)))}
+            if name == "RSI":
+                return {"rsi": _rsi(c, int(p.get("Periyot", 14)))}
+            if name == "MACD":
+                ml, sl, hist = _macd(c, int(p.get("Fast", 12)),
+                                     int(p.get("Slow", 26)), int(p.get("Signal", 9)))
+                return {"macd": ml, "signal": sl, "histogram": hist}
+            if name == "ADX":
+                a, pdi, ndi = _adx(h, lo, c, int(p.get("Periyot", 14)))
+                return {"adx": a, "plus_di": pdi, "minus_di": ndi}
+            if name == "Stochastic":
+                k, d = _stochastic(h, lo, c, int(p.get("Periyot", 14)),
+                                   int(p.get("K", 3)), int(p.get("D", 3)))
+                return {"k": k, "d": d}
+            if name == "Stochastic RSI":
+                k, d = _stoch_rsi(c, int(p.get("RSI P", 14)), int(p.get("Stoch P", 14)),
+                                  int(p.get("K", 3)), int(p.get("D", 3)))
+                return {"k": k, "d": d}
+            if name == "MFI":
+                return {"mfi": _mfi(h, lo, c, v, int(p.get("Periyot", 14)))}
+            if name == "CCI":
+                return {"cci": _cci(h, lo, c, int(p.get("Periyot", 20)))}
+            if name == "Williams %R":
+                return {"wr": _williams_r(h, lo, c, int(p.get("Periyot", 14)))}
+            if name == "ROC":
+                return {"roc": _roc(c, int(p.get("Periyot", 12)))}
+            if name == "Ultimate Osc":
+                return {"uo": _ultimate_osc(h, lo, c, int(p.get("P1", 7)),
+                                            int(p.get("P2", 14)), int(p.get("P3", 28)))}
+            if name == "OBV":
+                return {"obv": _obv(c, v)}
+            if name == "CVD":
+                return {"cvd": _cvd(v, tbv)}
+            if name == "CMF":
+                return {"cmf": _cmf(h, lo, c, v, int(p.get("Periyot", 20)))}
+            if name == "A/D Line":
+                return {"ad": _ad_line(h, lo, c, v)}
+            if name == "Elder Force":
+                return {"ef": _elder_force(c, v, int(p.get("Periyot", 13)))}
+            if name == "Hacim":
+                return {"volume": v, "vol_ma": _sma(v, 20)}
+            if name == "ATR":
+                return {"atr": _atr(h, lo, c, int(p.get("Periyot", 14)))}
+            if name == "BB Width":
+                return {"bbw": _bb_width(c, int(p.get("Periyot", 20)),
+                                         float(p.get("Std", 2.0)))}
+            if name == "Aroon":
+                au, ad = _aroon(h, lo, int(p.get("Periyot", 25)))
+                return {"aroon_up": au, "aroon_down": ad}
+        except Exception as e:
+            logger.warning(f"Indicator compute error [{name}]: {e}")
+        return {}
 
-            slice_df = df.iloc[: i + 1].copy()
-            try:
-                ind = engine.compute_all(slice_df)
-            except Exception:
-                continue
+    # ══════════════════════════════════════════════════════════════════════
+    # REFRESH / DRAW COORDINATION
+    # ══════════════════════════════════════════════════════════════════════
 
-            regime = regime_detector.detect(ind)
-            rw = regime.get("indicator_weights", {})
-            conf = confluence.score(ind, rw)
+    def _on_refresh(self):
+        self._progress_var.set("Veri al\u0131n\u0131yor...")
+        threading.Thread(target=self._do_refresh, daemon=True).start()
 
-            record = {
-                "timestamp": df["timestamp"].iloc[i],
-                "open": df["open"].iloc[i],
-                "high": df["high"].iloc[i],
-                "low": df["low"].iloc[i],
-                "close": df["close"].iloc[i],
-                "volume": df["volume"].iloc[i],
-                # Raw indicator values
-                "RSI": ind.get("RSI", 50),
-                "MACD_line": ind.get("MACD_line", 0),
-                "MACD_signal": ind.get("MACD_signal", 0),
-                "MACD_histogram": ind.get("MACD_histogram", 0),
-                "MACD_bullish_cross": ind.get("MACD_bullish_cross", False),
-                "MACD_bearish_cross": ind.get("MACD_bearish_cross", False),
-                "ADX": ind.get("ADX", 0),
-                "ADX_plus_DI": ind.get("ADX_plus_DI", 0),
-                "ADX_minus_DI": ind.get("ADX_minus_DI", 0),
-                "Supertrend_trend": ind.get("Supertrend_trend", ""),
-                "PSAR_trend": ind.get("PSAR_trend", ""),
-                "Ichimoku_Position": ind.get("Ichimoku_Position", ""),
-                "Price": ind.get("Price", 0),
-                "SMA_slow": ind.get("SMA_slow", 0),
-                "StochRSI_K": ind.get("StochRSI_K", 50),
-                "StochRSI_D": ind.get("StochRSI_D", 50),
-                "MFI": ind.get("MFI", 50),
-                "BB_PercentB": ind.get("BB_PercentB", 0.5),
-                "OBV_slope": ind.get("OBV_slope", 0),
-                "CMF": ind.get("CMF", 0),
-                # Confluence scores
-                "trend_score": conf.get("trend_score", 0),
-                "reversion_score": conf.get("reversion_score", 0),
-                "volume_score": conf.get("volume_score", 0),
-                "confluence_score": conf.get("score", 0),
-                "active_group": conf.get("active_group", "NEUTRAL"),
-                "signal": conf.get("signal", "NEUTRAL"),
-                # Per-indicator scores
-                **{f"score_{k}": v for k, v in conf.get("trend_details", {}).items()},
-                **{f"score_{k}": v for k, v in conf.get("reversion_details", {}).items()},
-                **{f"score_{k}": v for k, v in conf.get("volume_details", {}).items()},
-                # Regime
-                "regime": regime.get("regime", "UNKNOWN"),
-                "regime_confidence": regime.get("confidence", 0),
-                "trend_direction": regime.get("trend_direction", "NONE"),
-            }
-            records.append(record)
-
-        if progress_cb:
-            progress_cb(100)
-
-        return pd.DataFrame(records)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # STATIC MODE
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _on_analyze_click(self):
-        self._analyze_btn.configure(state="disabled")
-        self._progress_var.set("Veriler aliniyor...")
-        t = threading.Thread(target=self._run_static_analysis, daemon=True)
-        t.start()
-
-    def _run_static_analysis(self):
+    def _do_refresh(self):
         try:
             df = self._fetch_klines()
             if df is None or df.empty:
-                self.after(0, lambda: self._progress_var.set("Veri alinamadi!"))
-                self.after(0, lambda: self._analyze_btn.configure(state="normal"))
+                self.after(0, lambda: self._progress_var.set("Veri al\u0131namad\u0131!"))
                 return
-
-            def _progress(pct):
-                self.after(0, lambda p=pct: self._progress_var.set(f"Hesaplaniyor... %{p}"))
-
             with self._computation_lock:
-                ts = self._compute_timeseries(df, progress_cb=_progress)
-
-            if ts.empty:
-                self.after(0, lambda: self._progress_var.set("Hesaplama basarisiz!"))
-                self.after(0, lambda: self._analyze_btn.configure(state="normal"))
-                return
-
-            self._ts_df = ts
-            self.after(0, self._draw_charts)
-            self.after(0, lambda: self._progress_var.set(
-                f"{self._symbol_var.get()} | {len(ts)} mum | tamamlandi"
-            ))
+                self._prepare_data(df)
+                for ind in self._active:
+                    ind["data"] = self._compute_indicator(ind)
+            self.after(0, self._refresh_charts)
+            sym = self._symbol_var.get()
+            n = len(df)
+            self.after(0, lambda: self._progress_var.set(f"{sym} | {n} mum | tamamland\u0131"))
         except Exception as e:
-            logger.error(f"Static analysis error: {e}")
+            logger.error(f"Refresh error: {e}")
             self.after(0, lambda: self._progress_var.set(f"Hata: {e}"))
-        finally:
-            self.after(0, lambda: self._analyze_btn.configure(state="normal"))
 
-    # ══════════════════════════════════════════════════════════════════════════
+    def _recompute_and_draw(self):
+        """Recompute active indicators and redraw (UI thread)."""
+        if self._df is None:
+            return
+        for ind in self._active:
+            ind["data"] = self._compute_indicator(ind)
+        self._refresh_charts()
+
+    def _refresh_charts(self):
+        if self._df is None:
+            return
+        self._draw_price_chart()
+        self._draw_indicator_charts()
+
+    # ── Cleanup helpers ──
+
+    def _destroy_price_canvas(self):
+        if self._price_canvas:
+            self._price_canvas.get_tk_widget().destroy()
+            self._price_canvas = None
+        if self._price_fig:
+            import matplotlib.pyplot as plt
+            plt.close(self._price_fig)
+            self._price_fig = None
+        self._price_vline = None
+        self._price_hline = None
+
+    def _destroy_ind_canvas(self):
+        if self._ind_canvas:
+            self._ind_canvas.get_tk_widget().destroy()
+            self._ind_canvas = None
+        if self._ind_fig:
+            import matplotlib.pyplot as plt
+            plt.close(self._ind_fig)
+            self._ind_fig = None
+        self._ind_vlines.clear()
+        self._value_texts.clear()
+        self._ind_axes.clear()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PRICE CHART (FIXED)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _draw_price_chart(self):
+        self._destroy_price_canvas()
+
+        fig = Figure(figsize=(20, 4), facecolor=CLR_BG, dpi=80)
+        fig.subplots_adjust(left=0.04, right=0.96, top=0.94, bottom=0.10)
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(CLR_SUBPLOT)
+        ax.tick_params(colors=CLR_TEXT, labelsize=7)
+        ax.grid(True, color=CLR_GRID, alpha=0.3, linewidth=0.5)
+        for spine in ax.spines.values():
+            spine.set_color(CLR_GRID)
+
+        x = self._x
+
+        # ── Candlesticks (draw ALL, xlim controls visibility) ──
+        for i in range(self._n):
+            color = CLR_GREEN if self._close[i] >= self._open[i] else CLR_RED
+            ax.plot([x[i], x[i]], [self._low[i], self._high[i]], color=color, linewidth=0.6)
+            body_b = min(self._open[i], self._close[i])
+            body_h = max(abs(self._close[i] - self._open[i]),
+                         (self._high[i] - self._low[i]) * 0.005)
+            ax.bar(x[i], body_h, bottom=body_b, width=0.6,
+                   color=color, edgecolor=color, linewidth=0.3)
+
+        # ── Overlay indicators ──
+        overlays = [ind for ind in self._active
+                    if INDICATOR_DEFS.get(ind["name"], {}).get("type") == "overlay"]
+        for ind in overlays:
+            self._draw_overlay(ax, ind)
+
+        if overlays:
+            ax.legend(loc="upper left", fontsize=7, facecolor=CLR_SUBPLOT,
+                      edgecolor=CLR_GRID, labelcolor=CLR_TEXT, ncol=2)
+
+        ax.set_title(
+            f"{self._symbol_var.get()} \u2014 {self._tf_var.get()}",
+            fontsize=10, color=CLR_TEXT, loc="left", pad=4,
+        )
+
+        # ── Apply zoom view limits ──
+        self._apply_view_limits(ax)
+
+        # ── Crosshair lines ──
+        self._price_vline = ax.axvline(
+            0, color=CLR_WHITE, linewidth=0.5, alpha=0.5, visible=False
+        )
+        self._price_hline = ax.axhline(
+            0, color=CLR_WHITE, linewidth=0.5, alpha=0.5, visible=False
+        )
+
+        self._price_fig = fig
+        self._price_ax = ax
+        self._price_canvas = FigureCanvasTkAgg(fig, master=self._price_frame)
+        self._price_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._price_canvas.draw_idle()
+
+        # ── Mouse events ──
+        self._price_canvas.mpl_connect("motion_notify_event", self._on_mouse_price)
+        self._price_canvas.mpl_connect("axes_leave_event", self._on_mouse_leave)
+        self._price_canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
+        self._price_canvas.mpl_connect("button_press_event", self._on_drag_start)
+        self._price_canvas.mpl_connect("button_release_event", self._on_drag_end)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ZOOM & PAN (TradingView-style)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _apply_view_limits(self, ax=None):
+        """Set X and Y axis limits based on current view range."""
+        if ax is None:
+            ax = self._price_ax
+        if ax is None or self._n == 0:
+            return
+
+        vs, ve = self._view_start, self._view_end
+        vs = max(0, vs)
+        ve = min(self._n, ve)
+        if ve <= vs:
+            ve = vs + 1
+
+        # X limits with small padding
+        x_pad = max(1, (ve - vs) * 0.02)
+        ax.set_xlim(vs - x_pad, ve - 1 + x_pad)
+
+        # Y limits: fit to visible candles with padding
+        vis_low = self._low[vs:ve]
+        vis_high = self._high[vs:ve]
+        if len(vis_low) > 0:
+            y_min = float(np.min(vis_low))
+            y_max = float(np.max(vis_high))
+            y_pad = (y_max - y_min) * 0.05 if y_max > y_min else y_max * 0.01
+            ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
+        # Format X axis for visible range
+        self._format_xaxis_ranged(ax, vs, ve)
+
+    def _format_xaxis_ranged(self, ax, vs: int, ve: int):
+        """Format x-axis labels for the visible candle range."""
+        if self._n == 0:
+            return
+        visible_count = ve - vs
+        step = max(1, visible_count // 12)
+        ticks = list(range(vs, ve, step))
+        labels = []
+        for p in ticks:
+            if 0 <= p < self._n:
+                t = pd.Timestamp(self._timestamps[p])
+                labels.append(t.strftime("%m/%d\n%H:%M"))
+            else:
+                labels.append("")
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels, fontsize=7, color=CLR_TEXT)
+
+    def _on_scroll_zoom(self, event):
+        """Mouse wheel zoom — scroll up = zoom in, scroll down = zoom out."""
+        if self._n == 0 or event.inaxes is None:
+            return
+        # Accept zoom from both price chart and indicator subplots
+        valid_axes = [self._price_ax] + self._ind_axes
+        if event.inaxes not in valid_axes:
+            return
+
+        # Zoom factor
+        if event.button == "up":
+            scale = 0.8   # zoom in: show 80% of current range
+        elif event.button == "down":
+            scale = 1.25  # zoom out: show 125% of current range
+        else:
+            return
+
+        visible = self._view_end - self._view_start
+        new_visible = int(visible * scale)
+        new_visible = max(self._min_visible, min(new_visible, self._n))
+
+        # Zoom centered on mouse position
+        if event.xdata is not None:
+            mouse_ratio = (event.xdata - self._view_start) / max(visible, 1)
+        else:
+            mouse_ratio = 0.5
+
+        mouse_ratio = max(0.0, min(1.0, mouse_ratio))
+        new_start = int(round(event.xdata - new_visible * mouse_ratio)) if event.xdata is not None else self._view_start
+        new_start = max(0, min(new_start, self._n - new_visible))
+        new_end = new_start + new_visible
+
+        self._view_start = new_start
+        self._view_end = min(new_end, self._n)
+
+        # Fast update: just change axis limits, don't redraw everything
+        self._apply_view_limits()
+        self._sync_indicator_xlim()
+        if self._price_canvas:
+            self._price_canvas.draw_idle()
+        if self._ind_canvas:
+            self._ind_canvas.draw_idle()
+
+    def _on_drag_start(self, event):
+        """Start panning on middle-click or left-click drag."""
+        if event.inaxes != self._price_ax:
+            return
+        if event.button == 1:  # left click = pan
+            self._drag_active = True
+            self._drag_start_x = event.xdata
+            self._drag_view_start = self._view_start
+
+    def _on_drag_end(self, event):
+        """End panning."""
+        self._drag_active = False
+        self._drag_start_x = None
+
+    def _on_mouse_price(self, event):
+        if event.inaxes != self._price_ax or event.xdata is None:
+            return
+
+        # Handle drag/pan
+        if self._drag_active and self._drag_start_x is not None:
+            dx = int(round(self._drag_start_x - event.xdata))
+            visible = self._view_end - self._view_start
+            new_start = max(0, min(self._drag_view_start + dx, self._n - visible))
+            new_end = new_start + visible
+            if new_start != self._view_start:
+                self._view_start = new_start
+                self._view_end = new_end
+                self._apply_view_limits()
+                self._sync_indicator_xlim()
+                if self._price_canvas:
+                    self._price_canvas.draw_idle()
+                if self._ind_canvas:
+                    self._ind_canvas.draw_idle()
+            return
+
+        # Crosshair
+        idx = max(0, min(int(round(event.xdata)), self._n - 1))
+        self._update_crosshair(idx, event.ydata)
+
+    def _sync_indicator_xlim(self):
+        """Sync indicator subplot X limits with the price chart view."""
+        if not self._ind_axes:
+            return
+        vs, ve = self._view_start, self._view_end
+        x_pad = max(1, (ve - vs) * 0.02)
+        for ax in self._ind_axes:
+            ax.set_xlim(vs - x_pad, ve - 1 + x_pad)
+
+    def _reset_zoom(self):
+        """Reset zoom to show all candles."""
+        if self._n == 0:
+            return
+        self._view_start = 0
+        self._view_end = self._n
+        self._apply_view_limits()
+        self._sync_indicator_xlim()
+        if self._price_canvas:
+            self._price_canvas.draw_idle()
+        if self._ind_canvas:
+            self._ind_canvas.draw_idle()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # OVERLAY DRAWING
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _draw_overlay(self, ax, ind: dict):
+        name = ind["name"]
+        d = ind["data"]
+        x = self._x
+        if not d:
+            return
+
+        if name == "EMA \u2191":
+            p = ind["params"]
+            ax.plot(x, d["ema1"], color=CLR_CYAN, linewidth=1, alpha=0.8,
+                    label=f"EMA {p.get('P1', 9)}")
+            ax.plot(x, d["ema2"], color=CLR_ORANGE, linewidth=1, alpha=0.8,
+                    label=f"EMA {p.get('P2', 21)}")
+
+        elif name == "SMA \u2191":
+            p = ind["params"]
+            ax.plot(x, d["sma1"], color=CLR_YELLOW, linewidth=1, alpha=0.8,
+                    label=f"SMA {p.get('P1', 20)}")
+            ax.plot(x, d["sma2"], color=CLR_PURPLE, linewidth=1, alpha=0.8,
+                    label=f"SMA {p.get('P2', 200)}")
+
+        elif name == "Bollinger Bands \u2191":
+            ax.plot(x, d["upper"], color=CLR_BLUE, linewidth=0.8, alpha=0.7, label="BB")
+            ax.plot(x, d["middle"], color=CLR_BLUE, linewidth=0.6, alpha=0.4, linestyle="--")
+            ax.plot(x, d["lower"], color=CLR_BLUE, linewidth=0.8, alpha=0.7)
+            ax.fill_between(x, d["upper"], d["lower"], color=CLR_BLUE, alpha=0.06)
+
+        elif name == "Keltner \u2191":
+            ax.plot(x, d["upper"], color=CLR_PURPLE, linewidth=0.8, alpha=0.7, label="KC")
+            ax.plot(x, d["middle"], color=CLR_PURPLE, linewidth=0.6, alpha=0.4, linestyle="--")
+            ax.plot(x, d["lower"], color=CLR_PURPLE, linewidth=0.8, alpha=0.7)
+            ax.fill_between(x, d["upper"], d["lower"], color=CLR_PURPLE, alpha=0.05)
+
+        elif name == "Donchian \u2191":
+            ax.plot(x, d["upper"], color=CLR_TEAL, linewidth=0.8, alpha=0.7, label="DC")
+            ax.plot(x, d["middle"], color=CLR_TEAL, linewidth=0.6, alpha=0.4, linestyle="--")
+            ax.plot(x, d["lower"], color=CLR_TEAL, linewidth=0.8, alpha=0.7)
+            ax.fill_between(x, d["upper"], d["lower"], color=CLR_TEAL, alpha=0.05)
+
+        elif name == "Ichimoku \u2191":
+            ax.plot(x, d["tenkan"], color=CLR_RED, linewidth=0.8, alpha=0.7, label="Tenkan")
+            ax.plot(x, d["kijun"], color=CLR_BLUE, linewidth=0.8, alpha=0.7, label="Kijun")
+            sa, sb = d["senkou_a"], d["senkou_b"]
+            ax.fill_between(x, sa, sb, where=(sa >= sb), color=CLR_GREEN, alpha=0.08)
+            ax.fill_between(x, sa, sb, where=(sa < sb), color=CLR_RED, alpha=0.08)
+
+        elif name == "PSAR \u2191":
+            up_m = d["trend"] == 1
+            dn_m = d["trend"] == -1
+            ax.scatter(x[up_m], d["psar"][up_m], color=CLR_GREEN, s=4, marker=".",
+                       alpha=0.7, label="PSAR")
+            ax.scatter(x[dn_m], d["psar"][dn_m], color=CLR_RED, s=4, marker=".", alpha=0.7)
+
+        elif name == "Supertrend \u2191":
+            st_val = d["supertrend"]
+            direction = d["direction"]
+            for i in range(1, self._n):
+                clr = CLR_GREEN if direction[i] == 1 else CLR_RED
+                ax.plot([x[i - 1], x[i]], [st_val[i - 1], st_val[i]],
+                        color=clr, linewidth=1.2, alpha=0.8)
+            ax.plot([], [], color=CLR_GREEN, linewidth=1.2, label="ST Up")
+            ax.plot([], [], color=CLR_RED, linewidth=1.2, label="ST Down")
+
+        elif name == "VWAP \u2191":
+            ax.plot(x, d["vwap"], color=CLR_PURPLE, linewidth=1, alpha=0.8,
+                    linestyle="-.", label="VWAP")
+
+        elif name == "HMA \u2191":
+            hma_vals = d["hma"]
+            valid = ~np.isnan(hma_vals)
+            if valid.any():
+                ax.plot(x[valid], hma_vals[valid], color=CLR_PINK, linewidth=1.2, alpha=0.8,
+                        label=f"HMA {ind['params'].get('Periyot', 20)}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # INDICATOR SUBPLOTS (SCROLLABLE)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _draw_indicator_charts(self):
+        self._destroy_ind_canvas()
+
+        subplots = [ind for ind in self._active
+                    if INDICATOR_DEFS.get(ind["name"], {}).get("type") == "subplot"]
+        if not subplots:
+            return
+
+        n_sub = len(subplots)
+        h_per = 2.0  # inches per subplot
+        total_h = n_sub * h_per
+
+        fig = Figure(figsize=(20, total_h), facecolor=CLR_BG, dpi=80)
+        fig.subplots_adjust(left=0.04, right=0.96,
+                            top=1.0 - 0.015 / max(total_h, 1),
+                            bottom=0.015 / max(total_h, 1),
+                            hspace=0.45)
+
+        gs = GridSpec(n_sub, 1, figure=fig, hspace=0.45)
+
+        self._ind_axes = []
+        self._ind_vlines = []
+        self._value_texts = []
+
+        for i, ind in enumerate(subplots):
+            ax = fig.add_subplot(gs[i, 0])
+            ax.set_facecolor(CLR_SUBPLOT)
+            ax.tick_params(colors=CLR_TEXT, labelsize=7)
+            ax.grid(True, color=CLR_GRID, alpha=0.3, linewidth=0.5)
+            for spine in ax.spines.values():
+                spine.set_color(CLR_GRID)
+
+            self._draw_subplot(ax, ind)
+
+            if i < n_sub - 1:
+                ax.tick_params(labelbottom=False)
+            else:
+                self._format_xaxis_ranged(ax, self._view_start, self._view_end)
+
+            vl = ax.axvline(0, color=CLR_WHITE, linewidth=0.5, alpha=0.5, visible=False)
+            self._ind_vlines.append(vl)
+
+            vt = ax.text(
+                0.99, 0.90, "", transform=ax.transAxes, fontsize=8, color=CLR_TEXT,
+                ha="right", va="top",
+                bbox=dict(boxstyle="round,pad=0.2", fc=CLR_SUBPLOT, ec=CLR_GRID, alpha=0.85),
+            )
+            self._value_texts.append(vt)
+            self._ind_axes.append(ax)
+
+        self._ind_fig = fig
+        self._ind_canvas = FigureCanvasTkAgg(fig, master=self._ind_scroll)
+        w = self._ind_canvas.get_tk_widget()
+        w.configure(height=int(total_h * 80))
+        w.pack(fill="x", expand=False)
+
+        # Sync indicator X limits with price chart zoom
+        self._sync_indicator_xlim()
+        self._ind_canvas.draw_idle()
+
+        self._ind_canvas.mpl_connect("motion_notify_event", self._on_mouse_ind)
+        self._ind_canvas.mpl_connect("axes_leave_event", self._on_mouse_leave)
+        self._ind_canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SUBPLOT DRAWING
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _draw_subplot(self, ax, ind: dict):
+        name = ind["name"]
+        d = ind["data"]
+        x = self._x
+        if not d:
+            ax.set_title(name, fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+            return
+
+        if name == "RSI":
+            r = d["rsi"]
+            ax.plot(x, r, color=CLR_PURPLE, linewidth=1)
+            ax.axhline(30, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(70, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.fill_between(x, r, 30, where=(r < 30), color=CLR_GREEN, alpha=0.12)
+            ax.fill_between(x, r, 70, where=(r > 70), color=CLR_RED, alpha=0.12)
+            ax.set_ylim(0, 100)
+            ax.set_title("RSI", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "MACD":
+            hist = d["histogram"]
+            colors = [CLR_GREEN if h >= 0 else CLR_RED for h in hist]
+            ax.bar(x, hist, color=colors, alpha=0.6, width=0.7)
+            ax.plot(x, d["macd"], color=CLR_BLUE, linewidth=0.8, label="MACD")
+            ax.plot(x, d["signal"], color=CLR_ORANGE, linewidth=0.8, label="Signal")
+            ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
+            ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
+                      edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
+            ax.set_title("MACD", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "ADX":
+            ax.plot(x, d["adx"], color=CLR_BLUE, linewidth=1, label="ADX")
+            ax.plot(x, d["plus_di"], color=CLR_GREEN, linewidth=0.8, label="+DI")
+            ax.plot(x, d["minus_di"], color=CLR_RED, linewidth=0.8, label="-DI")
+            ax.axhline(20, color=CLR_GRAY, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(25, color=CLR_ORANGE, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
+                      edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
+            ax.set_title("ADX", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "Stochastic":
+            ax.plot(x, d["k"], color=CLR_BLUE, linewidth=0.8, label="%K")
+            ax.plot(x, d["d"], color=CLR_ORANGE, linewidth=0.8, label="%D")
+            ax.axhline(20, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(80, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.set_ylim(0, 100)
+            ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
+                      edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
+            ax.set_title("Stochastic", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "Stochastic RSI":
+            ax.plot(x, d["k"], color=CLR_BLUE, linewidth=0.8, label="%K")
+            ax.plot(x, d["d"], color=CLR_ORANGE, linewidth=0.8, label="%D")
+            ax.axhline(20, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(80, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.set_ylim(0, 100)
+            ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
+                      edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
+            ax.set_title("Stochastic RSI", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "MFI":
+            ax.plot(x, d["mfi"], color=CLR_TEAL, linewidth=1)
+            ax.axhline(20, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(80, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.set_ylim(0, 100)
+            ax.set_title("MFI", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "CCI":
+            cc = d["cci"]
+            ax.plot(x, cc, color=CLR_BLUE, linewidth=1)
+            ax.axhline(100, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(-100, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(0, color=CLR_GRAY, linewidth=0.5, alpha=0.3)
+            ax.fill_between(x, cc, 100, where=(cc > 100), color=CLR_RED, alpha=0.08)
+            ax.fill_between(x, cc, -100, where=(cc < -100), color=CLR_GREEN, alpha=0.08)
+            ax.set_title("CCI", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "Williams %R":
+            ax.plot(x, d["wr"], color=CLR_PURPLE, linewidth=1)
+            ax.axhline(-20, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(-80, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.set_ylim(-100, 0)
+            ax.set_title("Williams %R", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "ROC":
+            rc = d["roc"]
+            ax.plot(x, rc, color=CLR_BLUE, linewidth=1)
+            ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
+            ax.fill_between(x, rc, 0, where=(rc >= 0), color=CLR_GREEN, alpha=0.08)
+            ax.fill_between(x, rc, 0, where=(rc < 0), color=CLR_RED, alpha=0.08)
+            ax.set_title("ROC", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "Ultimate Osc":
+            ax.plot(x, d["uo"], color=CLR_BLUE, linewidth=1)
+            ax.axhline(30, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.axhline(70, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.set_title("Ultimate Oscillator", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "OBV":
+            ax.plot(x, d["obv"], color=CLR_BLUE, linewidth=1)
+            ax.set_title("OBV", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "CVD":
+            ax.plot(x, d["cvd"], color=CLR_CYAN, linewidth=1)
+            ax.set_title("CVD", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "CMF":
+            cm = d["cmf"]
+            ax.plot(x, cm, color=CLR_BLUE, linewidth=1)
+            ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
+            ax.fill_between(x, cm, 0, where=(cm >= 0), color=CLR_GREEN, alpha=0.12)
+            ax.fill_between(x, cm, 0, where=(cm < 0), color=CLR_RED, alpha=0.12)
+            ax.set_title("CMF", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "A/D Line":
+            ax.plot(x, d["ad"], color=CLR_BLUE, linewidth=1)
+            ax.set_title("A/D Line", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "Elder Force":
+            ef = d["ef"]
+            colors = [CLR_GREEN if v >= 0 else CLR_RED for v in ef]
+            ax.bar(x, ef, color=colors, alpha=0.6, width=0.7)
+            ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
+            ax.set_title("Elder Force Index", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "Hacim":
+            vol = d["volume"]
+            colors = [CLR_GREEN if self._close[i] >= self._open[i] else CLR_RED
+                      for i in range(self._n)]
+            ax.bar(x, vol, color=colors, alpha=0.6, width=0.7)
+            vm = d.get("vol_ma")
+            if vm is not None:
+                valid = ~np.isnan(vm)
+                ax.plot(x[valid], vm[valid], color=CLR_ORANGE, linewidth=1, label="MA20")
+                ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
+                          edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
+            ax.set_title("Hacim", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "ATR":
+            ax.plot(x, d["atr"], color=CLR_ORANGE, linewidth=1)
+            ax.set_title("ATR", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "BB Width":
+            ax.plot(x, d["bbw"], color=CLR_BLUE, linewidth=1)
+            ax.set_title("BB Width", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+        elif name == "Aroon":
+            ax.plot(x, d["aroon_up"], color=CLR_GREEN, linewidth=0.8, label="Up")
+            ax.plot(x, d["aroon_down"], color=CLR_RED, linewidth=0.8, label="Down")
+            ax.axhline(50, color=CLR_GRAY, linewidth=0.5, linestyle="--", alpha=0.3)
+            ax.set_ylim(0, 100)
+            ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
+                      edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
+            ax.set_title("Aroon", fontsize=8, color=CLR_TEXT, loc="left", pad=2)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # X-AXIS FORMATTING
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _format_xaxis(self, ax):
+        if self._n == 0:
+            return
+        step = max(1, self._n // 12)
+        ticks = list(range(0, self._n, step))
+        labels = []
+        for p in ticks:
+            t = pd.Timestamp(self._timestamps[p])
+            labels.append(t.strftime("%m/%d\n%H:%M"))
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels, fontsize=7, color=CLR_TEXT)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CROSSHAIR / INTERACTION
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _on_mouse_ind(self, event):
+        if not event.inaxes or event.xdata is None:
+            return
+        idx = max(0, min(int(round(event.xdata)), self._n - 1))
+        self._update_crosshair(idx, None)
+
+    def _on_mouse_leave(self, event):
+        if self._price_vline:
+            self._price_vline.set_visible(False)
+        if self._price_hline:
+            self._price_hline.set_visible(False)
+        for vl in self._ind_vlines:
+            vl.set_visible(False)
+        for vt in self._value_texts:
+            vt.set_text("")
+        if self._price_canvas:
+            self._price_canvas.draw_idle()
+        if self._ind_canvas:
+            self._ind_canvas.draw_idle()
+        self._info_var.set("")
+        self._last_cross_idx = -1
+
+    def _update_crosshair(self, idx: int, y_price: float | None):
+        if idx == self._last_cross_idx:
+            return
+        self._last_cross_idx = idx
+
+        # Price chart crosshair
+        if self._price_vline:
+            self._price_vline.set_xdata([idx])
+            self._price_vline.set_visible(True)
+        if self._price_hline and y_price is not None:
+            self._price_hline.set_ydata([y_price])
+            self._price_hline.set_visible(True)
+
+        # Indicator crosshair lines
+        for vl in self._ind_vlines:
+            vl.set_xdata([idx])
+            vl.set_visible(True)
+
+        # Update value annotations on indicator subplots
+        subplots = [ind for ind in self._active
+                    if INDICATOR_DEFS.get(ind["name"], {}).get("type") == "subplot"]
+        for i, ind in enumerate(subplots):
+            if i < len(self._value_texts):
+                self._value_texts[i].set_text(self._get_value_str(ind, idx))
+
+        # Update info bar
+        self._update_info(idx)
+
+        # Redraw
+        if self._price_canvas:
+            self._price_canvas.draw_idle()
+        if self._ind_canvas:
+            self._ind_canvas.draw_idle()
+
+    def _get_value_str(self, ind: dict, idx: int) -> str:
+        name = ind["name"]
+        d = ind["data"]
+        if not d or idx < 0:
+            return ""
+
+        def _v(key):
+            arr = d.get(key)
+            if arr is None or idx >= len(arr):
+                return np.nan
+            val = arr[idx]
+            return val if np.isfinite(val) else np.nan
+
+        if name == "RSI":
+            return f"RSI: {_v('rsi'):.1f}"
+        if name == "MACD":
+            return f"MACD: {_v('macd'):.2f}  Sig: {_v('signal'):.2f}"
+        if name == "ADX":
+            return f"ADX: {_v('adx'):.1f}  +DI: {_v('plus_di'):.1f}  -DI: {_v('minus_di'):.1f}"
+        if name in ("Stochastic", "Stochastic RSI"):
+            return f"%K: {_v('k'):.1f}  %D: {_v('d'):.1f}"
+        if name == "MFI":
+            return f"MFI: {_v('mfi'):.1f}"
+        if name == "CCI":
+            return f"CCI: {_v('cci'):.1f}"
+        if name == "Williams %R":
+            return f"%R: {_v('wr'):.1f}"
+        if name == "ROC":
+            return f"ROC: {_v('roc'):.2f}%"
+        if name == "Ultimate Osc":
+            return f"UO: {_v('uo'):.1f}"
+        if name == "OBV":
+            return f"OBV: {_v('obv'):,.0f}"
+        if name == "CVD":
+            return f"CVD: {_v('cvd'):,.0f}"
+        if name == "CMF":
+            return f"CMF: {_v('cmf'):.4f}"
+        if name == "A/D Line":
+            return f"A/D: {_v('ad'):,.0f}"
+        if name == "Elder Force":
+            return f"EFI: {_v('ef'):,.0f}"
+        if name == "Hacim":
+            return f"Vol: {_v('volume'):,.0f}"
+        if name == "ATR":
+            return f"ATR: {_v('atr'):.4f}"
+        if name == "BB Width":
+            return f"BBW: {_v('bbw'):.2f}%"
+        if name == "Aroon":
+            return f"Up: {_v('aroon_up'):.0f}  Down: {_v('aroon_down'):.0f}"
+        return ""
+
+    def _update_info(self, idx: int):
+        if idx < 0 or idx >= self._n:
+            return
+        ts = pd.Timestamp(self._timestamps[idx]).strftime("%Y-%m-%d %H:%M")
+        o, h, lo, c = self._open[idx], self._high[idx], self._low[idx], self._close[idx]
+        v = self._volume[idx]
+
+        prec = 2 if c >= 1 else 6
+
+        info = (f"{ts} \u2502 O:{o:.{prec}f}  H:{h:.{prec}f}  "
+                f"L:{lo:.{prec}f}  C:{c:.{prec}f} \u2502 Vol:{v:,.0f}")
+
+        # Append overlay values
+        for ind in self._active:
+            if INDICATOR_DEFS.get(ind["name"], {}).get("type") != "overlay":
+                continue
+            d = ind["data"]
+            if not d:
+                continue
+            nm = ind["name"]
+
+            def _ov(key):
+                arr = d.get(key)
+                if arr is None or idx >= len(arr):
+                    return 0.0
+                val = arr[idx]
+                return val if np.isfinite(val) else 0.0
+
+            if nm == "EMA \u2191":
+                info += f" \u2502 EMA:{_ov('ema1'):.{prec}f}/{_ov('ema2'):.{prec}f}"
+            elif nm == "SMA \u2191":
+                info += f" \u2502 SMA:{_ov('sma1'):.{prec}f}/{_ov('sma2'):.{prec}f}"
+            elif nm == "VWAP \u2191":
+                info += f" \u2502 VWAP:{_ov('vwap'):.{prec}f}"
+            elif nm == "Supertrend \u2191":
+                info += f" \u2502 ST:{_ov('supertrend'):.{prec}f}"
+
+        self._info_var.set(info)
+
+    # ══════════════════════════════════════════════════════════════════════
     # LIVE MODE
-    # ══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════
 
-    def _on_live_toggle(self):
+    def _toggle_live(self):
         if self._live_running:
             self._stop_live()
         else:
@@ -415,594 +1559,38 @@ class IndicatorAnalysisPanel(ctk.CTkFrame):
 
     def _start_live(self):
         self._live_running = True
-        self._live_btn.configure(text="Durdur", fg_color="#B71C1C")
+        self._live_btn.configure(text="Canl\u0131: A\u00c7IK", fg_color="#1B5E20")
         self._live_thread = threading.Thread(target=self._live_loop, daemon=True)
         self._live_thread.start()
 
     def _stop_live(self):
         self._live_running = False
-        self._live_btn.configure(text="Baslat", fg_color="#1B5E20")
+        self._live_btn.configure(text="Canl\u0131: Kapal\u0131", fg_color="#333333")
 
     def _live_loop(self):
-        """Background loop for live mode."""
-        first_run = True
         while self._live_running:
             try:
-                self.after(0, lambda: self._progress_var.set("Canli guncelleme..."))
                 df = self._fetch_klines()
-                if df is None or df.empty:
-                    self.after(0, lambda: self._progress_var.set("Veri alinamadi, tekrar deneniyor..."))
-                    time.sleep(5)
-                    continue
-
-                if first_run:
-                    # Full computation on first run
-                    def _progress(pct):
-                        self.after(0, lambda p=pct: self._progress_var.set(f"Ilk hesaplama... %{p}"))
-
+                if df is not None and not df.empty:
                     with self._computation_lock:
-                        ts = self._compute_timeseries(df, progress_cb=_progress)
-                    first_run = False
-                else:
-                    # Incremental: recompute only last 5 candles for speed
-                    warmup = max(55, len(df) - 5)
-                    with self._computation_lock:
-                        ts_new = self._compute_timeseries(df, min_warmup=warmup)
-                    if self._ts_df is not None and not ts_new.empty:
-                        # Merge: keep old data, replace/append new candles
-                        old = self._ts_df
-                        cutoff = ts_new["timestamp"].iloc[0]
-                        old_keep = old[old["timestamp"] < cutoff]
-                        ts = pd.concat([old_keep, ts_new], ignore_index=True)
-                    else:
-                        ts = ts_new
+                        self._prepare_data(df)
+                        for ind in self._active:
+                            ind["data"] = self._compute_indicator(ind)
+                    self.after(0, self._refresh_charts)
+                    now = datetime.now().strftime("%H:%M:%S")
+                    sym = self._symbol_var.get()
+                    self.after(0, lambda t=now, s=sym: self._progress_var.set(
+                        f"Canl\u0131 \u2502 {s} \u2502 {t}"
+                    ))
 
-                if ts.empty:
-                    time.sleep(5)
-                    continue
-
-                self._ts_df = ts
-                self.after(0, self._draw_charts)
-                now = datetime.now().strftime("%H:%M:%S")
-                self.after(0, lambda t=now: self._progress_var.set(
-                    f"Canli | {self._symbol_var.get()} | {len(self._ts_df)} mum | {t}"
-                ))
-
-                # Sleep based on update mode
-                if self._update_var.get() == "Mum Kapanisi":
-                    interval_sec = _INTERVAL_SECONDS.get(self._tf_var.get(), 60)
-                    # Sleep until next candle close + 2s buffer
-                    now_ts = time.time()
-                    next_close = (int(now_ts / interval_sec) + 1) * interval_sec + 2
-                    wait = max(next_close - now_ts, 1)
-                    # Sleep in small increments to allow stopping
-                    for _ in range(int(wait)):
-                        if not self._live_running:
-                            return
-                        time.sleep(1)
-                else:
-                    # Her 5 sn
-                    for _ in range(5):
-                        if not self._live_running:
-                            return
-                        time.sleep(1)
+                # Adaptive wait: max 10s or candle interval
+                interval = _INTERVAL_SEC.get(self._tf_var.get(), 60)
+                wait = min(interval, 10)
+                for _ in range(int(wait)):
+                    if not self._live_running:
+                        return
+                    time.sleep(1)
 
             except Exception as e:
                 logger.error(f"Live loop error: {e}")
-                self.after(0, lambda: self._progress_var.set(f"Hata: {e}"))
                 time.sleep(5)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # CHART DRAWING
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _draw_charts(self):
-        """Main chart drawing routine -- runs on the UI thread."""
-        ts = self._ts_df
-        if ts is None or ts.empty:
-            return
-
-        # Destroy old canvas
-        if self._canvas:
-            self._canvas.get_tk_widget().destroy()
-            self._canvas = None
-        if self._fig:
-            import matplotlib.pyplot as plt
-            plt.close(self._fig)
-            self._fig = None
-
-        # Prepare data
-        timestamps = ts["timestamp"].values
-        x = np.arange(len(timestamps))
-
-        # ── Figure with GridSpec ──────────────────────────────────────────
-        # Height ratios: price=4, indicators=1 each (12), group totals=1.5 (3),
-        # grand total=2, regime=0.5
-        # Subplots: price, MACD, ADX, Supertrend, PSAR, Ichimoku, PriceSMA,
-        #   trend_total, RSI, StochRSI, MFI, BB, rev_total, OBV, CMF, vol_total,
-        #   grand_total, regime = 18 subplots
-        n_sub = 18
-        ratios = [4, 1, 1, 1, 1, 1, 1, 1.5, 1, 1, 1, 1, 1.5, 1, 1, 1.5, 2, 0.5]
-        total_height = sum(ratios) * 1.3  # ~1.3 inches per ratio unit
-
-        fig = Figure(figsize=(20, total_height), facecolor=CLR_BG, dpi=80)
-        fig.subplots_adjust(left=0.025, right=0.998, top=0.997, bottom=0.008,
-                            hspace=0.35)
-        gs = GridSpec(n_sub, 1, figure=fig, height_ratios=ratios, hspace=0.35)
-
-        axes = []
-        for i in range(n_sub):
-            ax = fig.add_subplot(gs[i, 0])
-            ax.set_facecolor(CLR_SUBPLOT)
-            ax.tick_params(colors=CLR_TEXT, labelsize=6, pad=1)
-            ax.yaxis.set_tick_params(labelsize=6, pad=1)
-            ax.grid(True, color=CLR_GRID, alpha=0.3, linewidth=0.5)
-            for spine in ax.spines.values():
-                spine.set_color(CLR_GRID)
-            axes.append(ax)
-
-        # Share x axis
-        for ax in axes[1:]:
-            ax.sharex(axes[0])
-
-        # Hide x labels except last
-        for ax in axes[:-1]:
-            ax.tick_params(labelbottom=False)
-
-        # Format x-axis on last subplot
-        self._format_xaxis(axes[-1], timestamps, x)
-
-        # ── Draw subplots ─────────────────────────────────────────────────
-        self._draw_price(axes[0], ts, x)
-        self._draw_macd(axes[1], ts, x)
-        self._draw_adx(axes[2], ts, x)
-        self._draw_supertrend(axes[3], ts, x)
-        self._draw_psar(axes[4], ts, x)
-        self._draw_ichimoku(axes[5], ts, x)
-        self._draw_price_sma(axes[6], ts, x)
-        self._draw_group_total(axes[7], ts, x, "trend_score", "TREND TOPLAM")
-        self._draw_rsi(axes[8], ts, x)
-        self._draw_stochrsi(axes[9], ts, x)
-        self._draw_mfi(axes[10], ts, x)
-        self._draw_bb(axes[11], ts, x)
-        self._draw_group_total(axes[12], ts, x, "reversion_score", "MEAN-REV TOPLAM")
-        self._draw_obv(axes[13], ts, x)
-        self._draw_cmf(axes[14], ts, x)
-        self._draw_group_total(axes[15], ts, x, "volume_score", "VOLUME TOPLAM")
-        self._draw_grand_total(axes[16], ts, x)
-        self._draw_regime(axes[17], ts, x)
-
-        self._fig = fig
-        self._canvas = FigureCanvasTkAgg(fig, master=self._chart_frame)
-        widget = self._canvas.get_tk_widget()
-        widget.configure(height=int(total_height * 80))  # dpi=80
-        widget.pack(fill="x", expand=False)
-        self._canvas.draw_idle()
-
-    # ── X-axis formatting ────────────────────────────────────────────────
-
-    def _format_xaxis(self, ax, timestamps, x):
-        """Use timestamp labels on integer x positions."""
-        n = len(x)
-        if n == 0:
-            return
-        # Show ~12 labels
-        step = max(1, n // 12)
-        tick_pos = list(range(0, n, step))
-        tick_labels = []
-        for p in tick_pos:
-            t = pd.Timestamp(timestamps[p])
-            tick_labels.append(t.strftime("%m/%d\n%H:%M"))
-        ax.set_xticks(tick_pos)
-        ax.set_xticklabels(tick_labels, fontsize=7, color=CLR_TEXT)
-
-    # ── Subplot helper: title ────────────────────────────────────────────
-
-    def _set_title(self, ax, text, score_text=None):
-        title = text
-        if score_text is not None:
-            title += f"  [{score_text}]"
-        ax.set_title(title, fontsize=8, color=CLR_TEXT, loc="left", pad=2)
-
-    def _get_last_score(self, ts, key):
-        val = ts[key].iloc[-1] if key in ts.columns else 0
-        return val
-
-    # ── Signal A/S markers helper ─────────────────────────────────────────
-
-    def _draw_signal_markers(self, ax, ts, x):
-        """Draw green 'A' (AL/BUY) and red 'S' (SAT/SELL) markers at top of subplot."""
-        if "signal" not in ts.columns:
-            return
-        signals = ts["signal"].values
-        ymin, ymax = ax.get_ylim()
-        marker_y = ymax - (ymax - ymin) * 0.08  # 8% from top
-
-        for i in range(len(x)):
-            if signals[i] == "BUY":
-                ax.text(x[i], marker_y, "A", color=CLR_GREEN, fontsize=6,
-                        fontweight="bold", ha="center", va="top", alpha=0.85)
-            elif signals[i] == "SELL":
-                ax.text(x[i], marker_y, "S", color=CLR_RED, fontsize=6,
-                        fontweight="bold", ha="center", va="top", alpha=0.85)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # INDIVIDUAL SUBPLOT DRAWING
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _draw_price(self, ax, ts, x):
-        """Candlestick chart with SMA overlay."""
-        opens = ts["open"].values
-        highs = ts["high"].values
-        lows = ts["low"].values
-        closes = ts["close"].values
-        sma = ts["SMA_slow"].values
-
-        # Draw candles
-        for i in range(len(x)):
-            color = CLR_GREEN if closes[i] >= opens[i] else CLR_RED
-            # Wick
-            ax.plot([x[i], x[i]], [lows[i], highs[i]], color=color, linewidth=0.6)
-            # Body
-            body_bottom = min(opens[i], closes[i])
-            body_height = abs(closes[i] - opens[i])
-            if body_height < (highs[i] - lows[i]) * 0.01:
-                body_height = (highs[i] - lows[i]) * 0.01
-            ax.bar(x[i], body_height, bottom=body_bottom, width=0.6,
-                   color=color, edgecolor=color, linewidth=0.5)
-
-        # SMA overlay
-        valid_sma = sma > 0
-        if valid_sma.any():
-            ax.plot(x[valid_sma], sma[valid_sma], color=CLR_ORANGE, linewidth=1.0,
-                    alpha=0.8, label=f"SMA {self._param_vars['SMA Slow'].get()}")
-            ax.legend(loc="upper left", fontsize=7, facecolor=CLR_SUBPLOT,
-                      edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
-
-        self._set_title(ax, f"FIYAT - {self._symbol_var.get()} ({self._tf_var.get()})")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_macd(self, ax, ts, x):
-        hist = ts["MACD_histogram"].values
-        macd_line = ts["MACD_line"].values
-        sig_line = ts["MACD_signal"].values
-
-        colors = [CLR_GREEN if h >= 0 else CLR_RED for h in hist]
-        ax.bar(x, hist, color=colors, alpha=0.6, width=0.7)
-        ax.plot(x, macd_line, color=CLR_BLUE, linewidth=0.8, label="MACD")
-        ax.plot(x, sig_line, color=CLR_ORANGE, linewidth=0.8, label="Signal")
-        ax.axhline(0, color=CLR_GRAY, linewidth=0.5, alpha=0.5)
-
-        # Score background
-        if "score_MACD" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_MACD")
-
-        score = self._get_last_score(ts, "score_MACD")
-        self._set_title(ax, "MACD", f"skor: {score:+.1f}")
-        ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
-                  edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_adx(self, ax, ts, x):
-        ax.plot(x, ts["ADX"].values, color=CLR_BLUE, linewidth=1.0, label="ADX")
-        ax.plot(x, ts["ADX_plus_DI"].values, color=CLR_GREEN, linewidth=0.8, label="+DI")
-        ax.plot(x, ts["ADX_minus_DI"].values, color=CLR_RED, linewidth=0.8, label="-DI")
-        ax.axhline(22, color=CLR_GRAY, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.axhline(30, color=CLR_ORANGE, linewidth=0.5, linestyle="--", alpha=0.5)
-
-        if "score_ADX" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_ADX")
-
-        score = self._get_last_score(ts, "score_ADX")
-        self._set_title(ax, "ADX", f"skor: {score:+.1f}")
-        ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
-                  edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_supertrend(self, ax, ts, x):
-        trends = ts["Supertrend_trend"].values
-        for i in range(len(x)):
-            color = CLR_GREEN if trends[i] == "UP" else (CLR_RED if trends[i] == "DOWN" else CLR_GRAY)
-            ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=color, alpha=0.25)
-
-        if "score_Supertrend" in ts.columns:
-            ax.plot(x, ts["score_Supertrend"].values, color=CLR_TEXT, linewidth=0.8)
-
-        score = self._get_last_score(ts, "score_Supertrend")
-        self._set_title(ax, "Supertrend", f"skor: {score:+.1f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_psar(self, ax, ts, x):
-        trends = ts["PSAR_trend"].values
-        for i in range(len(x)):
-            color = CLR_GREEN if trends[i] == "UP" else (CLR_RED if trends[i] == "DOWN" else CLR_GRAY)
-            ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=color, alpha=0.25)
-
-        if "score_PSAR" in ts.columns:
-            ax.plot(x, ts["score_PSAR"].values, color=CLR_TEXT, linewidth=0.8)
-
-        score = self._get_last_score(ts, "score_PSAR")
-        self._set_title(ax, "PSAR", f"skor: {score:+.1f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_ichimoku(self, ax, ts, x):
-        positions = ts["Ichimoku_Position"].values
-        color_map = {"ABOVE": CLR_GREEN, "BELOW": CLR_RED, "INSIDE": CLR_ORANGE}
-        for i in range(len(x)):
-            c = color_map.get(positions[i], CLR_GRAY)
-            ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=c, alpha=0.25)
-
-        if "score_Ichimoku" in ts.columns:
-            ax.plot(x, ts["score_Ichimoku"].values, color=CLR_TEXT, linewidth=0.8)
-
-        score = self._get_last_score(ts, "score_Ichimoku")
-        self._set_title(ax, "Ichimoku", f"skor: {score:+.1f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_price_sma(self, ax, ts, x):
-        price = ts["Price"].values
-        sma = ts["SMA_slow"].values
-        valid = sma > 0
-        diff = np.where(valid, price - sma, 0)
-        colors = [CLR_GREEN if d >= 0 else CLR_RED for d in diff]
-        ax.bar(x, diff, color=colors, alpha=0.5, width=0.7)
-        ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
-
-        if "score_Price_vs_SMA" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_Price_vs_SMA")
-
-        score = self._get_last_score(ts, "score_Price_vs_SMA")
-        self._set_title(ax, "Price vs SMA", f"skor: {score:+.1f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_group_total(self, ax, ts, x, col, title):
-        """Draw group total score with fill."""
-        if col not in ts.columns:
-            self._set_title(ax, title, "N/A")
-            return
-        values = ts[col].values
-        pos = np.where(values >= 0, values, 0)
-        neg = np.where(values < 0, values, 0)
-        ax.fill_between(x, 0, pos, color=CLR_GREEN, alpha=0.4, step="mid")
-        ax.fill_between(x, 0, neg, color=CLR_RED, alpha=0.4, step="mid")
-        ax.plot(x, values, color=CLR_TEXT, linewidth=1.0)
-        ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
-        ax.axhline(GROUP_NEUTRAL_THRESHOLD, color=CLR_GREEN, linewidth=0.5,
-                   linestyle="--", alpha=0.5)
-        ax.axhline(-GROUP_NEUTRAL_THRESHOLD, color=CLR_RED, linewidth=0.5,
-                   linestyle="--", alpha=0.5)
-
-        last_val = values[-1]
-        self._set_title(ax, title, f"{last_val:+.2f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_rsi(self, ax, ts, x):
-        rsi = ts["RSI"].values
-        ax.plot(x, rsi, color=CLR_PURPLE, linewidth=1.0)
-        ax.axhline(25, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.axhline(35, color=CLR_LIGHT_GREEN, linewidth=0.5, linestyle=":", alpha=0.4)
-        ax.axhline(65, color=CLR_LIGHT_RED, linewidth=0.5, linestyle=":", alpha=0.4)
-        ax.axhline(75, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.fill_between(x, rsi, 25, where=(rsi < 25), color=CLR_GREEN, alpha=0.15)
-        ax.fill_between(x, rsi, 75, where=(rsi > 75), color=CLR_RED, alpha=0.15)
-        ax.set_ylim(0, 100)
-
-        if "score_RSI" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_RSI")
-
-        score = self._get_last_score(ts, "score_RSI")
-        self._set_title(ax, "RSI", f"skor: {score:+.1f} | RSI: {rsi[-1]:.1f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_stochrsi(self, ax, ts, x):
-        k = ts["StochRSI_K"].values
-        d = ts["StochRSI_D"].values
-        ax.plot(x, k, color=CLR_BLUE, linewidth=0.8, label="K")
-        ax.plot(x, d, color=CLR_ORANGE, linewidth=0.8, label="D")
-        ax.axhline(20, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.axhline(80, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.set_ylim(0, 100)
-
-        if "score_StochRSI" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_StochRSI")
-
-        score = self._get_last_score(ts, "score_StochRSI")
-        self._set_title(ax, "StochRSI", f"skor: {score:+.1f}")
-        ax.legend(loc="upper left", fontsize=6, facecolor=CLR_SUBPLOT,
-                  edgecolor=CLR_GRID, labelcolor=CLR_TEXT)
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_mfi(self, ax, ts, x):
-        mfi = ts["MFI"].values
-        ax.plot(x, mfi, color=CLR_PURPLE, linewidth=1.0)
-        ax.axhline(20, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.axhline(80, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.fill_between(x, mfi, 20, where=(mfi < 20), color=CLR_GREEN, alpha=0.15)
-        ax.fill_between(x, mfi, 80, where=(mfi > 80), color=CLR_RED, alpha=0.15)
-        ax.set_ylim(0, 100)
-
-        if "score_MFI" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_MFI")
-
-        score = self._get_last_score(ts, "score_MFI")
-        self._set_title(ax, "MFI", f"skor: {score:+.1f} | MFI: {mfi[-1]:.1f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_bb(self, ax, ts, x):
-        pctb = ts["BB_PercentB"].values
-        ax.plot(x, pctb, color=CLR_PURPLE, linewidth=1.0)
-        ax.axhline(0.0, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.axhline(0.2, color=CLR_LIGHT_GREEN, linewidth=0.5, linestyle=":", alpha=0.4)
-        ax.axhline(0.8, color=CLR_LIGHT_RED, linewidth=0.5, linestyle=":", alpha=0.4)
-        ax.axhline(1.0, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.fill_between(x, pctb, 0.0, where=(pctb < 0.0), color=CLR_GREEN, alpha=0.15)
-        ax.fill_between(x, pctb, 1.0, where=(pctb > 1.0), color=CLR_RED, alpha=0.15)
-
-        if "score_BB" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_BB")
-
-        score = self._get_last_score(ts, "score_BB")
-        self._set_title(ax, "Bollinger %B", f"skor: {score:+.1f} | %B: {pctb[-1]:.2f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_obv(self, ax, ts, x):
-        slope = ts["OBV_slope"].values
-        colors = [CLR_GREEN if s > 0 else (CLR_RED if s < 0 else CLR_GRAY) for s in slope]
-        ax.bar(x, slope, color=colors, alpha=0.6, width=0.7)
-        ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
-
-        if "score_OBV" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_OBV")
-
-        score = self._get_last_score(ts, "score_OBV")
-        self._set_title(ax, "OBV Slope", f"skor: {score:+.1f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_cmf(self, ax, ts, x):
-        cmf = ts["CMF"].values
-        ax.plot(x, cmf, color=CLR_BLUE, linewidth=1.0)
-        ax.axhline(0.1, color=CLR_GREEN, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.axhline(-0.1, color=CLR_RED, linewidth=0.5, linestyle="--", alpha=0.5)
-        ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
-        ax.fill_between(x, cmf, 0, where=(cmf >= 0), color=CLR_GREEN, alpha=0.15)
-        ax.fill_between(x, cmf, 0, where=(cmf < 0), color=CLR_RED, alpha=0.15)
-
-        if "score_CMF" in ts.columns:
-            self._draw_score_bg(ax, ts, x, "score_CMF")
-
-        score = self._get_last_score(ts, "score_CMF")
-        self._set_title(ax, "CMF", f"skor: {score:+.1f} | CMF: {cmf[-1]:.3f}")
-        self._draw_signal_markers(ax, ts, x)
-
-    def _draw_grand_total(self, ax, ts, x):
-        """Grand confluence score with active_group coloring and signal markers."""
-        scores = ts["confluence_score"].values
-        signals = ts["signal"].values
-        groups = ts["active_group"].values
-
-        # Active group background
-        group_colors = {
-            "BOTH": CLR_BLUE,
-            "TREND": CLR_ORANGE,
-            "REVERSION": CLR_PURPLE,
-            "CONFLICT": CLR_RED,
-            "NEUTRAL": CLR_GRAY,
-        }
-        for i in range(len(x)):
-            c = group_colors.get(groups[i], CLR_GRAY)
-            ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=c, alpha=0.08)
-
-        # Score line with fill
-        pos = np.where(scores >= 0, scores, 0)
-        neg = np.where(scores < 0, scores, 0)
-        ax.fill_between(x, 0, pos, color=CLR_GREEN, alpha=0.3, step="mid")
-        ax.fill_between(x, 0, neg, color=CLR_RED, alpha=0.3, step="mid")
-        ax.plot(x, scores, color=CLR_TEXT, linewidth=1.2)
-
-        # Threshold lines
-        ax.axhline(4.0, color=CLR_GREEN, linewidth=0.7, linestyle="--", alpha=0.6)
-        ax.axhline(-4.0, color=CLR_RED, linewidth=0.7, linestyle="--", alpha=0.6)
-        ax.axhline(5.0, color=CLR_GREEN, linewidth=0.5, linestyle=":", alpha=0.4)
-        ax.axhline(-5.0, color=CLR_RED, linewidth=0.5, linestyle=":", alpha=0.4)
-        ax.axhline(0, color=CLR_GRAY, linewidth=0.5)
-
-        # BUY/SELL markers
-        buy_x = [x[i] for i in range(len(x)) if signals[i] == "BUY"]
-        buy_y = [scores[i] for i in range(len(x)) if signals[i] == "BUY"]
-        sell_x = [x[i] for i in range(len(x)) if signals[i] == "SELL"]
-        sell_y = [scores[i] for i in range(len(x)) if signals[i] == "SELL"]
-
-        if buy_x:
-            ax.scatter(buy_x, buy_y, marker="^", color=CLR_GREEN, s=40,
-                       zorder=5, label="BUY")
-        if sell_x:
-            ax.scatter(sell_x, sell_y, marker="v", color=CLR_RED, s=40,
-                       zorder=5, label="SELL")
-
-        last_score = scores[-1]
-        last_group = groups[-1]
-        self._set_title(ax, "CONFLUENCE TOPLAM",
-                        f"skor: {last_score:+.2f} | grup: {last_group}")
-
-        # Legend with group colors
-        from matplotlib.patches import Patch
-        handles = [
-            Patch(facecolor=CLR_BLUE, alpha=0.3, label="BOTH"),
-            Patch(facecolor=CLR_ORANGE, alpha=0.3, label="TREND"),
-            Patch(facecolor=CLR_PURPLE, alpha=0.3, label="REVERSION"),
-            Patch(facecolor=CLR_RED, alpha=0.3, label="CONFLICT"),
-            Patch(facecolor=CLR_GRAY, alpha=0.3, label="NEUTRAL"),
-        ]
-        ax.legend(handles=handles, loc="upper right", fontsize=6,
-                  facecolor=CLR_SUBPLOT, edgecolor=CLR_GRID, labelcolor=CLR_TEXT,
-                  ncol=5)
-
-    def _draw_regime(self, ax, ts, x):
-        """Regime colored horizontal band."""
-        regimes = ts["regime"].values
-        confidences = ts["regime_confidence"].values
-
-        regime_colors = {
-            "TRENDING": CLR_BLUE,
-            "RANGING": CLR_ORANGE,
-            "VOLATILE": CLR_RED,
-            "BREAKOUT": CLR_GREEN,
-        }
-
-        for i in range(len(x)):
-            c = regime_colors.get(regimes[i], CLR_GRAY)
-            alpha = max(0.15, min(confidences[i] * 0.6, 0.6))
-            ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=c, alpha=alpha)
-
-        ax.set_ylim(0, 1)
-        ax.set_yticks([])
-
-        last_regime = regimes[-1]
-        last_conf = confidences[-1]
-        self._set_title(ax, "REJIM", f"{last_regime} (guven: {last_conf:.0%})")
-
-        # Legend
-        from matplotlib.patches import Patch
-        handles = [
-            Patch(facecolor=CLR_BLUE, alpha=0.4, label="TRENDING"),
-            Patch(facecolor=CLR_ORANGE, alpha=0.4, label="RANGING"),
-            Patch(facecolor=CLR_RED, alpha=0.4, label="VOLATILE"),
-            Patch(facecolor=CLR_GREEN, alpha=0.4, label="BREAKOUT"),
-        ]
-        ax.legend(handles=handles, loc="upper right", fontsize=6,
-                  facecolor=CLR_SUBPLOT, edgecolor=CLR_GRID, labelcolor=CLR_TEXT,
-                  ncol=4)
-
-    # ── Score background helper ──────────────────────────────────────────
-
-    def _draw_score_bg(self, ax, ts, x, score_col):
-        """Draw faint colored background based on per-indicator score values."""
-        if score_col not in ts.columns:
-            return
-        scores = ts[score_col].values
-        for i in range(len(x)):
-            s = scores[i]
-            if s > 0.5:
-                ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=CLR_GREEN, alpha=0.06)
-            elif s > 0:
-                ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=CLR_GREEN, alpha=0.03)
-            elif s < -0.5:
-                ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=CLR_RED, alpha=0.06)
-            elif s < 0:
-                ax.axvspan(x[i] - 0.5, x[i] + 0.5, color=CLR_RED, alpha=0.03)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # CLEANUP
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def destroy(self):
-        """Stop live mode and clean up matplotlib resources on panel destroy."""
-        self._live_running = False
-        if self._canvas:
-            self._canvas.get_tk_widget().destroy()
-            self._canvas = None
-        if self._fig:
-            import matplotlib.pyplot as plt
-            plt.close(self._fig)
-            self._fig = None
-        super().destroy()

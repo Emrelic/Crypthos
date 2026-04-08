@@ -282,10 +282,10 @@ TP icin: P(TP_hit) = count(forward >= TP%) / total_forwards
 
 ### 7.2 Hedef Oranlar
 ```
-Minimum P(win) = KALDIRILDI (config: min_p_win=0.0)
+Minimum P(win) = %35 (config: min_p_win=0.35)
+  → v1.0'da %40 idi, v1.1'de gevsetildi
   → EV > 0 ve R:R >= 2.0 zaten yeterli koruma saglar
-  → R:R=2.0'da breakeven P(win) = %33.3 — EV>0 bunu garanti eder
-  → Ayri min_p_win filtresi matematiksel redundancy idi
+  → Ek guvenlik agi olarak %35 esik korunuyor
 
 Minimum R:R = 1:2.0 (onceki: 1:2.5)
   → 2.5 fee yapisiyla yuksek kaldiraci imkansiz kiliyordu
@@ -318,8 +318,8 @@ Ek kisit: secilen SL, Tur 1/2'deki liq_dist / sl_divisor'u ASMAMALI
 ```json
 {
   "ev": {
-    "min_p_win": 0.40,       // %40 minimum (EV optimizasyonunda kontrol edilir)
-    "min_rr": 2.5,
+    "min_p_win": 0.35,       // %35 minimum (EV optimizasyonunda kontrol edilir)
+    "min_rr": 2.0,
     "ev_min_threshold": 0.0,
     "sl_candidates": [1.0, 1.25, 1.5, 1.75, 2.0],
     "tp_candidates": [2.0, 2.5, 3.0, 3.5, 4.0, 5.0]

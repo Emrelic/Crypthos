@@ -1,18 +1,13 @@
-"""System N Scanner — AlphaTrend PRO v2 + G-bazlı dinamik kaldıraç.
+"""System M Scanner — AlphaTrend PRO sinyal sistemi.
 
-System M'den evrilmiş akıllı sistem:
-  - Backtest optimize dosyasından coin başına coeff/period/TF okur
-  - G dalga analiziyle dinamik kaldıraç hesaplar
-  - Günde 1 kere re-optimize (cache: data/system_n_optimize.json)
+Arkadaşın TradingView indikatörünün Python implementasyonu.
+AlphaTrend çizgisi + 3 katmanlı anti-range filtre + state machine sinyaller.
 
 Modlar:
   - Spot (short_enabled=False): BUY→LONG aç, SELL→LONG kapat
   - Short (reverse=False): BUY→LONG, SELL→kapat, sonraki sinyal yeni pozisyon
   - Short+Reverse (reverse=True): BUY→LONG (short varsa çevir), SELL→SHORT (long varsa çevir)
 """
-import json
-import os
-import time as _time
 import threading
 from dataclasses import dataclass, field
 from loguru import logger
@@ -33,7 +28,7 @@ class AlphaTrendState:
 
 
 @dataclass
-class SystemNSignal:
+class SystemMSignal:
     """Tek bir coin için sinyal sonucu."""
     symbol: str
     signal: str             # "BUY", "SELL", "NONE"
@@ -58,7 +53,7 @@ class SystemNSignal:
 
 
 @dataclass
-class SystemNScanResult:
+class SystemMScanResult:
     """GUI ve buying kararı için kullanılan scan sonucu."""
     symbol: str
     signal: str             # "BUY", "SELL", "NONE"
@@ -180,8 +175,7 @@ def _compute_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray,
     mdi = np.where(smoothed_tr > 0, 100.0 * smoothed_minus / smoothed_tr, 0.0)
 
     dx_sum = pdi + mdi
-    with np.errstate(divide='ignore', invalid='ignore'):
-        dx = np.where(dx_sum > 0, 100.0 * np.abs(pdi - mdi) / dx_sum, 0.0)
+    dx = np.where(dx_sum > 0, 100.0 * np.abs(pdi - mdi) / dx_sum, 0.0)
 
     adx = _rma(dx, period)
     return adx, pdi, mdi
@@ -246,183 +240,30 @@ def compute_alpha_trend(high: np.ndarray, low: np.ndarray, close: np.ndarray,
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  System N Scanner
+#  System M Scanner
 # ═══════════════════════════════════════════════════════════════════
 
-class SystemNScanner:
-    """AlphaTrend PRO v2 + G-bazlı dinamik kaldıraç tarama sistemi.
+class SystemMScanner:
+    """AlphaTrend PRO bazlı tarama sistemi.
 
-    Her coin için backtest optimize dosyasından (data/system_n_optimize.json)
-    en iyi coeff/period/TF parametrelerini okur. G dalga analizinden
-    maksimum güvenli kaldıracı hesaplar.
+    Her coin için AlphaTrend hesaplar, anti-range filtreleri uygular,
+    state machine ile tekrarlanmayan BUY/SELL sinyalleri üretir.
     """
-
-    OPTIMIZE_FILE = "data/system_n_optimize.json"
-    # Kaldıraç formülü sabitleri
-    SL_G_MULT = 1.5
-    FEE_TOTAL = 0.12        # round-trip: 2×%0.04 taker + 2×%0.02 slippage
-    SL_DIVISOR = 2.0
-    DEFAULT_MAINT_RATE = 0.004  # %0.4
 
     def __init__(self, config: ConfigManager):
         self._config = config
         self._lock = threading.RLock()
         # Per-coin state: son trend yönü (sinyal tekrarını önlemek için)
         self._coin_trend_direction: dict[str, int] = {}
-        # Optimize cache: {symbol: {coeff, period, tf, G, max_leverage, ...}}
-        self._optimize_cache: dict[str, dict] = {}
-        self._optimize_loaded_at: float = 0.0
-        # İlk yükleme
-        self._load_optimize_cache()
+        # Per-coin AlphaTrend history (son 4 değer yeterli)
+        self._coin_at_history: dict[str, list[float]] = {}
 
     def _cfg(self, key: str, default=None):
-        """Config erişimi: system_n.key"""
-        return self._config.get(f"system_n.{key}", default)
-
-    # ═══ Optimize Cache ═══
-
-    def _load_optimize_cache(self) -> int:
-        """data/system_n_optimize.json dosyasını oku ve cache'e yükle.
-        Returns: yüklenen coin sayısı.
-        """
-        path = self.OPTIMIZE_FILE
-        if not os.path.exists(path):
-            logger.warning(f"[SysN] Optimize dosyası bulunamadı: {path}")
-            return 0
-
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            logger.error(f"[SysN] Optimize dosyası okunamadı: {e}")
-            return 0
-
-        results = data.get("results", {})
-        loaded = 0
-
-        for symbol, info in results.items():
-            optimal_tf = info.get("optimal_tf", "5m")
-            G = info.get("G", 0)
-            max_lev = info.get("max_leverage", 1)
-            regime = info.get("regime", "")
-
-            # Bu coin + optimal TF için parametreler
-            params = info.get("params", {}).get(optimal_tf, {})
-            coeff = params.get("coeff", 0)
-            period = params.get("period", 0)
-            pnl = params.get("total_pnl_pct", 0)
-            pf = params.get("profit_factor", 0)
-            wr = params.get("win_rate", 0)
-
-            # G analiz verisi
-            g_data = info.get("g_analysis", {}).get(optimal_tf, {})
-
-            if coeff > 0 and period > 0:
-                if pnl <= 0:
-                    logger.info(f"[SysN] {symbol}: backtest kârsız (PnL={pnl:.2f}%), "
-                                f"cache'e ALINMIyor — canlıda kullanılmayacak")
-                    continue
-                self._optimize_cache[symbol] = {
-                    "coeff": coeff,
-                    "period": period,
-                    "tf": optimal_tf,
-                    "G": G,
-                    "max_leverage": max_lev,
-                    "regime": regime,
-                    "pnl": pnl,
-                    "pf": pf,
-                    "wr": wr,
-                    "sl_pct": g_data.get("sl_pct", 0),
-                }
-                loaded += 1
-
-        self._optimize_loaded_at = _time.time()
-        ts = data.get("timestamp", "?")
-        logger.info(f"[SysN] Optimize cache yüklendi: {loaded}/{len(results)} coin "
-                    f"(kaynak: {ts})")
-        return loaded
-
-    def reload_if_stale(self, max_age_hours: float = 24.0) -> None:
-        """Cache eski ise yeniden yükle + artık olmayan coinlerin state'ini temizle."""
-        age = _time.time() - self._optimize_loaded_at
-        if age > max_age_hours * 3600:
-            logger.info(f"[SysN] Optimize cache {age/3600:.1f}h eski — yeniden yükleniyor")
-            old_symbols = set(self._optimize_cache.keys())
-            self._load_optimize_cache()
-            new_symbols = set(self._optimize_cache.keys())
-            # Artık cache'de olmayan coinlerin trend state'ini temizle
-            removed = old_symbols - new_symbols
-            if removed:
-                with self._lock:
-                    for sym in removed:
-                        self._coin_trend_direction.pop(sym, None)
-                logger.info(f"[SysN] {len(removed)} eski coin state temizlendi")
-
-    def get_coin_params(self, symbol: str) -> dict:
-        """Coin için optimize parametreleri döndür.
-        Cache'de yoksa config varsayılanlarını kullanır.
-        """
-        cached = self._optimize_cache.get(symbol)
-        if cached:
-            return cached
-
-        # Fallback: config'den varsayılan
-        cfg = self._config.get("system_n", {})
-        ind = cfg.get("indicators", {})
-        return {
-            "coeff": ind.get("coeff", 3.6),
-            "period": ind.get("period", 27),
-            "tf": cfg.get("timeframe", "5m"),
-            "G": 0,
-            "max_leverage": cfg.get("leverage", 1),
-            "regime": "",
-            "pnl": 0,
-            "pf": 0,
-            "wr": 0,
-            "sl_pct": 0,
-        }
-
-    def get_optimized_symbols(self) -> list[str]:
-        """Optimize cache'deki tüm coinleri döndür (kârlı olanlar)."""
-        return list(self._optimize_cache.keys())
-
-    def calc_leverage_from_g(self, G: float, maint_rate: float = 0.0) -> int:
-        """G dalga boyundan maksimum güvenli kaldıraç hesapla.
-
-        Formül: SL% = G × 1.5 + 0.12%
-                Liq_dist = SL% × 2.0
-                Teorik_liq = Liq_dist + maint_margin%
-                Leverage = floor(100 / Teorik_liq)
-
-        G birimi: yüzde (ör: 1.5 = %1.5). Oran olarak gelirse (< 0.1) otomatik düzeltilir.
-        """
-        if G <= 0:
-            return 1
-        # Absürt büyük G değerlerini reddet (>%50 dalga anlamsız)
-        if G > 50.0:
-            logger.warning(f"[SysN] G={G:.2f}% absürt büyük — kaldıraç 1x")
-            return 1
-        # Çok küçük G muhtemelen birim hatası değil, düşük volatilite coini.
-        # Otomatik ×100 dönüşümü yapmıyoruz — yanlış pozitif riski yüksek.
-        # G < 0.1% → SL < 0.27% → çok sıkı, kaldıraç çok yüksek çıkar → güvenlik sınırı
-        if G < 0.15:
-            logger.warning(f"[SysN] G={G:.4f}% çok küçük (düşük volatilite?) — kaldıraç 1x")
-            return 1
-        if maint_rate <= 0:
-            maint_rate = self.DEFAULT_MAINT_RATE
-
-        sl_pct = G * self.SL_G_MULT + self.FEE_TOTAL
-        liq_dist = sl_pct * self.SL_DIVISOR
-        teorik_liq = liq_dist + maint_rate * 100.0
-        if teorik_liq <= 0:
-            return 1
-
-        max_lev = int(100.0 / teorik_liq)
-        max_cfg = self._cfg("max_leverage", 125)
-        return max(1, min(max_lev, max_cfg))
+        """Config erişimi: system_m.key"""
+        return self._config.get(f"system_m.{key}", default)
 
     def analyze_symbol(self, symbol: str, klines: list,
-                       volume_data: bool = True) -> SystemNScanResult:
+                       volume_data: bool = True) -> SystemMScanResult:
         """Tek bir coin için AlphaTrend analizi yap ve sinyal üret.
 
         Args:
@@ -431,15 +272,14 @@ class SystemNScanner:
             volume_data: True ise MFI kullan, False ise RSI kullan
 
         Returns:
-            SystemNScanResult
+            SystemMScanResult
         """
-        cfg = self._config.get("system_n", {})
+        cfg = self._config.get("system_m", {})
         indicator_cfg = cfg.get("indicators", {})
 
-        # Coin başına optimize parametreleri (cache'den)
-        coin_params = self.get_coin_params(symbol)
-        coeff = coin_params["coeff"]
-        period = coin_params["period"]
+        # Parametreler
+        coeff = indicator_cfg.get("coeff", 3.6)
+        period = indicator_cfg.get("period", 27)
         adx_length = indicator_cfg.get("adx_length", 14)
         adx_threshold = indicator_cfg.get("adx_threshold", 18.0)
         use_adx_static = indicator_cfg.get("use_adx_static", True)
@@ -487,8 +327,7 @@ class SystemNScanner:
         adx_val = adx_arr[-1] if not np.isnan(adx_arr[-1]) else 0.0
 
         # ── RSI hesapla ──
-        rsi_length = indicator_cfg.get("rsi_length", 14)
-        rsi_arr = _compute_rsi(closes, rsi_length)
+        rsi_arr = _compute_rsi(closes, period)
         rsi_val = rsi_arr[-1] if not np.isnan(rsi_arr[-1]) else 50.0
 
         # ── MFI hesapla ──
@@ -529,18 +368,6 @@ class SystemNScanner:
         sell_filtered = sell_cross and final_filter
 
         # ═══ STATE MACHINE (tekrar önleme) ═══
-
-        # Crossover yaşı kontrolü: momentum hâlâ taze mi?
-        # AT ile AT[2] arasındaki fark büyüyorsa momentum devam ediyor.
-        # Fark kapanıyorsa crossover eski — sinyal üretme.
-        cross_momentum_alive = True
-        if buy_cross or sell_cross:
-            delta_now = abs(at_now - at_2)
-            delta_prev = abs(at_1 - at_3)
-            # Momentum zayıflıyorsa (fark %30+ daraldıysa) → eski crossover
-            if delta_prev > 0 and delta_now < delta_prev * 0.7:
-                cross_momentum_alive = False
-
         with self._lock:
             prev_direction = self._coin_trend_direction.get(symbol, 0)
 
@@ -551,11 +378,12 @@ class SystemNScanner:
                 new_direction = -1
 
             # Sinyal sadece yön DEĞİŞİNCE üretilir
+            # prev_direction==0: ilk tarama — crossover varsa sinyal üret
+            # (restart sonrası mevcut firsatlar kaçırılmasın)
             if prev_direction == 0:
-                # İlk kez görülen coin: crossover taze ise sinyal ver
-                # (eski/zayıflayan crossover'da sinyal üretme — geç giriş riski)
-                plot_buy = buy_filtered and cross_momentum_alive
-                plot_sell = sell_filtered and not buy_filtered and cross_momentum_alive
+                # İlk kez görülen coin: aktif crossover varsa sinyal ver
+                plot_buy = buy_filtered
+                plot_sell = sell_filtered and not buy_filtered
             else:
                 plot_buy = buy_filtered and prev_direction != 1
                 plot_sell = sell_filtered and prev_direction != -1
@@ -585,7 +413,7 @@ class SystemNScanner:
         eligible = signal != "NONE"
         reject_reason = "" if eligible else "no_signal"
 
-        return SystemNScanResult(
+        return SystemMScanResult(
             symbol=symbol,
             signal=signal,
             direction=direction,
@@ -607,7 +435,7 @@ class SystemNScanner:
         )
 
     def reconstruct_state_from_positions(self, positions: dict) -> int:
-        """Açık SYSTEM_N pozisyonlarından trend yönü state'ini reconstruct et.
+        """Açık SYSTEM_M pozisyonlarından trend yönü state'ini reconstruct et.
 
         Startup'ta çağrılır — restart sonrası duplicate trade'i önler.
         Args:
@@ -618,7 +446,7 @@ class SystemNScanner:
         count = 0
         with self._lock:
             for symbol, pos in positions.items():
-                if getattr(pos, "entry_mode", "") != "SYSTEM_N":
+                if getattr(pos, "entry_mode", "") != "SYSTEM_M":
                     continue
                 from core.constants import OrderSide
                 if pos.side == OrderSide.BUY_LONG:
@@ -627,7 +455,7 @@ class SystemNScanner:
                     self._coin_trend_direction[symbol] = -1
                 count += 1
         if count > 0:
-            logger.info(f"[SysN] Reconstructed state for {count} coins from open positions")
+            logger.info(f"[SysM] Reconstructed state for {count} coins from open positions")
         return count
 
     def reset_state(self, symbol: str = None) -> None:
@@ -635,79 +463,21 @@ class SystemNScanner:
         with self._lock:
             if symbol:
                 self._coin_trend_direction.pop(symbol, None)
+                self._coin_at_history.pop(symbol, None)
             else:
                 self._coin_trend_direction.clear()
+                self._coin_at_history.clear()
 
-    def _calc_min_notional_margin(self, leverage: int,
-                                   coin_min_notional: float) -> float:
-        """Min notional bazlı margin hesapla."""
-        base_notional = self._cfg("position.min_notional_usd", 5.0)
-        if coin_min_notional > base_notional:
-            base_notional = coin_min_notional
-        buffer_pct = self._cfg("position.min_notional_buffer_pct", 20)
-        target_notional = base_notional * (1 + buffer_pct / 100.0)
-        return target_notional / max(leverage, 1)
-
-    def _calc_divider_margin(self, wallet: float) -> float:
-        """1/N portföy bölme bazlı margin hesapla."""
+    def calculate_position_size(self, wallet: float) -> float:
+        """Portfolio divider'a göre pozisyon büyüklüğü hesapla."""
         divider = self._cfg("position.portfolio_divider", 12)
-        size = wallet / max(divider, 1)
+        size = wallet / divider
         min_pos = self._cfg("position.min_position_usd", 1.0)
         return max(size, min_pos)
 
-    def calculate_position_size(self, wallet: float, leverage: int = 1,
-                               coin_min_notional: float = 0,
-                               available_balance: float = 0) -> float:
-        """Pozisyon büyüklüğü (margin) hesapla.
-
-        Üç mod:
-          min_notional: max(config, coin_bazlı) × (1 + buffer%) / leverage
-          divider:      wallet / portfolio_divider (klasik 1/12)
-          hybrid:       wallet < threshold → min_notional
-                        wallet >= threshold → divider (yetmezse kademeli düşüş)
-
-        Kademeli düşüş (divider ve hybrid modda):
-          1) 1/N hesapla → serbest bakiye yetiyorsa kullan
-          2) yetmiyorsa → serbest bakiyenin %90'ı (min notional karşılıyorsa)
-          3) yetmiyorsa → min_notional × (1+buffer%) / leverage
-
-        Args:
-            wallet: toplam bakiye (available + locked)
-            leverage: kaldıraç çarpanı
-            coin_min_notional: Binance min notional (0=config kullan)
-            available_balance: serbest bakiye (kademeli düşüş için)
-
-        Returns: margin_usdt (kaldıraç ÖNCESİ)
-        """
-        mode = self._cfg("position.sizing_mode", "divider")
-
-        if mode == "min_notional":
-            return self._calc_min_notional_margin(leverage, coin_min_notional)
-
-        if mode == "hybrid":
-            threshold = self._cfg("position.hybrid_threshold_usd", 12.0)
-            if wallet < threshold:
-                return self._calc_min_notional_margin(leverage, coin_min_notional)
-
-        # divider veya hybrid (wallet >= threshold): kademeli hesap
-        ideal = self._calc_divider_margin(wallet)
-        min_margin = self._calc_min_notional_margin(leverage, coin_min_notional)
-        avail = available_balance if available_balance > 0 else ideal
-
-        # 1) 1/N yetiyorsa → ideal
-        if ideal <= avail:
-            return ideal
-
-        # 2) Serbest bakiye min notional'ı karşılıyorsa → serbest bakiyeyi kullan
-        if avail >= min_margin:
-            return avail
-
-        # 3) Son çare: minimum notional
-        return min_margin
-
-    def _empty_result(self, symbol: str, reason: str) -> SystemNScanResult:
+    def _empty_result(self, symbol: str, reason: str) -> SystemMScanResult:
         """Boş/geçersiz sonuç üret."""
-        return SystemNScanResult(
+        return SystemMScanResult(
             symbol=symbol, signal="NONE", direction="",
             price=0.0, alpha_trend=0.0, alpha_trend_2=0.0,
             adx=0.0, rsi=50.0, mfi=50.0, atr=0.0,

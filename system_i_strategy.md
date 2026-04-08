@@ -20,20 +20,44 @@ Onceki 8 sistemin (A-H) deneyimlerinden cikan en iyi yapilar tek bir tutarli sis
 ## 1. Aday Secimi
 
 ### 1.1 Evren
-- Binance Futures USDT-M, top 50 coin (24h islem hacmine gore)
+- Binance Futures USDT-M, top X coin (24h islem hacmine gore)
+- Y adet spike coin eklenir (son 5dk'da hacim patlamasi yasayan coinler)
+- Toplam aday havuzu: X + Y coin
 - Guncelleme: Her scan dongusunde (varsayilan 60s)
 
-### 1.2 Hard Filtreler (aday eleme)
+### 1.1.1 Spike Coin Tespiti
+```
+Spike kosulu (her ikisi birden saglanmali):
+  1. |fiyat degisimi| >= spike_min_price_change (varsayilan: 1.5%)
+  2. 24h hacim >= tum adaylarin median hacmi (thin-book sahte spike'lari elenir)
+Spike havuzundan en yuksek |fiyat degisimi|'ne sahip Y coin secilir.
+Spike coinler normal havuzla birlestirilir (tekrar eden coinler elenir).
+```
+
+### 1.2 Config
+```json
+{
+  "universe": {
+    "top_coin_count": 50,
+    "spike_coin_count": 20,
+    "spike_volume_ratio": 3.0,
+    "spike_min_price_change": 1.5,
+    "spike_lookback_minutes": 5
+  }
+}
+```
+
+### 1.3 Hard Filtreler (aday eleme)
 | Filtre | Kosul | Ayarlanabilir | Varsayilan |
 |--------|-------|---------------|------------|
-| Funding Rate | abs(FR) < esik | funding_rate_max | 0.1% |
+| Funding Rate | abs(FR) < esik | funding_rate_max | 0.03% |
 | Orderbook | spread < esik | max_spread_pct | 0.05% |
-| Thin Book | depth > min | min_depth_usd | 50000 |
-| Volume | vol_ratio >= esik | min_volume_ratio | 1.5 |
+| Thin Book | depth > min | min_depth_usd | 100000 |
+| Volume | vol_ratio >= esik | min_volume_ratio | 1.2 |
 | Min Dalga | wave_count >= n | min_wave_count | 3 |
-| Wall Blocking | imbalance < esik | max_wall_imbalance | 0.3 |
+| Wall Blocking | imbalance < esik | max_wall_imbalance | 0.4 |
 
-### 1.3 BTC Korelasyonu (opsiyonel)
+### 1.4 BTC Korelasyonu (opsiyonel)
 ```json
 {
   "btc_correlation": {
@@ -55,16 +79,25 @@ Her aday coin icin Binance'in destekledigi TUM 14 TF'de zigzag analizi:
 ```
 TF listesi: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w
 
-Her TF icin (TF'ye gore dinamik mum sayisi):
+Her TF icin N adet mum cekilir (G hesaplama mum sayisi):
   Kisa TF (1m-5m):   1000-1500 mum (1-5 gun veri)
   Orta TF (15m-2h):  300-500 mum   (5-25 gun veri)
   Uzun TF (4h+):     200 mum       (33+ gun veri)
 
-  1. Zigzag swing tespiti (N=10)
-  2. G = ortalama geri dalga boyu (%)
-  3. I = ortalama ileri dalga boyu (%)
-  4. BW = geri dalga sayisi (guvenilirlik olcusu)
-  5. G/TF orani = (G artis%) / (TF artis%) — verimlilik olcusu
+NOT: Mum sayisi (N) config'den ayarlanabilir. Daha fazla mum = daha guvenilir
+G ortalamasi, ama daha fazla API yuklenmesi. M parametresi ile geriye donuk
+cekilecek ham mum sayisi belirlenir (ornegin M=1500 mum cekilir, N=1000'i
+hesaplamada kullanilir, fark baslangic zigzag tespiti icin gereklidir).
+
+Her TF icin hesaplama:
+  1. M adet mum cek (ham veri)
+  2. Zigzag swing tespiti (N=10 periyot)
+  3. Ileri dalga boylari (I_pcts) ve geri dalga boylari (G_pcts) ayri hesapla
+  4. G = ortalama geri dalga boyu (%)
+  5. I = ortalama ileri dalga boyu (%)
+  6. BW = geri dalga sayisi (guvenilirlik olcusu)
+  7. FW = ileri dalga sayisi
+  8. G/TF orani = (G artis%) / (TF artis%) — verimlilik olcusu
 ```
 
 ### 2.2 Minimum Dalga Filtresi
@@ -123,10 +156,16 @@ Binance TF mapping: en yakin gecerli TF'ye yuvarla (tf_rounding ayari)
     "zoom_max_tf": "1w",
     "zoom_min_backward_waves": 10,
     "zoom_g_tf_efficient": 0.60,
-    "zoom_g_tf_inefficient": 0.80
+    "zoom_g_tf_inefficient": 0.80,
+    "candle_count_short_tf": 1500,
+    "candle_count_mid_tf": 500,
+    "candle_count_long_tf": 200,
+    "raw_candle_extra": 500
   }
 }
 ```
+- `candle_count_*`: G hesaplamasi icin kullanilan mum sayisi (N)
+- `raw_candle_extra`: Ham cekim M = N + extra (zigzag baslangic payı)
 
 ### 2.7 Gercek Veri Ornekleri (2026-03-28)
 ```
@@ -144,17 +183,86 @@ ADAUSDT:  yon_tf=3m   G=1.18%  Lev=19x  BW=13  (1m->3m verimli, 5m'de patladi)
 
 ---
 
-## 3. Yon Belirleme - 3 Indikator x N Timeframe
+## 3. Rejim Tespiti - Trend vs Ranging (ZOOM'DAN SONRA ILK ADIM)
 
-### 3.1 Indikatorler (her TF icin)
+> **ONEMLI:** Rejim, yondan ONCE belirlenir. Cunku rejim, yonun nasil
+> hesaplanacagini dogrudan etkiler:
+> - TREND rejiminde yon = momentum yonu (EMA, MACD)
+> - RANGING rejiminde yon = TERS yon (RSI asiri bolge → ortalamaya donus)
+> Eger yon rejimden once hesaplanirsa, ranging coinlerde yanlis yone girilir.
+
+### 3.1 Birincil: Rolling Efficiency Ratio (ER)
+```
+ER = |net_fiyat_degisimi| / toplam_|bar_degisimleri|
+
+ONEMLI: ER tum seri uzerinden degil, KISA PENCERE ile hesaplanir.
+Kripto piyasasinda uzun pencere (200-500 mum) ER'yi daima ~0'a ceker
+cunku her mum geri-ileri saliniyor. Kisa pencere gercek rejimi yakalar.
+
+Yontem: Rolling ER
+  1. Son W mum'luk pencerelerle ER hesapla (W = er_window, varsayilan: 20)
+  2. Son N rolling ER'nin medyanini al (N = er_median_count, varsayilan: 10)
+  3. Bu medyan = o anki rejim sinyali
+
+Esikler (50 coin x 4 TF gercek piyasa verisinden kalibre):
+  ER > 0.25 -> TRENDING   (yaklasik P75 — coinlerin ust %25'i)
+  ER < 0.08 -> RANGING    (yaklasik P25 — coinlerin alt %25'i)
+  ER 0.08-0.25 -> GRAY ZONE
+
+NOT: Eski esikler (0.35/0.20) tum coinleri %100 RANGING siniflandiriyordu.
+500 mum uzerinden hesaplanan ER'nin P90'i bile 0.14'tu.
+```
+
+### 3.2 Hurst Exponent (teyit) — Gelistirilmis
+```
+Hesaplama: Yon TF verisi uzerinde, R/S analizi
+Eski: 4 chunk size [16,32,64,128], non-overlapping, gürültülü
+Yeni: 11 chunk size [8,12,16,24,32,48,64,96,128,192,256], overlapping (%50)
+Avantaj: daha stabil (düsük std, dar range), regresyon güvenilir
+
+Esikler (kripto Hurst dagilimi genelde 0.55-0.65 arasinda yogunlasir):
+  H > 0.60 -> TRENDING (persistent)
+  H < 0.50 -> RANGING (mean-reverting)
+  H 0.50-0.60 -> BELIRSIZ
+
+NOT: Eski esikler (0.55/0.45) ile neredeyse her coin TRENDING cikiyordu
+cunku kripto Hurst medyani ~0.59. Yeni esikler bunu duzeltiyor.
+```
+
+### 3.3 Gray Zone Karari: ER + Hurst
+```
+Gray zone (ER 0.08-0.25):
+
+Hurst > 0.60 -> TREND gibi davran (kaldirac x0.7)
+Hurst < 0.50 -> RANGING gibi davran (kaldirac x0.7)
+Hurst 0.50-0.60 -> COK BELIRSIZ
+  3/3 TF hizalama varsa -> dusuk kaldiracla TREND (x0.5)
+  2/3 TF hizalama varsa -> dusuk kaldiracla RANGING (x0.5)
+  1/3 veya 0/3 -> ISLEM YAPMA
+```
+
+### 3.4 Rejim Hysteresis
+- Rejim degisimi icin 2 ardisik ayni okuma gerekli (varsayilan)
+- Bootstrap: ilk okuma hemen kabul edilir
+- Config: `regime_hysteresis_count: 2`
+
+---
+
+## 4. Yon Belirleme - Rejime Bagli Yon Tespiti
+
+> Yon tespiti rejimden SONRA yapilir. Rejim, yon hesaplama mantigi belirler.
+
+### 4.1 Indikatorler (her TF icin)
 | Indikator | Parametreler | LONG | SHORT | Notr |
 |-----------|-------------|------|-------|------|
 | EMA 9/21 | gap >= 0.05% | EMA9 > EMA21 | EMA9 < EMA21 | gap < 0.05% |
 | MACD 8/17/9 | histogram + momentum | hist > 0 AND artan | hist < 0 AND azalan | duz |
 | RSI 14 | 55/45 esik | RSI > 55 | RSI < 45 | 45-55 arasi |
 
-### 3.2 TF Oylama
+### 4.2 TREND Rejiminde Yon Tespiti
 ```
+Momentum tabanli: fiyat nereye gidiyorsa oraya girilir.
+
 Her TF: 3 indikator -> +1 (LONG), -1 (SHORT), 0 (notr)
 TF yonu = toplam / 3
   >= +0.33 -> LONG
@@ -162,7 +270,19 @@ TF yonu = toplam / 3
   diger -> FLAT
 ```
 
-### 3.3 Coklu TF Hizalama
+### 4.3 RANGING Rejiminde Yon Tespiti
+```
+Ters mantik: fiyat neredeyse TERS yone girilir (ortalamaya donus).
+
+RSI > 70 -> SHORT (asiri alim, dusus beklenir)
+RSI < 30 -> LONG (asiri satim, yukselis beklenir)
+RSI 30-70 -> BB bant yakınligi kontrol et:
+  Fiyat > BB Upper x 0.95 -> SHORT
+  Fiyat < BB Lower x 1.05 -> LONG
+  Ortada -> SINYAL YOK (bekleme)
+```
+
+### 4.4 Coklu TF Hizalama
 ```
 tf_count=2:
   Yon TF + Teyit TF ayni yon -> sinyal VAR
@@ -174,57 +294,18 @@ tf_count=3:
   1/3 veya 0/3 -> sinyal YOK
 ```
 
-### 3.4 Giris TF Kullanimi
-Giris TF yonu ana yonle uyumlu oldugunda giris yapilir.
-Giris TF'de EMA cross veya RSI donusu beklenir (hassas giris noktasi).
-
----
-
-## 4. Rejim Tespiti - Trend vs Ranging
-
-### 4.1 Birincil: Efficiency Ratio (ER)
-```
-ER = |net_fiyat_degisimi| / toplam_|bar_degisimleri|
-Hesaplama TF: Yon TF (en dogal veri)
-
-ER > 0.35 -> TRENDING
-ER < 0.20 -> RANGING
-ER 0.20-0.35 -> GRAY ZONE
-```
-
-### 4.2 Gray Zone Karari: ER + Hurst + TF Hizalama
-```
-Gray zone (ER 0.20-0.35):
-
-Hurst > 0.55 AND 3/3 TF hizalama -> TREND gibi davran (kaldirac x0.7)
-Hurst < 0.45 AND 2/3 TF hizalama -> RANGING gibi davran (kaldirac x0.7)
-Hurst 0.45-0.55:
-  3/3 TF hizalama -> dusuk kaldiracla TREND (x0.5)
-  2/3 TF hizalama -> dusuk kaldiracla RANGING (x0.5)
-  1/3 veya 0/3 -> ISLEM YAPMA
-```
-
-### 4.3 Hurst Exponent (teyit)
-```
-Hesaplama: Yon TF verisi uzerinde
-H > 0.55 -> TRENDING (persistent)
-H < 0.45 -> RANGING (mean-reverting)
-H 0.45-0.55 -> BELIRSIZ
-```
-
-### 4.4 Rejim Hysteresis
-- Rejim degisimi icin 2 ardisik ayni okuma gerekli (varsayilan)
-- Bootstrap: ilk okuma hemen kabul edilir
-- Config: `regime_hysteresis_count: 2`
-
-### 4.5 3/3 TF Hizalama + Rejim Iliskisi
+### 4.5 Rejim + TF Hizalama Iliskisi
 ```
 TRENDING + 3/3 hizalama = KESIN TREND (tam giris)
 TRENDING + 2/3 hizalama = TREND PULLBACK (bekle veya dusuk kaldirac)
-RANGING + 2/3 hizalama = MR FIRSATI (cogunluk yonune gir)
-RANGING + 3/3 hizalama = DIKKAT: momentum var, breakout riski
-GRAY ZONE = Hurst'e bak (Section 4.2)
+RANGING + 2/3 hizalama = MR FIRSATI (cogunluk yonune ters gir)
+RANGING + 3/3 hizalama = DIKKAT: momentum var, breakout riski → GIRME
+GRAY ZONE = Hurst'e bak (Section 3.3)
 ```
+
+### 4.6 Giris TF Kullanimi
+Giris TF yonu ana yonle uyumlu oldugunda giris yapilir.
+Giris TF'de EMA cross veya RSI donusu beklenir (hassas giris noktasi).
 
 ---
 
@@ -416,27 +497,101 @@ A sisteminden miras, G bazli uyarlama:
 
 ---
 
-## 10. P(win) / EV Istatistiksel Dogrulama
+## 10. P(win) / EV Istatistiksel Dogrulama ve SL/TP Optimizasyonu
 
-### 10.1 Hesaplama (F sisteminden)
+### 10.1 Temel Mantik
 ```
-Yon TF'deki swing verilerinden:
-  forward_pcts = yon ile ayni yondeki dalgalar
-  retrace_pcts = yon tersindeki dalgalar
+Piyasa "iki ileri bir geri" (veya "uc ileri bir geri") hareket eder.
+Bu demektir ki:
+  - SL noktasina ulasmak: 1 geri dalga yeterli (1-1.5G)
+  - TP noktasina ulasmak: birden fazla ileri dalga gerekli (3-4G)
 
-P(win_cycle) = count(forward >= TP%) / total_forward
-P(loss_cycle) = count(retrace >= SL%) / total_retrace
-P(win) = P(win_cycle) / (P(win_cycle) + P(loss_cycle))
-P(loss) = 1 - P(win)
+Dolayisiyla P(win) her zaman %50'nin ALTINDA olacaktir.
+Ama kazanc/kayip orani (R:R) bunu telafi etmelidir.
 
-EV% = P(win) x TP x kaldirac - P(loss) x SL x kaldirac - fee_ROI
+Hedef: %40-%50 arasi kazanc orani ile R:R >= 1:2 saglayarak
+       uzun vadede pozitif EV elde etmek.
 ```
 
-### 10.2 Kullanim
-- Hard gate degil, soft multiplier (varsayilan)
-- EV > 0: Skor x (1 + EV/100), max 1.3x bonus
-- EV < -10: Skor x (1 + EV/100), min 0.7x ceza
-- Opsiyonel hard gate: `ev_hard_gate_enabled: true, ev_min: 0`
+### 10.2 Ileri ve Geri Dalga Analizi
+```
+Yon TF'deki zigzag swing verilerinden (yön belirlendikten sonra):
+
+  forward_pcts = yon ile ayni yondeki dalga boylari (%)
+  retrace_pcts = yon tersindeki dalga boylari (%)
+
+Her SL ve TP adayi icin:
+  P(SL_hit) = count(retrace >= SL%) / total_retrace
+    → geri dalgalarin kaci SL noktasina ulasir?
+  P(TP_hit) = count(forward >= TP%) / total_forward
+    → ileri dalgalarin kaci TP noktasina ulasir?
+
+KRITIK: TP'ye ulasmak icin birden fazla ileri dalga gerekebilir.
+  P(TP_cumulative) = 1 - (1 - P(TP_single))^expected_waves
+  expected_waves = ortalama ileri dalga sayisi (SL'ye yakalanmadan once)
+```
+
+### 10.3 SL/TP Optimizasyonu (ev_optimized modu)
+```
+tp_mode = "ev_optimized" ise:
+
+1. SL aday seti olustur: [1.0G, 1.25G, 1.5G, 1.75G, 2.0G]
+2. TP aday seti olustur: [1.5G, 2.0G, 2.5G, 3.0G, 3.5G, 4.0G, 4.5G, 5.0G]
+3. Her SL x TP kombinasyonu icin:
+   a. P(win) hesapla: ileri dalgalarin TP'ye ulasma olasiligi
+   b. P(loss) hesapla: geri dalgalarin SL'ye ulasma olasiligi
+   c. P(win_adj) = P(win) / (P(win) + P(loss))
+   d. EV = P(win_adj) x TP x kaldirac - (1-P(win_adj)) x SL x kaldirac - fee
+   e. R:R = TP / SL
+4. En yuksek EV'yi veren SL/TP secilir
+5. Esitlik varsa: daha yuksek R:R tercih edilir
+6. EV < 0 olan tum kombinasyonlar → islem YAPMA
+
+Ornek (gercek veriden):
+  SL=1.5G, TP=3.0G: P(win)=42%, R:R=1:2.0, EV=+0.36G ✓
+  SL=1.5G, TP=4.0G: P(win)=33%, R:R=1:2.7, EV=+0.32G ✓
+  SL=1.0G, TP=2.5G: P(win)=48%, R:R=1:2.5, EV=+0.40G ✓✓ (en iyi)
+  SL=2.0G, TP=2.0G: P(win)=55%, R:R=1:1.0, EV=+0.10G (zayif)
+```
+
+### 10.4 Minimum R:R Filtresi
+```
+ev_min_rr = 1.5 (varsayilan)
+R:R < ev_min_rr olan kombinasyonlar elenir (EV pozitif olsa bile).
+Cunku dusuk R:R, komisyon ve slippage'dan dolayi pratikte negatife donebilir.
+```
+
+### 10.5 Kullanim Modlari
+```
+ev_mode = "soft":     (varsayilan)
+  EV > 0: Skor x (1 + EV/100), max 1.3x bonus
+  EV < -10: Skor x (1 + EV/100), min 0.7x ceza
+  SL/TP degismez (Section 7/8'deki sabit degerler kullanilir)
+
+ev_mode = "optimizer":
+  SL ve TP noktalarini EV'den hesapla (Section 10.3)
+  Section 7/8'deki sabit degerler yerine optimize edilmis degerler kullanilir
+
+ev_mode = "gate":
+  Hard gate: EV < ev_min_threshold → islem engelle
+  SL/TP degismez
+```
+
+### 10.6 Config
+```json
+{
+  "ev": {
+    "ev_mode": "optimizer",
+    "ev_min_threshold": 0.0,
+    "ev_min_rr": 1.5,
+    "ev_sl_candidates": [1.0, 1.25, 1.5, 1.75, 2.0],
+    "ev_tp_candidates": [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
+    "ev_max_bonus": 1.3,
+    "ev_min_penalty": 0.7,
+    "ev_cumulative_waves": true
+  }
+}
+```
 
 ---
 
@@ -543,7 +698,7 @@ loss_cooldown_seconds: 600  (10 dakika)
 ```
 ER > 0.35 -> TREND havuzu (max 10 slot)
 ER < 0.20 -> RANGING (MR) havuzu (max 2 slot)
-ER 0.20-0.35 -> Gray zone kararina gore (Section 4.2)
+ER 0.20-0.35 -> Gray zone kararina gore (Section 3.3)
 ```
 
 ### 13.2 Farkli Stratejiler
@@ -581,20 +736,44 @@ Pozisyon acikken rejim degisirse:
 
 ## 15. Scanner Loop Performans Ayari
 
-### 15.1 Iki Asamali Tarama
+### 15.1 Iki Asamali Tarama (DOGRU PIPELINE SIRASI)
 ```
 Faz 1 - Hizli Pre-Filtre (her 60s):
-  - Top 50 coin cek (1 API call)
-  - Hard filtreler uygula (FR, OB, volume) - cache'li
-  - Basit 3-indikator yon kontrolu (5m veri, zaten cache'de)
-  - Sonuc: ~15-20 aday
+  1. Top X coin + Y spike coin cek (1+1 API call)
+  2. Hard filtreler uygula (FR, OB, volume) - cache'li
+  3. Sonuc: ~15-20 aday
 
 Faz 2 - Derin Analiz (sadece adaylar icin, her 120s):
-  - Zoom diyafram (9 TF x aday sayisi API call, batch)
-  - ER/Hurst hesaplama
-  - P(win)/EV
-  - MTF yon teyidi
-  - Sonuc: Siralanmis final listesi
+  Pipeline sirasi (HER ADIM BIR ONCEKINE BAGIMLI):
+
+  1. ZOOM: Her TF icin mum cek → zigzag → G hesapla
+     → Dirsek noktasi bul → Optimal TF sec
+     Sonuc: coin basina yon_tf + G degeri
+
+  2. REJIM: Optimal TF'de ER + Hurst hesapla
+     → TREND / RANGING / GRAY ZONE karar ver
+     Sonuc: coin basina rejim
+
+  3. YON: Rejime gore yon belirle
+     → TREND: momentum tabanlı (EMA, MACD, RSI)
+     → RANGING: ters mantik (RSI asiri bolge, BB bant)
+     → MTF teyidi (Yon TF + Teyit TF hizalama)
+     Sonuc: coin basina LONG / SHORT / FLAT
+
+  4. SL/TP: Yon + Rejim + G'den SL/TP hesapla
+     → ev_mode=optimizer ise: P(win)/EV optimizasyonu
+     → ev_mode=soft ise: sabit G carpanlari + EV soft bonus/ceza
+     Sonuc: coin basina SL%, TP%, kaldirac
+
+  5. SKORLAMA: Tum verileri birlestir → final skor
+     → Siralanmis final listesi
+
+Neden bu sira zorunlu:
+  - TF olmadan G hesaplanamaz
+  - G olmadan rejim belirlenemez (ER, TF verisine bagli)
+  - Rejim olmadan yon belirlenemez (TREND vs RANGING farkli mantik)
+  - Yon olmadan SL/TP belirlenemez (ileri/geri dalga yonden turetilir)
+  - SL olmadan kaldirac belirlenemez
 ```
 
 ### 15.2 API Optimizasyonu
@@ -613,6 +792,7 @@ Faz 2 - Derin Analiz (sadece adaylar icin, her 120s):
     "scan_interval_seconds": 60,
     "deep_analysis_interval_seconds": 120,
     "prefilter_top_n": 50,
+    "spike_coin_count": 5,
     "deep_analysis_top_n": 15,
     "api_max_parallel": 5,
     "api_rate_limit_pct": 66,
@@ -737,4 +917,5 @@ Sinyal bozuldugunda beklemek yerine hemen cikmak, uzun vadede pozitif EV saglar.
 ---
 
 ## VERSIYON GECMISI
+- v1.1 (2026-03-29): Pipeline sirasi duzeltmesi (Rejim→Yon), EV optimizer detayi, spike coin, mum sayisi config
 - v1.0 (2026-03-27): Ilk tasarim - istisare sonucu

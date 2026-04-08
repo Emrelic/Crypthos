@@ -4277,8 +4277,8 @@ class StrategySettingsPanel(ctk.CTkFrame):
             row.pack(fill="x", padx=4, pady=1)
             ctk.CTkLabel(row, text=label, font=font, width=180, anchor="w").pack(side="left")
             var = ctk.StringVar(value=default)
-            ctk.CTkComboBox(row, values=values, variable=var,
-                            width=100, font=font).pack(side="right", padx=4)
+            ctk.CTkOptionMenu(row, values=values, variable=var,
+                              width=140, font=font).pack(side="right", padx=4)
             self._sn_combo_vars[key] = var
 
         # ── 3 column layout ──

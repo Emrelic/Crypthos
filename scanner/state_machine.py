@@ -11028,7 +11028,8 @@ class ScannerStateMachine:
                 pass
 
         scanner = self._system_n_scanner
-        margin_usdt = scanner.calculate_position_size(wallet, leverage, coin_min_notional)
+        margin_usdt = scanner.calculate_position_size(
+            wallet, leverage, coin_min_notional, available_balance=real_balance)
         margin_usdt = min(margin_usdt, real_balance * 0.90) if real_balance > 0 else margin_usdt
         min_pos_usd = pos_cfg.get("min_position_usd", 1.0)
         if margin_usdt < min_pos_usd:
@@ -11298,6 +11299,7 @@ class ScannerStateMachine:
             pass
 
         # G-bazlı dinamik kaldıraç (_do_open_system_n ile tutarlı)
+        scanner = self._system_n_scanner
         trading_mode = sm_cfg.get("trading_mode", "spot")
         if trading_mode == "spot":
             leverage = 1
@@ -11309,11 +11311,25 @@ class ScannerStateMachine:
             logger.info(f"[SysN REVERSE] {symbol}: G-bazlı kaldıraç={leverage}x "
                         f"(G={coin_params.get('G', 0):.3f}%)")
 
-        scanner = self._system_n_scanner
-        new_margin = scanner.calculate_position_size(wallet, leverage)
-        new_margin = min(new_margin, real_balance * 0.90) if real_balance > 0 else new_margin
-
-        new_qty = new_margin * leverage / price if price > 0 else 0
+        # Reverse sizing mode: "full" = eski pozisyon miktarı, "fresh" = portföy kurallarıyla yeniden hesapla
+        reverse_sizing = sm_cfg.get("reverse_sizing", "fresh")
+        if reverse_sizing == "full":
+            # Eski pozisyonun aynı notional'ı ile ters aç
+            new_qty = pos.size
+            new_margin = pos.margin_usdt
+        else:
+            # Portföy kurallarına göre yeniden hesapla (1/12, min_notional, hybrid)
+            coin_min_notional = 5.0
+            if self._symbol_info_cache:
+                try:
+                    si = self._symbol_info_cache.get(symbol)
+                    if si and hasattr(si, 'min_notional') and si.min_notional > 0:
+                        coin_min_notional = si.min_notional
+                except Exception:
+                    pass
+            new_margin = scanner.calculate_position_size(wallet, leverage, coin_min_notional)
+            new_margin = min(new_margin, real_balance * 0.90) if real_balance > 0 else new_margin
+            new_qty = new_margin * leverage / price if price > 0 else 0
 
         qp = 3
         if self._symbol_info_cache:

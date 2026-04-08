@@ -29,6 +29,7 @@ from scanner.system_b_scanner import (
     SwingPoint,
     WaveAnalysis,
 )
+from analysis.elliott_wave import detect_elliott, ElliottPattern
 
 # ─────────────────────────── Helpers ───────────────────────────
 
@@ -191,6 +192,11 @@ class SystemJScanResult:
     p_win: float = 0.0
     ev_pct: float = 0.0
 
+    # Elliott Wave
+    elliott_pattern: str = ""       # IMPULSE_5 / CORRECTION_ABC / ""
+    elliott_confidence: float = 0.0
+    elliott_direction: str = ""     # LONG / SHORT (Elliott'un next_move_dir'i)
+
     # Eligibility
     eligible: bool = False
     reject_reason: str = ""
@@ -241,6 +247,9 @@ class SystemJScanner:
 
     def _cfg_score(self, key: str, default=None):
         return self._config.get(f"system_j.score_weights.{key}", default)
+
+    def _cfg_elliott(self, key: str, default=None):
+        return self._config.get(f"system_j.elliott.{key}", default)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # LEVERAGE BRACKET — Binance API
@@ -593,11 +602,24 @@ class SystemJScanner:
             result.reject_reason = reason
             return result
 
-        # ---- İndikatörleri bir kez hesapla (rejim, yön, BB hep bunu kullansın) ----
+        # ---- Elliott koruma filtreleri: min TF + min G ----
+        if self._cfg_elliott("enabled", True):
+            min_tf_minutes = self._cfg_elliott("min_tf_minutes", 15)
+            tf_minutes = TF_MINUTES.get(tf, 1)
+            if tf_minutes < min_tf_minutes:
+                result.eligible = False
+                result.reject_reason = f"LOW_TF({tf}<{min_tf_minutes}m)"
+                return result
+
+            min_g = self._cfg_elliott("min_g_pct", 1.0)
+            if G < min_g:
+                result.eligible = False
+                result.reject_reason = f"LOW_G({G:.3f}<{min_g})"
+                return result
+
+        # ---- İndikatörleri bir kez hesapla ----
         klines_tf = klines_by_tf.get(tf)
         ind_tf = self._compute_indicators(klines_tf)
-        klines_confirm = klines_by_tf.get(result.confirm_tf)
-        ind_confirm = self._compute_indicators(klines_confirm)
 
         # BB/RSI/ATR değerlerini hemen doldur (GUI + giriş hesabı)
         if ind_tf:
@@ -609,36 +631,71 @@ class SystemJScanner:
             if result.price > 0 and result.atr > 0:
                 result.atr_pct = (result.atr / result.price) * 100
 
-        # ---- Rejim Tespiti (ER + Hurst dual-vote, gray zone artık çözülür) ----
-        result.regime = self._compute_regime(klines_tf)
-        result.er = result.regime.er
+        # ---- Elliott Wave Tespiti (rejim + yön yerine) ----
+        elliott_enabled = self._cfg_elliott("enabled", True)
+        if elliott_enabled:
+            elliott_result = self._detect_elliott_pattern(swings, ind_tf)
+            if elliott_result is None:
+                result.eligible = False
+                result.reject_reason = "NO_ELLIOTT"
+                result.regime_zone = "NO_PATTERN"
+                return result
 
-        if result.regime.regime == "UNDECIDED":
-            result.eligible = False
-            result.reject_reason = "UNDECIDED_REGIME"
-            result.regime_zone = "UNDECIDED"
-            return result
+            result.elliott_pattern = elliott_result.pattern_type
+            result.elliott_confidence = elliott_result.confidence
+            result.elliott_direction = elliott_result.next_move_dir
+            result.direction = elliott_result.next_move_dir
+            result.strength = "STRONG" if elliott_result.confidence >= 0.5 else "WEAK"
 
-        # GUI: gray'den çözülmüşse (H=hurst) göster
-        if result.regime.gray_resolved:
-            result.regime_zone = f"{result.regime.regime}(H={result.regime.hurst:.2f})"
+            # Elliott impulse = trend tamamlanmış, correction = ranging tamamlanmış
+            # Ama çıkış hep reaktif — pool sadece GUI/loglama için
+            result.pool = "TREND"
+            result.regime_zone = f"EW:{elliott_result.pattern_type[:3]}({elliott_result.confidence:.2f})"
+            result.regime = RegimeResultJ(
+                regime="TRENDING", er=0, confidence=elliott_result.confidence)
+
+            # Direction result oluştur (uyumluluk için)
+            result.direction_result = DirectionResultJ(
+                direction=elliott_result.next_move_dir,
+                strength=elliott_result.confidence,
+                aligned=True,
+            )
         else:
-            result.regime_zone = result.regime.regime
+            # Elliott kapalı — eski rejim + yön mantığı (fallback)
+            klines_confirm = klines_by_tf.get(result.confirm_tf)
+            ind_confirm = self._compute_indicators(klines_confirm)
 
-        result.pool = "TREND" if result.regime.regime == "TRENDING" else "RANGING"
+            result.regime = self._compute_regime(klines_tf)
+            result.er = result.regime.er
 
-        # ---- Yön Belirleme (önceden hesaplanan indikatörleri geç) ----
-        result.direction_result = self._compute_direction_cached(
-            ind_tf, ind_confirm, tf, result.confirm_tf, result.regime.regime)
-        result.direction = result.direction_result.direction
-        result.strength = "STRONG" if result.direction_result.aligned else "WEAK"
+            if result.regime.regime == "UNDECIDED":
+                result.eligible = False
+                result.reject_reason = "UNDECIDED_REGIME"
+                result.regime_zone = "UNDECIDED"
+                return result
 
-        if result.direction == "SKIP":
-            result.eligible = False
-            result.reject_reason = "NO_DIRECTION"
-            return result
+            if result.regime.gray_resolved:
+                result.regime_zone = f"{result.regime.regime}(H={result.regime.hurst:.2f})"
+            else:
+                result.regime_zone = result.regime.regime
 
-        # ---- P(win)/EV (liq_dist_pct geçilerek SL cap EV içinde yapılır) ----
+            result.pool = "TREND" if result.regime.regime == "TRENDING" else "RANGING"
+
+            result.direction_result = self._compute_direction_cached(
+                ind_tf, ind_confirm, tf, result.confirm_tf, result.regime.regime)
+            result.direction = result.direction_result.direction
+            result.strength = "STRONG" if result.direction_result.aligned else "WEAK"
+
+            if result.direction == "SKIP":
+                result.eligible = False
+                result.reject_reason = "NO_DIRECTION"
+                return result
+
+        # ---- P(win)/EV ----
+        # Elliott aktifken EV zorunlu değil (backtest'te EV filtresi yoktu,
+        # Elliott pattern zaten güçlü giriş filtresi)
+        ev_skip = elliott_enabled and self._cfg_elliott("skip_ev", True)
+
         result.ev_result = self._compute_ev(
             result.direction, G, result.sl_pct, leverage,
             swings, backward_waves, klines_tf,
@@ -646,7 +703,7 @@ class SystemJScanner:
         result.p_win = result.ev_result.p_win
         result.ev_pct = result.ev_result.ev_pct
 
-        if not result.ev_result.sufficient:
+        if not result.ev_result.sufficient and not ev_skip:
             result.eligible = False
             result.reject_reason = "NEGATIVE_EV"
             return result
@@ -1036,51 +1093,63 @@ class SystemJScanner:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _set_exit_params(self, result: SystemJScanResult, klines):
-        """Rejime göre TP/trailing parametreleri.
+        """TP/trailing parametreleri.
 
-        Düzeltmeler:
-          - TP hedefine fee EKLENMEZ (Binance fee'yi marjdan düşer, TP brüt fiyat)
-          - Trailing callback Binance min 0.1%'in altına düşerse → sabit TP'ye geç
-          - Ranging BB TP < SL → reject (R:R < 1 anlamsız)
+        Elliott aktifken: her zaman reaktif trailing (rejim ayrımı yok).
+        Elliott kapalıyken: eski rejim bazlı mantık.
         """
         G = result.G
+        elliott_enabled = self._cfg_elliott("enabled", True)
 
-        if result.pool == "TREND":
-            trigger_mult = self._cfg_tp("trailing_trigger_g_mult", 2.5)
-            callback_mult = self._cfg_tp("trailing_callback_g_mult", 0.5)
+        if elliott_enabled:
+            # ── Reaktif çıkış: her zaman trailing, rejim ayrımı yok ──
+            # Backtest optimal: trigger=1.0xG, callback=0.3xG (ATR yerine G bazlı)
+            trigger_mult = self._cfg_elliott("trail_trigger_g_mult", 1.0)
+            callback_mult = self._cfg_elliott("trail_callback_g_mult", 0.3)
             callback = callback_mult * G
 
-            if callback >= 0.15:
-                # Normal trailing: callback yeterince geniş
+            if callback >= 0.10:
                 result.trailing_trigger_pct = trigger_mult * G
                 result.trailing_callback_pct = max(0.1, min(callback, 5.0))
             else:
-                # Callback çok sıkı (yüksek kaldıraç, küçük G) → sabit TP kullan
+                # Callback çok sıkı → sabit TP fallback
                 result.trailing_trigger_pct = 0
                 result.trailing_callback_pct = 0
 
-            # TP: brüt hedef (fee dahil değil — Binance fee'yi marjdan düşer)
             if result.tp_pct <= 0:
                 result.tp_pct = trigger_mult * G
         else:
-            # RANGING — sabit TP (BB middle hedef)
-            bb_mid = result.bb_middle
-            price = result.price
-            if bb_mid > 0 and price > 0:
-                if result.direction == "LONG":
-                    bb_tp = (bb_mid - price) / price * 100
-                else:
-                    bb_tp = (price - bb_mid) / price * 100
-                if bb_tp > result.sl_pct:
-                    result.tp_pct = bb_tp
-                    return
-                # BB TP <= SL → reject flag (R:R < 1, _build_result'da kontrol edilecek)
-                result.tp_pct = -1.0  # sentinel: ranging R:R yetersiz
-                return
+            # ── Eski rejim bazlı mantık (Elliott kapalı) ──
+            if result.pool == "TREND":
+                trigger_mult = self._cfg_tp("trailing_trigger_g_mult", 2.5)
+                callback_mult = self._cfg_tp("trailing_callback_g_mult", 0.5)
+                callback = callback_mult * G
 
-            # Fallback: G bazlı TP (fee eklenmez)
-            tp_mult = self._cfg_tp("ranging_tp_g_mult", 2.0)
-            result.tp_pct = tp_mult * G
+                if callback >= 0.15:
+                    result.trailing_trigger_pct = trigger_mult * G
+                    result.trailing_callback_pct = max(0.1, min(callback, 5.0))
+                else:
+                    result.trailing_trigger_pct = 0
+                    result.trailing_callback_pct = 0
+
+                if result.tp_pct <= 0:
+                    result.tp_pct = trigger_mult * G
+            else:
+                bb_mid = result.bb_middle
+                price = result.price
+                if bb_mid > 0 and price > 0:
+                    if result.direction == "LONG":
+                        bb_tp = (bb_mid - price) / price * 100
+                    else:
+                        bb_tp = (price - bb_mid) / price * 100
+                    if bb_tp > result.sl_pct:
+                        result.tp_pct = bb_tp
+                        return
+                    result.tp_pct = -1.0
+                    return
+
+                tp_mult = self._cfg_tp("ranging_tp_g_mult", 2.0)
+                result.tp_pct = tp_mult * G
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # GİRİŞ STRATEJİSİ
@@ -1168,12 +1237,19 @@ class SystemJScanner:
         # Direction strength (0-100)
         dir_score = result.direction_result.strength * 100 if result.direction_result.aligned else 0
 
-        # EV quality (0-100) — aralık: -5% ile +100% ROI arası normalize
-        ev_raw = result.ev_result.ev_pct if result.ev_result.sufficient else 0
-        ev_score = min(100, max(0, (ev_raw + 5) / 105 * 100))
+        # EV quality (0-100)
+        # Elliott aktif + EV skip → EV yerine Elliott confidence kullan
+        if result.elliott_pattern and not result.ev_result.sufficient:
+            ev_score = result.elliott_confidence * 100
+        else:
+            ev_raw = result.ev_result.ev_pct if result.ev_result.sufficient else 0
+            ev_score = min(100, max(0, (ev_raw + 5) / 105 * 100))
 
-        # Regime clarity (0-100)
-        regime_score = result.regime.confidence * 100
+        # Elliott aktifse: elliott confidence kullan, değilse regime confidence
+        if result.elliott_pattern:
+            regime_score = result.elliott_confidence * 100
+        else:
+            regime_score = result.regime.confidence * 100
 
         # Wave quality (0-100)
         wc = min(result.wave_count / 10.0, 1.0)
@@ -1183,6 +1259,63 @@ class SystemJScanner:
         score = (w_dir * dir_score + w_ev * ev_score +
                  w_regime * regime_score + w_wave * wave_score)
         return max(0, min(100, score))
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ELLIOTT WAVE TESPİTİ
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _detect_elliott_pattern(self, swings: list, indicators: dict = None
+                                 ) -> Optional[ElliottPattern]:
+        """Zigzag swinglerinden Elliott pattern tespit et.
+
+        Args:
+            swings: detect_zigzag_swings() çıktısı
+            indicators: İndikatör dict (yön teyidi için — opsiyonel)
+
+        Returns:
+            ElliottPattern veya None (pattern bulunamazsa)
+        """
+        min_confidence = self._cfg_elliott("min_confidence", 0.35)
+        stale_bars = self._cfg_elliott("max_stale_bars", 30)
+
+        if not swings or len(swings) < 4:
+            return None
+
+        pattern = detect_elliott(swings, min_confidence=min_confidence)
+        if pattern is None:
+            return None
+
+        # İndikatör ile yön teyidi (soft filter — çelişki varsa reddet)
+        if indicators:
+            ema_fast = indicators.get("EMA_fast", 0)
+            ema_slow = indicators.get("EMA_slow", 0)
+            macd_hist = indicators.get("MACD_histogram", 0)
+            rsi = indicators.get("RSI", 50)
+
+            # Basit yön skoru
+            ind_score = 0.0
+            if ema_fast > 0 and ema_slow > 0:
+                if ema_fast > ema_slow:
+                    ind_score += 1
+                elif ema_fast < ema_slow:
+                    ind_score -= 1
+            if macd_hist > 0:
+                ind_score += 1
+            elif macd_hist < 0:
+                ind_score -= 1
+            if rsi > 55:
+                ind_score += 1
+            elif rsi < 45:
+                ind_score -= 1
+            ind_score /= 3.0
+
+            # Elliott yönü ile güçlü çelişki varsa reddet
+            if pattern.next_move_dir == "LONG" and ind_score < -0.33:
+                return None
+            if pattern.next_move_dir == "SHORT" and ind_score > 0.33:
+                return None
+
+        return pattern
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # İNDİKATÖR HELPER

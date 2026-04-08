@@ -970,9 +970,10 @@
     "scan_interval_seconds": 300,
     "kline_limit": 300,
     "timeframe": "5m",
-    "trading_mode": "spot",
+    "trading_mode": "futures",
     "short_enabled": true,
     "reverse_enabled": true,
+    "reverse_sizing": "fresh",
     "max_leverage": 150,
     "indicators": {
       "coeff": 3.6,
@@ -988,8 +989,9 @@
       "slope_factor": 0.1
     },
     "position": {
-      "sizing_mode": "min_notional",
-      "portfolio_divider": 12,
+      "sizing_mode": "hybrid",
+      "portfolio_divider": 30,
+      "hybrid_threshold_usd": 12.0,
       "min_notional_usd": 5.0,
       "min_notional_buffer_pct": 20,
       "max_positions": 50,
@@ -1003,7 +1005,7 @@
       "funding_rate_max": 0.001
     },
     "sl": {
-      "enabled": false,
+      "enabled": true,
       "mode": "g_based",
       "g_mult": 1.5,
       "atr_mult": 2.0,
