@@ -374,8 +374,7 @@ class SystemMPanel(ctk.CTkFrame):
         size = _g(p, "size", 0) or 0
         margin = _g(p, "margin_usdt", 0) or 0
         entry_time = _g(p, "entry_time", 0) or 0
-        from core.constants import OrderSide
-        is_long = (side == OrderSide.BUY_LONG) if side else True
+        is_long = ("Buy" in str(side) or "LONG" in str(side).upper()) if side else True
         dir_text = "^ LONG" if is_long else "v SHORT"
         dir_color = "#00E676" if is_long else "#FF5252"
         if entry_price > 0 and current_price > 0:

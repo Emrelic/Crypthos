@@ -160,6 +160,9 @@ class ScannerStateMachine:
         self._last_system_n_results: list[SystemNScanResult] = []
         self._system_n_decisions: list[dict] = []  # karar log'u (max 500)
         self._system_n_scan_count: int = 0  # System N'e özel tarama sayacı
+        self._system_n_scan_start_time: float = 0.0  # bu scan döngüsünün başlangıç zamanı
+        # System N loss protection: ardışık reverse takibi
+        self._system_n_reverse_history: dict[str, list[float]] = {}  # symbol -> [reverse_timestamps]
 
         # ── System J (Max Leverage First) ──
         self._system_j_scanner: SystemJScanner | None = None
@@ -1512,9 +1515,9 @@ class ScannerStateMachine:
                 if result:
                     pnl_usdt = result.get("pnl_usdt", 0)
                     if pnl_usdt < 0:
-                        # System D kendi cooldown ayarını kullanır
                         entry_mode = getattr(pos, 'entry_mode', '') if pos else ''
                         if entry_mode == "SYSTEM_D":
+                            # System D kendi cooldown ayarını kullanır
                             sd = self._config.get("system_d", {})
                             if sd.get("cooldown_enabled", False):
                                 cooldown_s = sd.get("cooldown_seconds", 600)
@@ -1522,11 +1525,24 @@ class ScannerStateMachine:
                                 logger.info(f"[SysD COOLDOWN] {symbol}: {cooldown_s}s re-entry yasagi "
                                             f"(PnL={pnl_usdt:+.4f} USDT)")
                             # cooldown kapalıysa kaydetme
+                        elif entry_mode == "SYSTEM_N":
+                            # System N kendi config'ini kullanır
+                            sn_opt = self._config.get("system_n", {}).get("optional_features", {})
+                            if sn_opt.get("loss_cooldown_enabled", False):
+                                cooldown_s = sn_opt.get("loss_cooldown_seconds", 600)
+                                self._loss_cooldown_symbols[symbol] = time.time()
+                                logger.info(f"[SysN COOLDOWN] {symbol}: {cooldown_s}s re-entry yasagi "
+                                            f"(PnL={pnl_usdt:+.4f} USDT, external_close)")
+                            if sn_opt.get("coin_ban_enabled", False):
+                                self._record_coin_loss(symbol)
+                                logger.info(f"[SysN BAN KAYDI] {symbol}: external close ban sayaci artti")
                         else:
                             self._loss_cooldown_symbols[symbol] = time.time()
                             logger.info(f"[LOSS COOLDOWN] {symbol}: {self._loss_cooldown_seconds}s re-entry yasagi "
                                         f"(PnL={pnl_usdt:+.4f} USDT, external_close)")
-                        self._record_coin_loss(symbol)
+                        # Tüm sistemler için coin loss kaydı (System N hariç, kendi bloğunda yapıyor)
+                        if entry_mode != "SYSTEM_N":
+                            self._record_coin_loss(symbol)
 
                 self._event_bus.publish(EventType.TRADE_RESULT, result or {})
 
@@ -2556,6 +2572,68 @@ class ScannerStateMachine:
         if symbol not in self._coin_loss_history:
             self._coin_loss_history[symbol] = []
         self._coin_loss_history[symbol].append(time.time())
+
+    def _check_coin_daily_ban_system_n(self, symbol: str) -> tuple[bool, str]:
+        """System N için coin ban kontrolü — kendi config'inden okur.
+        Global _check_coin_daily_ban() strategy.* okur (24h),
+        bu metot system_n.optional_features.* okur (8h)."""
+        sn_cfg = self._config.get("system_n", {})
+        opt = sn_cfg.get("optional_features", {})
+
+        if not opt.get("coin_ban_enabled", False):
+            return True, ""
+
+        limit = opt.get("coin_daily_loss_limit", 3)
+        if limit <= 0:
+            return True, ""
+
+        ban_hours = opt.get("coin_daily_ban_hours", 8)
+        now = time.time()
+        cutoff = now - (ban_hours * 3600)
+
+        if symbol in self._coin_loss_history:
+            self._coin_loss_history[symbol] = [
+                t for t in self._coin_loss_history[symbol] if t > cutoff
+            ]
+            loss_count = len(self._coin_loss_history[symbol])
+            if loss_count >= limit:
+                remaining_h = ban_hours - (now - self._coin_loss_history[symbol][0]) / 3600
+                return False, (f"coin_ban ({symbol}: {loss_count} zarar "
+                               f"{ban_hours}h icinde, ~{remaining_h:.1f}h kaldi)")
+
+        return True, ""
+
+    def _check_reverse_allowed_system_n(self, symbol: str) -> tuple[bool, str]:
+        """System N ardışık reverse koruması.
+        max_consecutive_reverses aşıldıysa reverse engellenir, sadece close yapılır."""
+        sn_cfg = self._config.get("system_n", {})
+        opt = sn_cfg.get("optional_features", {})
+
+        if not opt.get("reverse_protection_enabled", False):
+            return True, ""
+
+        max_rev = opt.get("max_consecutive_reverses", 2)
+        window_s = opt.get("reverse_window_seconds", 1800)
+        now = time.time()
+
+        # Eski kayıtları temizle
+        if symbol in self._system_n_reverse_history:
+            self._system_n_reverse_history[symbol] = [
+                t for t in self._system_n_reverse_history[symbol]
+                if now - t < window_s
+            ]
+            count = len(self._system_n_reverse_history[symbol])
+            if count >= max_rev:
+                return False, (f"ardisik reverse limiti ({count}/{max_rev} "
+                               f"son {window_s // 60}dk icinde)")
+
+        return True, ""
+
+    def _record_reverse_system_n(self, symbol: str) -> None:
+        """System N reverse kaydı — ardışık reverse takibi için."""
+        if symbol not in self._system_n_reverse_history:
+            self._system_n_reverse_history[symbol] = []
+        self._system_n_reverse_history[symbol].append(time.time())
 
     def _do_buying(self) -> None:
         """Place order via API (legacy state machine entry), then return to SCANNING."""
@@ -3976,8 +4054,61 @@ class ScannerStateMachine:
             self._system_m_decisions = self._system_m_decisions[-500:]
 
     def get_system_n_results(self) -> list:
-        """Return last System N scan results (for GUI)."""
-        return list(self._last_system_n_results)
+        """Return last System N scan results (for GUI).
+
+        Her sonuca ban/cooldown durumu eklenir:
+          ban_status: "" | "BAN" | "COOLDOWN"
+          ban_detail: "" | açıklama metni (sebep + kalan süre)
+        """
+        results = list(self._last_system_n_results)
+        if not results:
+            return results
+
+        now = time.time()
+        sn_cfg = self._config.get("system_n", {})
+        opt = sn_cfg.get("optional_features", {})
+
+        ban_enabled = opt.get("coin_ban_enabled", False)
+        ban_limit = opt.get("coin_daily_loss_limit", 3)
+        ban_hours = opt.get("coin_daily_ban_hours", 8)
+
+        cooldown_enabled = opt.get("loss_cooldown_enabled", False)
+        cooldown_s = opt.get("loss_cooldown_seconds", 600)
+
+        enriched = []
+        for r in results:
+            sym = getattr(r, "symbol", "") or (r.get("symbol", "") if isinstance(r, dict) else "")
+            ban_status = ""
+            ban_detail = ""
+
+            # 1. Coin ban kontrolü
+            if ban_enabled and ban_limit > 0 and sym in self._coin_loss_history:
+                cutoff = now - (ban_hours * 3600)
+                recent = [t for t in self._coin_loss_history[sym] if t > cutoff]
+                if len(recent) >= ban_limit:
+                    remaining_h = ban_hours - (now - recent[0]) / 3600
+                    ban_status = "BAN"
+                    ban_detail = (f"{len(recent)} zarar/{ban_hours}h "
+                                  f"({remaining_h:.1f}h kaldi)")
+
+            # 2. Loss cooldown kontrolü (ban yoksa)
+            if not ban_status and cooldown_enabled and sym in self._loss_cooldown_symbols:
+                elapsed = now - self._loss_cooldown_symbols[sym]
+                remaining = cooldown_s - elapsed
+                if remaining > 0:
+                    ban_status = "COOLDOWN"
+                    ban_detail = f"zarar sonrasi bekleme ({remaining:.0f}s kaldi)"
+
+            # Dataclass'ı dict'e çevir + ban bilgisi ekle
+            if isinstance(r, dict):
+                row = dict(r)
+            else:
+                row = {k: getattr(r, k, None) for k in r.__dataclass_fields__}
+            row["ban_status"] = ban_status
+            row["ban_detail"] = ban_detail
+            enriched.append(row)
+
+        return enriched
 
     def get_system_n_decisions(self) -> list[dict]:
         """Return System N trade decision log (for GUI)."""
@@ -10437,7 +10568,16 @@ class ScannerStateMachine:
             new_notional = new_qty * price
 
         # Reverse'te mevcut pos kapanıp margin serbest kalır ama yine de kontrol
-        freed_margin = pos.margin_usdt
+        # PnL-aware: isolated margin'de serbest kalan = margin + unrealized_pnl
+        if pos.entry_price > 0 and price > 0:
+            if pos.side == OrderSide.BUY_LONG:
+                _pnl_ratio = (price - pos.entry_price) / pos.entry_price
+            else:
+                _pnl_ratio = (pos.entry_price - price) / pos.entry_price
+            _unrealized = pos.margin_usdt * pos.leverage * _pnl_ratio
+            freed_margin = max(pos.margin_usdt + _unrealized, 0)
+        else:
+            freed_margin = pos.margin_usdt
         available_after = real_balance + freed_margin
         required_margin = new_notional / max(leverage, 1)
         if required_margin > available_after * 0.90:
@@ -10555,6 +10695,7 @@ class ScannerStateMachine:
 
         self._scan_count += 1
         self._system_n_scan_count += 1
+        self._system_n_scan_start_time = time.time()
         sm_cfg = self._config.get("system_n", {})
         pos_cfg = sm_cfg.get("position", {})
         filter_cfg = sm_cfg.get("filters", {})
@@ -10770,10 +10911,20 @@ class ScannerStateMachine:
         reverse_enabled = sm_cfg.get("reverse_enabled", False)
         pos_cfg = sm_cfg.get("position", {})
         max_pos = pos_cfg.get("max_positions", 12)
+        sn_opt = sm_cfg.get("optional_features", {})
 
         held = self._position_mgr.get_all_positions()
         held_m = {sym: pos for sym, pos in held.items()
                   if pos.entry_mode == "SYSTEM_N"}
+
+        # ── Loss protection: expired cooldown temizliği ──
+        now = time.time()
+        if sn_opt.get("loss_cooldown_enabled", False):
+            cooldown_s = sn_opt.get("loss_cooldown_seconds", 600)
+            self._loss_cooldown_symbols = {
+                s: t for s, t in self._loss_cooldown_symbols.items()
+                if now - t < cooldown_s
+            }
 
         # ── BÖLGE UYUMSUZLUĞU: kaçırılmış sinyal tespiti ──
         # Restart/kopukluk sırasında kaçırılan sinyaller nedeniyle
@@ -10826,6 +10977,11 @@ class ScannerStateMachine:
                     ok = self._do_close_system_n(sym, pos, "ZONE_MISMATCH_BUY")
                     self._log_n_decision(sym, "BUY", "ZONE_KAPAT" if ok else "ZONE_KAPAT_BAŞARISIZ",
                                          f"SHORT kapatıldı (yanlış bölge)", scan_r.price)
+                else:
+                    # short_enabled=False ama SHORT pozisyon var — yetim bırakma
+                    ok = self._do_close_system_n(sym, pos, "ZONE_MISMATCH_SHORT_DISABLED")
+                    self._log_n_decision(sym, "BUY", "ZONE_KAPAT" if ok else "ZONE_KAPAT_BAŞARISIZ",
+                                         f"SHORT kapatıldı (yanlış bölge, short devre dışı)", scan_r.price)
                 held = self._position_mgr.get_all_positions()
                 held_m = {s: p for s, p in held.items() if p.entry_mode == "SYSTEM_N"}
 
@@ -10862,13 +11018,43 @@ class ScannerStateMachine:
                     return False, f"yön dengesi aşıldı ({longs}L/{shorts}S, oran {dir_ratio_str})"
             return True, ""
 
+        # ── Loss protection: yeni pozisyon açma kontrolü ──
+        def _can_open_new(sym: str, signal_type: str) -> tuple[bool, str]:
+            """Cooldown + ban + eski sinyal kontrolü. True=açılabilir."""
+            # 1. Loss cooldown
+            if sn_opt.get("loss_cooldown_enabled", False):
+                cooldown_s = sn_opt.get("loss_cooldown_seconds", 600)
+                if sym in self._loss_cooldown_symbols:
+                    elapsed = now - self._loss_cooldown_symbols[sym]
+                    remaining = cooldown_s - elapsed
+                    if remaining > 0:
+                        return False, f"loss cooldown ({remaining:.0f}s kaldi)"
+                    # Cooldown yeni bitti — sinyal cooldown döneminde mi üretildi?
+                    # Scan başlangıcı cooldown bitiş zamanından SONRA olmalı
+                    cooldown_end = self._loss_cooldown_symbols[sym] + cooldown_s
+                    if self._system_n_scan_start_time < cooldown_end:
+                        return False, f"eski sinyal (cooldown sirasinda uretildi, yeni scan bekleniyor)"
+
+            # 2. Coin daily ban
+            if sn_opt.get("coin_ban_enabled", False):
+                ban_ok, ban_reason = self._check_coin_daily_ban_system_n(sym)
+                if not ban_ok:
+                    return False, ban_reason
+
+            return True, ""
+
         # ── SELL sinyallerini işle (önce çıkış) ──
         for sig in sell_signals:
             sym = sig.symbol
             pos = held_m.get(sym)
 
             if not pos:
+                # Yeni SHORT açma — cooldown + ban kontrolü
                 if short_enabled:
+                    can_open, block_reason = _can_open_new(sym, "SELL")
+                    if not can_open:
+                        self._log_n_decision(sym, "SELL", "ATLA", block_reason, sig.price)
+                        continue
                     current_count = len(held_m)
                     if current_count >= max_pos:
                         self._log_n_decision(sym, "SELL", "ATLA",
@@ -10890,10 +11076,20 @@ class ScannerStateMachine:
                 continue
 
             if pos.side == OrderSide.BUY_LONG:
+                # Çıkış/reverse — close HER ZAMAN serbest
                 if reverse_enabled and short_enabled:
-                    ok = self._do_reverse_system_n(sym, pos, sig, "SHORT")
-                    self._log_n_decision(sym, "SELL", "REVERSE→SHORT" if ok else "REVERSE_BAŞARISIZ",
-                                         "LONG→SHORT çeviriliyor", sig.price)
+                    # Reverse kontrolü: ardışık reverse limiti
+                    rev_ok, rev_reason = self._check_reverse_allowed_system_n(sym)
+                    if not rev_ok:
+                        # Reverse engellendi → sadece close yap
+                        logger.info(f"[SysN] {sym}: {rev_reason} → reverse yerine close")
+                        ok = self._do_close_system_n(sym, pos, "SELL_SIGNAL_REV_LIMIT")
+                        self._log_n_decision(sym, "SELL", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
+                                             f"reverse limiti: {rev_reason}", sig.price)
+                    else:
+                        ok = self._do_reverse_system_n(sym, pos, sig, "SHORT")
+                        self._log_n_decision(sym, "SELL", "REVERSE→SHORT" if ok else "REVERSE_BAŞARISIZ",
+                                             "LONG→SHORT çeviriliyor", sig.price)
                 else:
                     ok = self._do_close_system_n(sym, pos, "SELL_SIGNAL")
                     self._log_n_decision(sym, "SELL", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
@@ -10908,6 +11104,11 @@ class ScannerStateMachine:
             pos = held_m.get(sym)
 
             if not pos:
+                # Yeni LONG açma — cooldown + ban kontrolü
+                can_open, block_reason = _can_open_new(sym, "BUY")
+                if not can_open:
+                    self._log_n_decision(sym, "BUY", "ATLA", block_reason, sig.price)
+                    continue
                 current_count = len(held_m)
                 if current_count >= max_pos:
                     self._log_n_decision(sym, "BUY", "ATLA",
@@ -10926,14 +11127,29 @@ class ScannerStateMachine:
                 continue
 
             if pos.side == OrderSide.SELL_SHORT:
+                # Çıkış/reverse — close HER ZAMAN serbest
                 if reverse_enabled and short_enabled:
-                    ok = self._do_reverse_system_n(sym, pos, sig, "LONG")
-                    self._log_n_decision(sym, "BUY", "REVERSE→LONG" if ok else "REVERSE_BAŞARISIZ",
-                                         "SHORT→LONG çeviriliyor", sig.price)
+                    # Reverse kontrolü: ardışık reverse limiti
+                    rev_ok, rev_reason = self._check_reverse_allowed_system_n(sym)
+                    if not rev_ok:
+                        logger.info(f"[SysN] {sym}: {rev_reason} → reverse yerine close")
+                        ok = self._do_close_system_n(sym, pos, "BUY_SIGNAL_REV_LIMIT")
+                        self._log_n_decision(sym, "BUY", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
+                                             f"reverse limiti: {rev_reason}", sig.price)
+                    else:
+                        ok = self._do_reverse_system_n(sym, pos, sig, "LONG")
+                        self._log_n_decision(sym, "BUY", "REVERSE→LONG" if ok else "REVERSE_BAŞARISIZ",
+                                             "SHORT→LONG çeviriliyor", sig.price)
                 elif short_enabled:
                     ok = self._do_close_system_n(sym, pos, "BUY_SIGNAL")
                     self._log_n_decision(sym, "BUY", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
                                          "SHORT pozisyon kapatılıyor", sig.price)
+                else:
+                    # short_enabled=False ama SHORT pozisyon var (config değişti/sync)
+                    # Close HER ZAMAN serbest — pozisyonu yetim bırakma
+                    ok = self._do_close_system_n(sym, pos, "BUY_SIGNAL_SHORT_DISABLED")
+                    self._log_n_decision(sym, "BUY", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
+                                         "SHORT kapatılıyor (short devre dışı)", sig.price)
                 held = self._position_mgr.get_all_positions()
                 held_m = {s: p for s, p in held.items()
                           if p.entry_mode == "SYSTEM_N"}
@@ -11226,6 +11442,21 @@ class ScannerStateMachine:
 
             trade = self._position_mgr.close_position(symbol, exit_price, reason)
 
+            # ── Loss protection: zarar kaydı ──
+            if trade:
+                pnl_usdt = trade.get("pnl_usdt", 0)
+                if pnl_usdt < 0:
+                    sn_opt = self._config.get("system_n", {}).get("optional_features", {})
+                    if sn_opt.get("loss_cooldown_enabled", False):
+                        cooldown_s = sn_opt.get("loss_cooldown_seconds", 600)
+                        self._loss_cooldown_symbols[symbol] = time.time()
+                        logger.info(f"[SysN COOLDOWN] {symbol}: {cooldown_s}s re-entry yasagi "
+                                    f"(PnL={pnl_usdt:+.4f} USDT, reason={reason})")
+                    if sn_opt.get("coin_ban_enabled", False):
+                        self._record_coin_loss(symbol)
+                        logger.info(f"[SysN BAN KAYDI] {symbol}: ban sayaci artti "
+                                    f"(PnL={pnl_usdt:+.4f} USDT)")
+
             # Hemen state kaydet (crash koruması)
             try:
                 self._position_mgr.save_state()
@@ -11353,7 +11584,16 @@ class ScannerStateMachine:
             new_notional = new_qty * price
 
         # Reverse'te mevcut pos kapanıp margin serbest kalır ama yine de kontrol
-        freed_margin = pos.margin_usdt
+        # PnL-aware: isolated margin'de serbest kalan = margin + unrealized_pnl
+        if pos.entry_price > 0 and price > 0:
+            if pos.side == OrderSide.BUY_LONG:
+                _pnl_ratio = (price - pos.entry_price) / pos.entry_price
+            else:
+                _pnl_ratio = (pos.entry_price - price) / pos.entry_price
+            _unrealized = pos.margin_usdt * pos.leverage * _pnl_ratio
+            freed_margin = max(pos.margin_usdt + _unrealized, 0)
+        else:
+            freed_margin = pos.margin_usdt
         available_after = real_balance + freed_margin
         required_margin = new_notional / max(leverage, 1)
         if required_margin > available_after * 0.90:
@@ -11384,6 +11624,21 @@ class ScannerStateMachine:
 
             trade = self._position_mgr.close_position(symbol, fill_price,
                                                        f"REVERSE_{new_direction}")
+
+            # ── Loss protection: reverse zarar kaydı ──
+            if trade:
+                pnl_usdt = trade.get("pnl_usdt", 0)
+                if pnl_usdt < 0:
+                    sn_opt = self._config.get("system_n", {}).get("optional_features", {})
+                    if sn_opt.get("loss_cooldown_enabled", False):
+                        self._loss_cooldown_symbols[symbol] = time.time()
+                        logger.info(f"[SysN REVERSE COOLDOWN] {symbol}: cooldown set "
+                                    f"(PnL={pnl_usdt:+.4f} USDT)")
+                    if sn_opt.get("coin_ban_enabled", False):
+                        self._record_coin_loss(symbol)
+                        logger.info(f"[SysN REVERSE BAN] {symbol}: ban sayaci artti")
+            # Ardışık reverse kaydı (PnL fark etmez)
+            self._record_reverse_system_n(symbol)
 
             if self._order_logger and trade:
                 from datetime import datetime as dt

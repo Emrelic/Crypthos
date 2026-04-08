@@ -1879,10 +1879,16 @@ class PositionManager:
         trailing_distance_pct = atr_pct * distance_mult
         trailing_activate_roi = trailing_activate_pct * lev
 
+        # PnL in USDT
+        pnl_usdt = self._get_pnl(pos, current) if pos.leverage >= 1 else 0.0
+        # Notional (position size in USDT)
+        notional = current * pos.size if current > 0 else pos.entry_price * pos.size
+
         return {
             "symbol": pos.symbol,
             "side": pos.side.value,
             "entry_price": pos.entry_price,
+            "current_price": current,
             "size": pos.size,
             "sl": pos.initial_sl,
             "tp": pos.initial_tp,
@@ -1891,6 +1897,7 @@ class PositionManager:
             "highest": pos.highest_price,
             "lowest": pos.lowest_price,
             "hold_seconds": time.time() - pos.entry_time,
+            "entry_time": pos.entry_time,
             "leverage": pos.leverage,
             "margin_usdt": pos.margin_usdt,
             "liquidation_price": pos.liquidation_price,
@@ -1906,6 +1913,8 @@ class PositionManager:
             "entry_adx": pos.entry_adx,
             "entry_rsi": pos.entry_rsi,
             "roi_percent": roi,
+            "pnl_usdt": pnl_usdt,
+            "notional": notional,
             "entry_mode": pos.entry_mode,
             "entry_regime": pos.entry_regime,
             "entry_bb_width": pos.entry_bb_width,

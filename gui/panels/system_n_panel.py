@@ -13,29 +13,35 @@ _PAD_X = 4
 
 # ═══ Column Layout: Scan Results ═══
 SN_SCAN_HEADERS = [
-    "#", "Sinyal", "Sembol", "Fiyat",
+    "#", "Sinyal", "Sembol", "Durum", "Fiyat",
     "AlphaTrend", "AT[2]", "Trend",
     "ADX", "RSI", "MFI", "ATR",
     "ADX_S", "ADX_D", "Slope", "Filtre",
+    "Pozisyon",
 ]
 SN_SCAN_WIDTHS = [
-    32, 74, 105, 92,
+    32, 74, 105, 120, 92,
     92, 92, 54,
     56, 52, 52, 76,
     50, 50, 50, 54,
+    110,
 ]
-_SN_IMP = {1, 2, 3, 6}
+_SN_IMP = {1, 2, 3, 6, 16}
 
 # ═══ Column Layout: Positions ═══
 SN_POS_HEADERS = [
-    "#", "Sembol", "Yon", "Giris Fiyat", "Guncel Fiyat",
-    "ROI%", "Kaldirac", "Miktar", "Marjin $", "Sure",
+    "#", "Sembol", "Yon", "Giris", "Guncel",
+    "ROI%", "PnL $", "Marjin", "Hacim $",
+    "Lev", "Liq Fiyat", "SL Fiyat", "G%",
+    "Sure",
 ]
 SN_POS_WIDTHS = [
-    32, 105, 72, 92, 92,
-    76, 58, 80, 72, 72,
+    26, 94, 62, 82, 82,
+    68, 68, 62, 70,
+    40, 82, 82, 52,
+    58,
 ]
-_SN_POS_IMP = {1, 2, 5}
+_SN_POS_IMP = {1, 2, 5, 6}
 
 # ═══ Column Layout: Decisions ═══
 SN_DEC_HEADERS = [
@@ -63,6 +69,10 @@ _ACTION_COLORS = {
     "SİNYAL_YOK": "#546E7A", "VERİ_YOK": "#455A64", "HATA": "#FF8A65",
     "LONG_BAŞARISIZ": "#FF8A65", "SHORT_BAŞARISIZ": "#FF8A65",
     "KAPAT_BAŞARISIZ": "#FF8A65", "REVERSE_BAŞARISIZ": "#FF8A65",
+    "ZONE_REVERSE→SHORT": "#FF5252", "ZONE_REVERSE→LONG": "#00E676",
+    "ZONE_KAPAT": "#FFD54F",
+    "ZONE_REVERSE_BAŞARISIZ": "#FF8A65",
+    "ZONE_KAPAT_BAŞARISIZ": "#FF8A65",
 }
 
 _TAB_ACTIVE = "#3d5afe"
@@ -119,6 +129,7 @@ class SystemNPanel(ctk.CTkFrame):
         self._last_dec_count: int = 0
         self._dec_filter = "all"
         self._active_tab = "scan"
+        self._held_map: dict = {}
 
         try:
             self._build_ui()
@@ -187,11 +198,18 @@ class SystemNPanel(ctk.CTkFrame):
 
         # --- POS ---
         self._pos_frame = ctk.CTkFrame(self)
+        pos_title_bar = ctk.CTkFrame(self._pos_frame, fg_color="transparent")
+        pos_title_bar.pack(fill="x", padx=8, pady=(4, 0))
         ctk.CTkLabel(
-            self._pos_frame, text="AKTIF POZISYONLAR",
+            pos_title_bar, text="AKTIF POZISYONLAR",
             font=ctk.CTkFont(size=_TITLE_FONT_SZ, weight="bold"),
             text_color="#FFFFFF",
-        ).pack(anchor="w", padx=8, pady=(4, 0))
+        ).pack(side="left")
+        self._pos_summary_label = ctk.CTkLabel(
+            pos_title_bar, text="",
+            font=ctk.CTkFont(size=13), text_color="#B0BEC5",
+        )
+        self._pos_summary_label.pack(side="right")
         _make_header_row(self._pos_frame, SN_POS_HEADERS, SN_POS_WIDTHS, _SN_POS_IMP)
         self._pos_scroll = ctk.CTkScrollableFrame(self._pos_frame)
         self._pos_scroll.pack(fill="both", expand=True, padx=4, pady=(2, 4))
@@ -789,6 +807,8 @@ class SystemNPanel(ctk.CTkFrame):
             text=f"Tarama: {len(results)}   |   BUY: {buy_c}   |   "
                  f"SELL: {sell_c}   |   Pozisyon: {len(m_pos)}")
 
+        # Pozisyon haritasi: symbol -> pos dict (scan tablosunda gosterilecek)
+        self._held_map = {_g(p, "symbol", ""): p for p in m_pos}
         self._update_scan_table(results)
         self._update_pos_table(m_pos)
         self._update_dec_table(decisions)
@@ -797,9 +817,24 @@ class SystemNPanel(ctk.CTkFrame):
     #  SCAN TABLE
     # ═══════════════════════════════════════════════════
     def _update_scan_table(self, results: list) -> None:
-        sorted_r = sorted(results,
-                          key=lambda r: (0 if _g(r, "signal") != "NONE" else 1,
-                                         -(_g(r, "adx", 0) or 0)))
+        # Sıralama: pozisyon olanlar + sinyal olanlar en üst, banlı/cooldown en alt
+        held = self._held_map
+        def _sort_key(r):
+            sym = _g(r, "symbol", "")
+            has_pos = sym in held
+            ban = _g(r, "ban_status", "")
+            if has_pos:
+                prio = -1  # pozisyon olanlar en uste
+            elif ban == "BAN":
+                prio = 3
+            elif ban == "COOLDOWN":
+                prio = 2
+            elif _g(r, "signal") != "NONE":
+                prio = 0
+            else:
+                prio = 1
+            return (prio, -(_g(r, "adx", 0) or 0))
+        sorted_r = sorted(results, key=_sort_key)
         new_cache = [self._scan_row_data(i + 1, r) for i, r in enumerate(sorted_r[:60])]
         if new_cache == self._scan_cache:
             return
@@ -829,31 +864,74 @@ class SystemNPanel(ctk.CTkFrame):
         tc = _TREND_COLORS.get(tc_name, "#90A4AE")
         dc = "#CFD8DC"
         W = SN_SCAN_WIDTHS
+
+        # Ban/Cooldown durumu
+        ban_status = _g(r, "ban_status", "")
+        ban_detail = _g(r, "ban_detail", "")
+        if ban_status == "BAN":
+            dur_text = f"BAN {ban_detail}"
+            dur_color = "#FF5252"
+        elif ban_status == "COOLDOWN":
+            dur_text = f"CD {ban_detail}"
+            dur_color = "#FF8A65"
+        else:
+            dur_text = ""
+            dur_color = "#546E7A"
+
+        # Pozisyon bilgisi — elimizde bu coin var mi?
+        symbol = _g(r, "symbol", "")
+        held = getattr(self, "_held_map", {})
+        pos = held.get(symbol)
+        if pos:
+            side = _g(pos, "side", "")
+            is_long = "Buy" in str(side) or "LONG" in str(side).upper()
+            roi = _g(pos, "roi_percent", 0) or 0
+            pnl = _g(pos, "pnl_usdt", 0) or 0
+            dir_ch = "L" if is_long else "S"
+            pos_text = f"{dir_ch} {roi:+.1f}% ${pnl:+.1f}"
+            pos_color = "#00E676" if roi >= 0 else "#FF5252"
+        else:
+            pos_text = ""
+            pos_color = "#546E7A"
+
         return [
             (idx, "#90A4AE", W[0]), (st, sc, W[1]),
-            (_g(r, "symbol", ""), "#FFFFFF", W[2]),
-            (f"{price:.4f}" if price < 1 else f"{price:.2f}", dc, W[3]),
-            (f"{at_now:.4f}" if at_now < 1 else f"{at_now:.2f}", tc, W[4]),
-            (f"{at_2:.4f}" if at_2 < 1 else f"{at_2:.2f}", "#90A4AE", W[5]),
-            ("^" if tc_name == "green" else "v", tc, W[6]),
-            (f"{adx:.1f}", "#FFD54F" if adx > 25 else dc, W[7]),
-            (f"{rsi:.0f}", "#00E676" if rsi > 60 else "#FF5252" if rsi < 40 else dc, W[8]),
-            (f"{mfi:.0f}", dc, W[9]),
-            (f"{atr:.6f}" if atr < 0.01 else f"{atr:.4f}", dc, W[10]),
+            (symbol, "#FFFFFF", W[2]),
+            (dur_text, dur_color, W[3]),
+            (f"{price:.4f}" if price < 1 else f"{price:.2f}", dc, W[4]),
+            (f"{at_now:.4f}" if at_now < 1 else f"{at_now:.2f}", tc, W[5]),
+            (f"{at_2:.4f}" if at_2 < 1 else f"{at_2:.2f}", "#90A4AE", W[6]),
+            ("^" if tc_name == "green" else "v", tc, W[7]),
+            (f"{adx:.1f}", "#FFD54F" if adx > 25 else dc, W[8]),
+            (f"{rsi:.0f}", "#00E676" if rsi > 60 else "#FF5252" if rsi < 40 else dc, W[9]),
+            (f"{mfi:.0f}", dc, W[10]),
+            (f"{atr:.6f}" if atr < 0.01 else f"{atr:.4f}", dc, W[11]),
             ("OK" if _g(r, "adx_static_ok") else "X",
-             "#00E676" if _g(r, "adx_static_ok") else "#FF5252", W[11]),
+             "#00E676" if _g(r, "adx_static_ok") else "#FF5252", W[12]),
             ("OK" if _g(r, "adx_dynamic_ok") else "X",
-             "#00E676" if _g(r, "adx_dynamic_ok") else "#FF5252", W[12]),
+             "#00E676" if _g(r, "adx_dynamic_ok") else "#FF5252", W[13]),
             ("OK" if _g(r, "slope_ok") else "X",
-             "#00E676" if _g(r, "slope_ok") else "#FF5252", W[13]),
+             "#00E676" if _g(r, "slope_ok") else "#FF5252", W[14]),
             ("OK" if _g(r, "final_filter") else "X",
-             "#00E676" if _g(r, "final_filter") else "#FF5252", W[14]),
+             "#00E676" if _g(r, "final_filter") else "#FF5252", W[15]),
+            (pos_text, pos_color, W[16]),
         ]
 
     # ═══════════════════════════════════════════════════
     #  POSITIONS TABLE
     # ═══════════════════════════════════════════════════
     def _update_pos_table(self, positions):
+        # Summary: toplam PnL, marjin, long/short sayisi
+        total_pnl = sum(_g(p, "pnl_usdt", 0) or 0 for p in positions)
+        total_margin = sum(_g(p, "margin_usdt", 0) or 0 for p in positions)
+        longs = sum(1 for p in positions
+                    if "Buy" in str(_g(p, "side", "")) or "LONG" in str(_g(p, "side", "")).upper())
+        shorts = len(positions) - longs
+        pnl_color = "#00E676" if total_pnl >= 0 else "#FF5252"
+        summary = (f"{len(positions)} poz  |  {longs}L / {shorts}S  |  "
+                   f"Marjin: ${total_margin:.1f}  |  PnL: ${total_pnl:+.2f}")
+        self._pos_summary_label.configure(text=summary, text_color=pnl_color)
+
         new_cache = [self._pos_row_data(i + 1, p) for i, p in enumerate(positions)]
         if new_cache == self._pos_cache:
             return
@@ -877,34 +955,60 @@ class SystemNPanel(ctk.CTkFrame):
         size = _g(p, "size", 0) or 0
         margin = _g(p, "margin_usdt", 0) or 0
         entry_time = _g(p, "entry_time", 0) or 0
-        from core.constants import OrderSide
-        is_long = (side == OrderSide.BUY_LONG) if side else True
+        pnl = _g(p, "pnl_usdt", 0) or 0
+        notional = _g(p, "notional", 0) or (current_price * size if current_price > 0 else 0)
+        liq_price = _g(p, "liquidation_price", 0) or 0
+        sl_price = _g(p, "sl", 0) or 0
+        g_pct = _g(p, "entry_bb_width", 0) or 0  # G degeri burada saklaniyor
+
+        is_long = ("Buy" in str(side) or "LONG" in str(side).upper()) if side else True
         dir_text = "^ LONG" if is_long else "v SHORT"
         dir_color = "#00E676" if is_long else "#FF5252"
-        if entry_price > 0 and current_price > 0:
+
+        roi = _g(p, "roi_percent", 0) or 0
+        if roi == 0 and entry_price > 0 and current_price > 0:
             roi = ((current_price - entry_price) / entry_price * 100 * leverage
                    if is_long else
                    (entry_price - current_price) / entry_price * 100 * leverage)
-        else:
-            roi = 0.0
+        pnl_color = "#00E676" if pnl >= 0 else "#FF5252"
         roi_color = "#00E676" if roi >= 0 else "#FF5252"
+
         if entry_time > 0:
             elapsed = time.time() - entry_time
             duration = f"{int(elapsed / 60)} dk" if elapsed < 3600 else f"{elapsed / 3600:.1f} sa"
         else:
             duration = "-"
+
+        def _fmt_price(v):
+            if v <= 0:
+                return "-"
+            return f"{v:.4f}" if v < 1 else f"{v:.2f}"
+
+        # Liq uzaklik rengi: %5'ten yakinsa kirmizi, %10'dan yakinsa turuncu
+        liq_color = "#CFD8DC"
+        if liq_price > 0 and current_price > 0:
+            liq_dist = abs(current_price - liq_price) / current_price * 100
+            if liq_dist < 5:
+                liq_color = "#FF5252"
+            elif liq_dist < 10:
+                liq_color = "#FF8A65"
+
         dc = "#CFD8DC"
         W = SN_POS_WIDTHS
         return [
             (idx, "#90A4AE", W[0]), (symbol, "#FFFFFF", W[1]),
             (dir_text, dir_color, W[2]),
-            (f"{entry_price:.4f}" if entry_price < 1 else f"{entry_price:.2f}", dc, W[3]),
-            (f"{current_price:.4f}" if current_price < 1 else f"{current_price:.2f}", roi_color, W[4]),
+            (_fmt_price(entry_price), dc, W[3]),
+            (_fmt_price(current_price), roi_color, W[4]),
             (f"{roi:+.2f}%", roi_color, W[5]),
-            (f"{leverage}x", dc, W[6]),
-            (f"{size:.4f}", dc, W[7]),
-            (f"${margin:.1f}", dc, W[8]),
-            (duration, "#90A4AE", W[9]),
+            (f"{pnl:+.2f}", pnl_color, W[6]),
+            (f"${margin:.1f}", dc, W[7]),
+            (f"${notional:.1f}", dc, W[8]),
+            (f"{leverage}x", dc, W[9]),
+            (_fmt_price(liq_price), liq_color, W[10]),
+            (_fmt_price(sl_price), "#FFD54F", W[11]),
+            (f"{g_pct:.2f}" if g_pct > 0 else "-", "#26C6DA", W[12]),
+            (duration, "#90A4AE", W[13]),
         ]
 
     # ═══════════════════════════════════════════════════

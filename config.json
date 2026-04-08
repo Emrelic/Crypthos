@@ -727,7 +727,10 @@
       "coin_daily_loss_limit": 3,
       "coin_daily_ban_hours": 8,
       "loss_cooldown_enabled": true,
-      "loss_cooldown_seconds": 600
+      "loss_cooldown_seconds": 600,
+      "reverse_protection_enabled": true,
+      "max_consecutive_reverses": 2,
+      "reverse_window_seconds": 1800
     },
     "backtest_optimizer": {
       "enabled": true,
