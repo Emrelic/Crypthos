@@ -17,6 +17,7 @@ SN_SCAN_HEADERS = [
     "AlphaTrend", "AT[2]", "Trend",
     "ADX", "RSI", "MFI", "ATR",
     "ADX_S", "ADX_D", "Slope", "Filtre",
+    "MACD", "ER", "Ek_F",
     "Pozisyon",
 ]
 SN_SCAN_WIDTHS = [
@@ -24,9 +25,10 @@ SN_SCAN_WIDTHS = [
     92, 92, 54,
     56, 52, 52, 76,
     50, 50, 50, 54,
+    50, 42, 42,
     110,
 ]
-_SN_IMP = {1, 2, 3, 6, 16}
+_SN_IMP = {1, 2, 3, 6, 19}
 
 # ═══ Column Layout: Positions ═══
 SN_POS_HEADERS = [
@@ -930,7 +932,14 @@ class SystemNPanel(ctk.CTkFrame):
              "#00E676" if _g(r, "slope_ok") else "#FF5252", W[14]),
             ("OK" if _g(r, "final_filter") else "X",
              "#00E676" if _g(r, "final_filter") else "#FF5252", W[15]),
-            (pos_text, pos_color, W[16]),
+            # Ek filtre sutunlari
+            ("OK" if _g(r, "macd_aligned", True) else "X",
+             "#00E676" if _g(r, "macd_aligned", True) else "#FF5252", W[16]),
+            (f"{_g(r, 'er', 0):.2f}",
+             "#00E676" if _g(r, "er_ok", True) else "#FF5252", W[17]),
+            ("OK" if _g(r, "extra_filter", True) else "X",
+             "#00E676" if _g(r, "extra_filter", True) else "#FF5252", W[18]),
+            (pos_text, pos_color, W[19]),
         ]
 
     # ═══════════════════════════════════════════════════

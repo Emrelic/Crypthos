@@ -1015,6 +1015,16 @@
       "fixed_pct": 5.0,
       "fee_total_pct": 0.12,
       "server_side": true
+    },
+    "extra_filters": {
+      "enabled": true,
+      "macd_align": true,
+      "rsi_align": true,
+      "rsi_long_min": 40.0,
+      "rsi_short_max": 60.0,
+      "er_filter": true,
+      "er_min": 0.2,
+      "ranging_reject": true
     }
   },
   "system_m": {

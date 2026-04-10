@@ -11108,6 +11108,19 @@ class ScannerStateMachine:
                         buy_signals.append(result)
                     elif result.signal == "SELL":
                         sell_signals.append(result)
+                elif getattr(result, "raw_signal", "NONE") != "NONE":
+                    # Ek filtreden elendi ama AlphaTrend crossover var:
+                    # Mevcut pozisyon varsa cikis/reverse icin raw sinyal kullan
+                    # (filtre sadece yeni giris engellemeli, cikisi degil)
+                    raw_sig = result.raw_signal
+                    if raw_sig == "BUY":
+                        buy_signals.append(result)
+                        logger.info(f"[SysN] {sym}: BUY raw_signal → ek filtre engeli "
+                                    f"({result.reject_reason}), cikis/reverse icin dahil")
+                    elif raw_sig == "SELL":
+                        sell_signals.append(result)
+                        logger.info(f"[SysN] {sym}: SELL raw_signal → ek filtre engeli "
+                                    f"({result.reject_reason}), cikis/reverse icin dahil")
                 else:
                     # Neden sinyal yok — filtre detayları
                     reasons = []
@@ -11337,6 +11350,12 @@ class ScannerStateMachine:
             pos = held_m.get(sym)
 
             if not pos:
+                # Yeni pozisyon acma: ek filtreden elenenleri engelle
+                if not sig.eligible:
+                    self._log_n_decision(sym, "SELL", "ATLA",
+                                         f"ek filtre engeli ({sig.reject_reason}), yeni giriş yok",
+                                         sig.price)
+                    continue
                 # Yeni SHORT açma — cooldown + ban kontrolü
                 if short_enabled:
                     can_open, block_reason = _can_open_new(sym, "SELL")
@@ -11365,7 +11384,10 @@ class ScannerStateMachine:
 
             if pos.side == OrderSide.BUY_LONG:
                 # Çıkış/reverse — close HER ZAMAN serbest
-                if reverse_enabled and short_enabled:
+                # Ek filtre engeli varsa: reverse yerine sadece close
+                # (ters yone yeni giris ek filtre gerektirmeli)
+                can_reverse = sig.eligible  # ek filtre gecti mi?
+                if reverse_enabled and short_enabled and can_reverse:
                     # Reverse kontrolü: ardışık reverse limiti
                     rev_ok, rev_reason = self._check_reverse_allowed_system_n(sym)
                     if not rev_ok:
@@ -11379,7 +11401,11 @@ class ScannerStateMachine:
                         self._log_n_decision(sym, "SELL", "REVERSE→SHORT" if ok else "REVERSE_BAŞARISIZ",
                                              "LONG→SHORT çeviriliyor", sig.price)
                 else:
-                    ok = self._do_close_system_n(sym, pos, "SELL_SIGNAL")
+                    reason = "SELL_SIGNAL"
+                    if not sig.eligible:
+                        reason = "SELL_RAW_SIGNAL"
+                        logger.info(f"[SysN] {sym}: ek filtre engeli → reverse yok, sadece close")
+                    ok = self._do_close_system_n(sym, pos, reason)
                     self._log_n_decision(sym, "SELL", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
                                          "LONG pozisyon kapatılıyor", sig.price)
                 held = self._position_mgr.get_all_positions()
@@ -11392,6 +11418,12 @@ class ScannerStateMachine:
             pos = held_m.get(sym)
 
             if not pos:
+                # Yeni pozisyon acma: ek filtreden elenenleri engelle
+                if not sig.eligible:
+                    self._log_n_decision(sym, "BUY", "ATLA",
+                                         f"ek filtre engeli ({sig.reject_reason}), yeni giriş yok",
+                                         sig.price)
+                    continue
                 # Yeni LONG açma — cooldown + ban kontrolü
                 can_open, block_reason = _can_open_new(sym, "BUY")
                 if not can_open:
@@ -11416,7 +11448,9 @@ class ScannerStateMachine:
 
             if pos.side == OrderSide.SELL_SHORT:
                 # Çıkış/reverse — close HER ZAMAN serbest
-                if reverse_enabled and short_enabled:
+                # Ek filtre engeli varsa: reverse yerine sadece close
+                can_reverse = sig.eligible
+                if reverse_enabled and short_enabled and can_reverse:
                     # Reverse kontrolü: ardışık reverse limiti
                     rev_ok, rev_reason = self._check_reverse_allowed_system_n(sym)
                     if not rev_ok:
@@ -11429,7 +11463,11 @@ class ScannerStateMachine:
                         self._log_n_decision(sym, "BUY", "REVERSE→LONG" if ok else "REVERSE_BAŞARISIZ",
                                              "SHORT→LONG çeviriliyor", sig.price)
                 elif short_enabled:
-                    ok = self._do_close_system_n(sym, pos, "BUY_SIGNAL")
+                    reason = "BUY_SIGNAL"
+                    if not sig.eligible:
+                        reason = "BUY_RAW_SIGNAL"
+                        logger.info(f"[SysN] {sym}: ek filtre engeli → reverse yok, sadece close")
+                    ok = self._do_close_system_n(sym, pos, reason)
                     self._log_n_decision(sym, "BUY", "KAPAT" if ok else "KAPAT_BAŞARISIZ",
                                          "SHORT pozisyon kapatılıyor", sig.price)
                 else:

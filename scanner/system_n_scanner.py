@@ -79,6 +79,18 @@ class SystemNScanResult:
     adx_dynamic_ok: bool
     slope_ok: bool
     final_filter: bool
+    # Ek filtre detaylari (v2 — backtest kaynakli)
+    macd_histogram: float = 0.0
+    macd_aligned: bool = True
+    er: float = 0.5
+    er_ok: bool = True
+    rsi_aligned: bool = True
+    obv_aligned: bool = True
+    regime_ok: bool = True
+    extra_filter: bool = True    # tum ek filtrelerin bilesimi
+    # raw sinyal: ek filtreler uygulanmadan onceki crossover durumu
+    # cikis/reverse kararlari icin kullanilir (filtre sadece yeni girisi engeller)
+    raw_signal: str = "NONE"     # "BUY", "SELL", "NONE"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -156,6 +168,61 @@ def _compute_mfi(high: np.ndarray, low: np.ndarray, close: np.ndarray,
         else:
             mfi[i] = 100.0
     return mfi
+
+
+def _compute_ema(data: np.ndarray, period: int) -> np.ndarray:
+    """Exponential Moving Average."""
+    out = np.full_like(data, np.nan, dtype=float)
+    if len(data) < period:
+        return out
+    out[period - 1] = np.mean(data[:period])
+    mult = 2.0 / (period + 1)
+    for i in range(period, len(data)):
+        out[i] = mult * data[i] + (1 - mult) * out[i - 1]
+    return out
+
+
+def _compute_macd(close: np.ndarray, fast: int = 12, slow: int = 26,
+                  signal: int = 9) -> tuple[float, float]:
+    """MACD histogram ve signal hesapla. Returns: (histogram, signal_line)."""
+    if len(close) < slow + signal:
+        return 0.0, 0.0
+    ema_fast = _compute_ema(close, fast)
+    ema_slow = _compute_ema(close, slow)
+    macd_line = ema_fast - ema_slow
+    # Signal line: MACD line'in EMA'si
+    valid = ~np.isnan(macd_line)
+    if np.sum(valid) < signal:
+        return 0.0, 0.0
+    sig = _compute_ema(macd_line[valid], signal)
+    if len(sig) == 0 or np.isnan(sig[-1]):
+        return 0.0, 0.0
+    histogram = macd_line[valid][-1] - sig[-1]
+    return float(histogram), float(sig[-1])
+
+
+def _compute_efficiency_ratio(close: np.ndarray, period: int = 10) -> float:
+    """Efficiency Ratio: |net move| / sum(|bar moves|). 0=random, 1=trending."""
+    if len(close) < period + 1:
+        return 0.5
+    direction = abs(close[-1] - close[-period - 1])
+    volatility = np.sum(np.abs(np.diff(close[-period - 1:])))
+    if volatility < 1e-12:
+        return 0.5
+    return float(direction / volatility)
+
+
+def _compute_obv_above_sma(close: np.ndarray, volume: np.ndarray,
+                           sma_period: int = 20) -> bool:
+    """OBV > OBV SMA(20) kontrolu."""
+    if len(close) < sma_period + 1:
+        return False
+    signs = np.sign(np.diff(close))
+    obv = np.concatenate([[0.0], np.cumsum(signs * volume[1:])])
+    obv_sma = _sma(obv, sma_period)
+    if np.isnan(obv_sma[-1]):
+        return False
+    return bool(obv[-1] > obv_sma[-1])
 
 
 def _compute_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray,
@@ -535,6 +602,66 @@ class SystemNScanner:
 
         final_filter = adx_static_ok and adx_dynamic_ok and slope_ok
 
+        # ═══ EK FİLTRELER (v2 — backtest analizi kaynakli) ═══
+
+        extra_cfg = cfg.get("extra_filters", {})
+        use_extra = extra_cfg.get("enabled", True)
+
+        # -- MACD histogram --
+        macd_hist, _macd_sig = _compute_macd(closes, 12, 26, 9)
+
+        # -- Efficiency Ratio --
+        er_val = _compute_efficiency_ratio(closes, 10)
+
+        # -- OBV yön uyumu --
+        obv_above = _compute_obv_above_sma(closes, volumes, 20)
+
+        # -- Rejim kontrolu (SYNCED:RANGING filtresi) --
+        coin_regime = coin_params.get("regime", "")
+
+        # Varsayilan: filtreler aktif degil ise hepsi True
+        macd_aligned = True
+        rsi_aligned = True
+        er_ok = True
+        obv_aligned = True
+        regime_ok = True
+
+        if use_extra:
+            # 4. MACD histogram yon uyumu
+            if extra_cfg.get("macd_align", True):
+                # BUY/crossover → hist > 0, SELL/crossunder → hist < 0
+                # Sinyal henuz belli degil, crossover bazli kontrol
+                buy_cross_raw = (at_now > at_2) and (at_1 <= at_3)
+                sell_cross_raw = (at_now < at_2) and (at_1 >= at_3)
+                if buy_cross_raw:
+                    macd_aligned = macd_hist > 0
+                elif sell_cross_raw:
+                    macd_aligned = macd_hist < 0
+                # Crossover yoksa filtre uygulanmaz (True kalir)
+
+            # 5. RSI yon uyumu
+            if extra_cfg.get("rsi_align", True):
+                rsi_long_min = extra_cfg.get("rsi_long_min", 40.0)
+                rsi_short_max = extra_cfg.get("rsi_short_max", 60.0)
+                buy_cross_raw = (at_now > at_2) and (at_1 <= at_3)
+                sell_cross_raw = (at_now < at_2) and (at_1 >= at_3)
+                if buy_cross_raw:
+                    rsi_aligned = rsi_val > rsi_long_min
+                elif sell_cross_raw:
+                    rsi_aligned = rsi_val < rsi_short_max
+
+            # 6. ER minimum esik
+            if extra_cfg.get("er_filter", True):
+                er_min = extra_cfg.get("er_min", 0.2)
+                er_ok = er_val > er_min
+
+            # 7. Rejim filtresi (SYNCED:RANGING reddi)
+            if extra_cfg.get("ranging_reject", True):
+                regime_ok = coin_regime != "RANGING"
+
+        extra_filter = macd_aligned and rsi_aligned and er_ok and regime_ok
+        final_filter = final_filter and extra_filter
+
         # ═══ SİNYAL TESPİTİ ═══
 
         # Crossover/Crossunder: AlphaTrend vs AlphaTrend[2]
@@ -542,6 +669,13 @@ class SystemNScanner:
         # at_now > at_2 AND at_1 <= at_3
         buy_cross = (at_now > at_2) and (at_1 <= at_3)
         sell_cross = (at_now < at_2) and (at_1 >= at_3)
+
+        # Mevcut filtreler (ADX + slope) geçen sinyal
+        base_filter = adx_static_ok and adx_dynamic_ok and slope_ok
+        # raw_signal: ek filtreler OLMADAN, sadece mevcut filtreler ile sinyal
+        # Cikis/reverse kararlari icin kullanilir
+        raw_buy = buy_cross and base_filter
+        raw_sell = sell_cross and base_filter
 
         buy_filtered = buy_cross and final_filter
         sell_filtered = sell_cross and final_filter
@@ -562,21 +696,27 @@ class SystemNScanner:
         with self._lock:
             prev_direction = self._coin_trend_direction.get(symbol, 0)
 
+            # Trend yonu RAW sinyal bazli guncellenir (ek filtrelerden bagimsiz)
+            # Boylece ek filtre engellese bile trend yonu dogru kalir
             new_direction = prev_direction
-            if buy_filtered:
+            if raw_buy:
                 new_direction = 1
-            elif sell_filtered:
+            elif raw_sell:
                 new_direction = -1
 
             # Sinyal sadece yön DEĞİŞİNCE üretilir
             if prev_direction == 0:
                 # İlk kez görülen coin: crossover taze ise sinyal ver
-                # (eski/zayıflayan crossover'da sinyal üretme — geç giriş riski)
                 plot_buy = buy_filtered and cross_momentum_alive
                 plot_sell = sell_filtered and not buy_filtered and cross_momentum_alive
+                # Raw sinyal (ek filtresiz) — cikis/reverse icin
+                raw_plot_buy = raw_buy and cross_momentum_alive
+                raw_plot_sell = raw_sell and not raw_buy and cross_momentum_alive
             else:
                 plot_buy = buy_filtered and prev_direction != 1
                 plot_sell = sell_filtered and prev_direction != -1
+                raw_plot_buy = raw_buy and prev_direction != 1
+                raw_plot_sell = raw_sell and prev_direction != -1
 
             self._coin_trend_direction[symbol] = new_direction
 
@@ -600,8 +740,31 @@ class SystemNScanner:
             signal = "SELL"
             direction = "SHORT"
 
+        # Raw sinyal (ek filtre olmadan): cikis/reverse kararlari icin
+        raw_signal = "NONE"
+        if raw_plot_buy:
+            raw_signal = "BUY"
+        elif raw_plot_sell:
+            raw_signal = "SELL"
+
         eligible = signal != "NONE"
-        reject_reason = "" if eligible else "no_signal"
+        # Reject reason: ek filtre bilgisi
+        if not eligible:
+            if not extra_filter:
+                reasons = []
+                if not macd_aligned:
+                    reasons.append("MACD_UYUMSUZ")
+                if not rsi_aligned:
+                    reasons.append("RSI_UYUMSUZ")
+                if not er_ok:
+                    reasons.append(f"ER_DUSUK({er_val:.2f})")
+                if not regime_ok:
+                    reasons.append("RANGING_REJIM")
+                reject_reason = "+".join(reasons) if reasons else "no_signal"
+            else:
+                reject_reason = "no_signal"
+        else:
+            reject_reason = ""
 
         return SystemNScanResult(
             symbol=symbol,
@@ -622,6 +785,16 @@ class SystemNScanner:
             adx_dynamic_ok=adx_dynamic_ok,
             slope_ok=slope_ok,
             final_filter=final_filter,
+            # Ek filtre detaylari
+            macd_histogram=macd_hist,
+            macd_aligned=macd_aligned,
+            er=er_val,
+            er_ok=er_ok,
+            rsi_aligned=rsi_aligned,
+            obv_aligned=obv_above if use_extra else True,
+            regime_ok=regime_ok,
+            extra_filter=extra_filter,
+            raw_signal=raw_signal,
         )
 
     def reconstruct_state_from_positions(self, positions: dict) -> int:
@@ -733,4 +906,7 @@ class SystemNScanner:
             eligible=False, reject_reason=reason,
             adx_static_ok=False, adx_dynamic_ok=False,
             slope_ok=False, final_filter=False,
+            macd_histogram=0.0, macd_aligned=False,
+            er=0.5, er_ok=False, rsi_aligned=False,
+            obv_aligned=False, regime_ok=False, extra_filter=False,
         )
