@@ -978,6 +978,7 @@
     "reverse_enabled": true,
     "reverse_sizing": "fresh",
     "max_leverage": 150,
+    "max_leverage_cap": 20,
     "indicators": {
       "coeff": 3.6,
       "period": 27,
@@ -1010,21 +1011,21 @@
     "sl": {
       "enabled": true,
       "mode": "g_based",
-      "g_mult": 1.5,
+      "g_mult": 2.5,
       "atr_mult": 2.0,
       "fixed_pct": 5.0,
       "fee_total_pct": 0.12,
       "server_side": true
     },
     "extra_filters": {
-      "enabled": true,
+      "enabled": false,
       "macd_align": false,
       "rsi_align": false,
       "rsi_long_min": 40.0,
       "rsi_short_max": 60.0,
-      "er_filter": true,
+      "er_filter": false,
       "er_min": 0.2,
-      "ranging_reject": true
+      "ranging_reject": false
     }
   },
   "system_m": {

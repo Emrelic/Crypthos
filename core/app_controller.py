@@ -360,6 +360,18 @@ class AppController:
             return self.scanner.scan_count
         return 0
 
+    def reset_system_n_state(self) -> bool:
+        """System N scanner trend state'ini sifirla.
+        Tum pozisyonlar kapatildiktan sonra cagirilmali.
+        """
+        if self.scanner and hasattr(self.scanner, '_system_n_scanner'):
+            sn = self.scanner._system_n_scanner
+            if sn is not None:
+                sn.reset_state()
+                logger.info("[AppCtrl] System N state reset — tum coin trend yonleri sifirlandi")
+                return True
+        return False
+
     def get_banned_symbols(self) -> dict[str, dict]:
         if self.scanner:
             return self.scanner.get_banned_symbols()

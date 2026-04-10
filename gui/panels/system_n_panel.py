@@ -331,6 +331,15 @@ class SystemNPanel(ctk.CTkFrame):
              ).pack(side="left"),
              "(aktifken diger sistemler devre disi kalir)")
 
+        # State Reset butonu
+        _row(scroll, "Trend State Sifirla:",
+             lambda r: ctk.CTkButton(
+                 r, text="RESET STATE", width=130, height=30,
+                 fg_color="#FF5252", hover_color="#D32F2F",
+                 command=self._reset_system_n_state,
+             ).pack(side="left"),
+             "(tum pozisyonlar kapatildiktan sonra kullanin)")
+
         # ═══════════════════════════════════════════════
         #  TRADE MODU
         # ═══════════════════════════════════════════════
@@ -384,7 +393,15 @@ class SystemNPanel(ctk.CTkFrame):
         _row(scroll, "Max Kaldirac:",
              lambda r: ctk.CTkEntry(r, textvariable=self._max_lev_var,
                                      width=80).pack(side="left"),
-             "(G-bazli hesaplanan kaldiracin ust siniri)")
+             "(Binance API max siniri)")
+
+        # Kaldirac cap (backtest sonucu guvenlik siniri)
+        self._max_lev_cap_var = ctk.StringVar(
+            value=str(cfg.get("system_n.max_leverage_cap", 20)))
+        _row(scroll, "Kaldirac Cap:",
+             lambda r: ctk.CTkEntry(r, textvariable=self._max_lev_cap_var,
+                                     width=80).pack(side="left"),
+             "(0=sinir yok, 20=max 20x — likidasyon koruma)")
 
         # Scan interval
         self._scan_interval_var = ctk.StringVar(
@@ -793,6 +810,18 @@ class SystemNPanel(ctk.CTkFrame):
             scroll, text="", font=ctk.CTkFont(size=12), text_color="#00E676")
         self._save_status.pack()
 
+    def _reset_system_n_state(self) -> None:
+        """System N trend state'ini sifirla (close all sonrasi)."""
+        ok = self.controller.reset_system_n_state()
+        if ok:
+            self._stats_label.configure(
+                text="STATE SIFIRLANDI — tum coin trend yonleri temizlendi",
+                text_color="#00E676")
+        else:
+            self._stats_label.configure(
+                text="HATA: Scanner henuz baslatilmamis",
+                text_color="#FF5252")
+
     def _save_settings(self) -> None:
         """Tum ayarlari config'e kaydet."""
         cfg = self.controller.config
@@ -838,6 +867,7 @@ class SystemNPanel(ctk.CTkFrame):
             # Numeric fields (safe parse)
             _nums = [
                 ("system_n.max_leverage", self._max_lev_var, int),
+                ("system_n.max_leverage_cap", self._max_lev_cap_var, int),
                 ("system_n.scan_interval_seconds", self._scan_interval_var, int),
                 ("system_n.kline_limit", self._kline_limit_var, int),
                 ("system_n.coin_sayisi", self._coin_sayisi_var, int),

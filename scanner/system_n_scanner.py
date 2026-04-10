@@ -504,7 +504,11 @@ class SystemNScanner:
 
         max_lev = int(100.0 / teorik_liq)
         max_cfg = self._cfg("max_leverage", 125)
-        return max(1, min(max_lev, max_cfg))
+        max_cap = self._cfg("max_leverage_cap", 0)
+        result = max(1, min(max_lev, max_cfg))
+        if max_cap > 0:
+            result = min(result, max_cap)
+        return result
 
     def analyze_symbol(self, symbol: str, klines: list,
                        volume_data: bool = True) -> SystemNScanResult:
