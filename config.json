@@ -1018,8 +1018,8 @@
     },
     "extra_filters": {
       "enabled": true,
-      "macd_align": true,
-      "rsi_align": true,
+      "macd_align": false,
+      "rsi_align": false,
       "rsi_long_min": 40.0,
       "rsi_short_max": 60.0,
       "er_filter": true,

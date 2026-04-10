@@ -633,6 +633,90 @@ class SystemNPanel(ctk.CTkFrame):
              "(0.001 = %0.1)")
 
         # ═══════════════════════════════════════════════
+        #  EK FILTRELER (Backtest Kaynakli)
+        # ═══════════════════════════════════════════════
+        ctk.CTkLabel(scroll, text="EK FILTRELER (Backtest Kaynakli)",
+                     font=hdr_font, text_color="#FFD54F").pack(anchor="w", pady=(16, 4))
+        ctk.CTkLabel(scroll, text="AlphaTrend sinyali uzerine ek kontroller. "
+                     "Sadece yeni girisi engeller, cikis/reverse etkilenmez.",
+                     font=hint_font, text_color=hint_c,
+                     wraplength=600).pack(anchor="w", pady=(0, 4))
+
+        # Ek filtreler ana switch
+        self._extra_enabled_var = ctk.BooleanVar(
+            value=cfg.get("system_n.extra_filters.enabled", True))
+        _row(scroll, "Ek Filtreler Aktif:",
+             lambda r: ctk.CTkSwitch(
+                 r, variable=self._extra_enabled_var, text="",
+                 command=self._save_settings,
+                 progress_color="#FFD54F",
+             ).pack(side="left"),
+             "(kapali: tum ek filtreler devre disi)")
+
+        # MACD alignment
+        self._extra_macd_var = ctk.BooleanVar(
+            value=cfg.get("system_n.extra_filters.macd_align", True))
+        _row(scroll, "MACD Yon Uyumu:",
+             lambda r: ctk.CTkSwitch(
+                 r, variable=self._extra_macd_var, text="",
+                 command=self._save_settings,
+             ).pack(side="left"),
+             "(LONG: hist>0, SHORT: hist<0)")
+
+        # RSI alignment
+        self._extra_rsi_var = ctk.BooleanVar(
+            value=cfg.get("system_n.extra_filters.rsi_align", True))
+        _row(scroll, "RSI Yon Uyumu:",
+             lambda r: ctk.CTkSwitch(
+                 r, variable=self._extra_rsi_var, text="",
+                 command=self._save_settings,
+             ).pack(side="left"))
+
+        # RSI long min
+        self._extra_rsi_long_min_var = ctk.StringVar(
+            value=str(cfg.get("system_n.extra_filters.rsi_long_min", 40.0)))
+        _row(scroll, "  RSI Long Min:",
+             lambda r: ctk.CTkEntry(r, textvariable=self._extra_rsi_long_min_var,
+                                     width=60).pack(side="left"),
+             "(LONG icin min RSI)")
+
+        # RSI short max
+        self._extra_rsi_short_max_var = ctk.StringVar(
+            value=str(cfg.get("system_n.extra_filters.rsi_short_max", 60.0)))
+        _row(scroll, "  RSI Short Max:",
+             lambda r: ctk.CTkEntry(r, textvariable=self._extra_rsi_short_max_var,
+                                     width=60).pack(side="left"),
+             "(SHORT icin max RSI)")
+
+        # ER filter
+        self._extra_er_var = ctk.BooleanVar(
+            value=cfg.get("system_n.extra_filters.er_filter", True))
+        _row(scroll, "ER Filtresi:",
+             lambda r: ctk.CTkSwitch(
+                 r, variable=self._extra_er_var, text="",
+                 command=self._save_settings,
+             ).pack(side="left"),
+             "(random walk eleme)")
+
+        # ER min
+        self._extra_er_min_var = ctk.StringVar(
+            value=str(cfg.get("system_n.extra_filters.er_min", 0.2)))
+        _row(scroll, "  ER Min Esik:",
+             lambda r: ctk.CTkEntry(r, textvariable=self._extra_er_min_var,
+                                     width=60).pack(side="left"),
+             "(0.2 = %20 verimlilik)")
+
+        # RANGING reject
+        self._extra_ranging_var = ctk.BooleanVar(
+            value=cfg.get("system_n.extra_filters.ranging_reject", True))
+        _row(scroll, "RANGING Reddi:",
+             lambda r: ctk.CTkSwitch(
+                 r, variable=self._extra_ranging_var, text="",
+                 command=self._save_settings,
+             ).pack(side="left"),
+             "(SYNCED:RANGING rejiminde giris yok)")
+
+        # ═══════════════════════════════════════════════
         #  STOP LOSS (OPSIYONEL)
         # ═══════════════════════════════════════════════
         ctk.CTkLabel(scroll, text="STOP LOSS (OPSIYONEL)",
@@ -730,6 +814,13 @@ class SystemNPanel(ctk.CTkFrame):
             cfg.set("system_n.indicators.use_adx_dynamic", self._use_adx_dynamic_var.get())
             cfg.set("system_n.indicators.use_slope", self._use_slope_var.get())
 
+            # Ek filtreler (switches)
+            cfg.set("system_n.extra_filters.enabled", self._extra_enabled_var.get())
+            cfg.set("system_n.extra_filters.macd_align", self._extra_macd_var.get())
+            cfg.set("system_n.extra_filters.rsi_align", self._extra_rsi_var.get())
+            cfg.set("system_n.extra_filters.er_filter", self._extra_er_var.get())
+            cfg.set("system_n.extra_filters.ranging_reject", self._extra_ranging_var.get())
+
             # SL switches
             cfg.set("system_n.sl.enabled", self._sl_enabled_var.get())
             cfg.set("system_n.sl.mode", self._sl_mode_var.get())
@@ -766,6 +857,9 @@ class SystemNPanel(ctk.CTkFrame):
                 ("system_n.position.max_same_direction", self._max_same_dir_var, int),
                 ("system_n.filters.min_volume_24h_usdt", self._min_vol_var, int),
                 ("system_n.filters.funding_rate_max", self._fr_max_var, float),
+                ("system_n.extra_filters.rsi_long_min", self._extra_rsi_long_min_var, float),
+                ("system_n.extra_filters.rsi_short_max", self._extra_rsi_short_max_var, float),
+                ("system_n.extra_filters.er_min", self._extra_er_min_var, float),
                 ("system_n.sl.g_mult", self._sl_g_mult_var, float),
                 ("system_n.sl.atr_mult", self._sl_atr_mult_var, float),
                 ("system_n.sl.fixed_pct", self._sl_fixed_pct_var, float),
