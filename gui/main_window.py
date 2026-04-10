@@ -82,28 +82,37 @@ class MainWindow(ctk.CTk):
         self._view_switch = _sw_frame  # pack reference olarak kullan
         logger.info("[VIEW] View switch buttons created")
 
-        # ═══ SYSTEM TABS (sadece aktif sistemler baştan, diğerleri lazy) ═══
+        # ═══ SYSTEM TABS ═══
         self._sys_tabview = ctk.CTkTabview(self)
 
-        # Aktif sistemleri baştan oluştur
+        # Tüm sistem sekmeleri — öncelik sırasıyla
         tab_n = self._sys_tabview.add("N")
         tab_m = self._sys_tabview.add("M")
+        tab_j = self._sys_tabview.add("J")
+        tab_i = self._sys_tabview.add("I")
+        tab_h = self._sys_tabview.add("H")
+        tab_g = self._sys_tabview.add("G")
+        tab_f = self._sys_tabview.add("F")
+        tab_e = self._sys_tabview.add("E")
+        tab_d = self._sys_tabview.add("D")
+        tab_c = self._sys_tabview.add("C")
+        tab_b = self._sys_tabview.add("B")
+        tab_a = self._sys_tabview.add("A")
 
         self._system_n_panel = SystemNPanel(tab_n, controller)
         self._system_m_panel = SystemMPanel(tab_m, controller)
-        self._sys_tabview.set("N")
+        self._system_j_panel = SystemJPanel(tab_j, controller)
+        self._system_i_panel = SystemIPanel(tab_i, controller)
+        self._system_h_panel = SystemHPanel(tab_h, controller)
+        self._system_g_panel = SystemGPanel(tab_g, controller)
+        self._system_f_panel = SystemFPanel(tab_f, controller)
+        self._system_e_panel = SystemEPanel(tab_e, controller)
+        self._system_d_panel = SystemDPanel(tab_d, controller)
+        self._system_c_panel = SystemCPanel(tab_c, controller)
+        self._system_b_panel = SystemBPanel(tab_b, controller)
+        self._scanner_panel = ScannerPanel(tab_a, controller)
 
-        # Pasif sistemler — placeholder (lazy-load, widget limiti koruması)
-        self._system_j_panel = None
-        self._system_i_panel = None
-        self._scanner_panel = None
-        self._system_b_panel = None
-        self._system_c_panel = None
-        self._system_d_panel = None
-        self._system_e_panel = None
-        self._system_f_panel = None
-        self._system_g_panel = None
-        self._system_h_panel = None
+        self._sys_tabview.set("N")
 
         # ═══ TOOL TABS (lazy — built on first Araclar click) ═══
         self._tool_tabview = None
