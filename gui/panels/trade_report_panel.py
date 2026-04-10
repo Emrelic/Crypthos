@@ -1,5 +1,7 @@
+import tkinter as tk
 import customtkinter as ctk
 from datetime import datetime, timedelta
+from tkcalendar import Calendar
 from loguru import logger
 
 
@@ -51,31 +53,60 @@ class TradeReportPanel(ctk.CTkFrame):
         ctk.CTkLabel(filter_frame, text="Islem Raporu",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(side="left", padx=10)
 
-        # Date filters
-        ctk.CTkLabel(filter_frame, text="Baslangic:",
-                     font=ctk.CTkFont(size=12)).pack(side="left", padx=(20, 5))
-        self._start_entry = ctk.CTkEntry(filter_frame, width=150, placeholder_text="2026-03-12 00:00")
-        self._start_entry.pack(side="left", padx=2)
-        # Default: 24 hours ago
-        default_start = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
-        self._start_entry.insert(0, default_start)
+        # ── Date-Time Picker: Takvim popup + saat/dakika ──
+        now = datetime.now()
+        ago24 = now - timedelta(hours=24)
 
+        # Başlangıç
+        ctk.CTkLabel(filter_frame, text="Baslangic:",
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(15, 3))
+        self._start_btn = ctk.CTkButton(
+            filter_frame, text=ago24.strftime("%Y-%m-%d %H:%M"),
+            width=145, height=28, font=ctk.CTkFont(size=12),
+            fg_color="#263238", hover_color="#37474F", border_width=1,
+            border_color="#546E7A", anchor="center",
+            command=lambda: self._open_datetime_picker("start"))
+        self._start_btn.pack(side="left", padx=2)
+
+        # Bitiş
         ctk.CTkLabel(filter_frame, text="Bitis:",
-                     font=ctk.CTkFont(size=12)).pack(side="left", padx=(15, 5))
-        self._end_entry = ctk.CTkEntry(filter_frame, width=150, placeholder_text="2026-03-13 23:59")
-        self._end_entry.pack(side="left", padx=2)
-        default_end = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self._end_entry.insert(0, default_end)
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 3))
+        self._end_btn = ctk.CTkButton(
+            filter_frame, text=now.strftime("%Y-%m-%d %H:%M"),
+            width=145, height=28, font=ctk.CTkFont(size=12),
+            fg_color="#263238", hover_color="#37474F", border_width=1,
+            border_color="#546E7A", anchor="center",
+            command=lambda: self._open_datetime_picker("end"))
+        self._end_btn.pack(side="left", padx=2)
+
+        # Uyumluluk: _start_entry / _end_entry arayüzü
+        class _BtnDateAccessor:
+            def __init__(self, btn):
+                self._btn = btn
+            def get(self):
+                return self._btn.cget("text")
+            def delete(self, *a):
+                pass
+            def insert(self, idx, val):
+                self._btn.configure(text=val.strip())
+            def strip(self):
+                return self.get().strip()
+        self._start_entry = _BtnDateAccessor(self._start_btn)
+        self._end_entry = _BtnDateAccessor(self._end_btn)
 
         # Quick filter buttons
-        ctk.CTkButton(filter_frame, text="Son 24s", width=70, height=28,
-                      command=lambda: self._quick_range(24)).pack(side="left", padx=(15, 3))
-        ctk.CTkButton(filter_frame, text="Son 7g", width=60, height=28,
-                      command=lambda: self._quick_range(168)).pack(side="left", padx=3)
-        ctk.CTkButton(filter_frame, text="Son 30g", width=60, height=28,
-                      command=lambda: self._quick_range(720)).pack(side="left", padx=3)
-        ctk.CTkButton(filter_frame, text="Tumu", width=50, height=28,
-                      command=self._show_all).pack(side="left", padx=3)
+        quick_frame = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        quick_frame.pack(side="left", padx=(10, 0))
+        for text, hours in [("1s", 1), ("4s", 4), ("12s", 12), ("24s", 24),
+                            ("2g", 48), ("3g", 72), ("7g", 168), ("30g", 720)]:
+            ctk.CTkButton(quick_frame, text=text, width=38, height=26,
+                          font=ctk.CTkFont(size=11),
+                          fg_color="#37474F", hover_color="#455A64",
+                          command=lambda h=hours: self._quick_range(h)).pack(side="left", padx=1)
+        ctk.CTkButton(quick_frame, text="Tumu", width=42, height=26,
+                      font=ctk.CTkFont(size=11),
+                      fg_color="#37474F", hover_color="#455A64",
+                      command=self._show_all).pack(side="left", padx=1)
 
         # Config period filter
         ctk.CTkLabel(filter_frame, text="Config:",
@@ -195,6 +226,102 @@ class TradeReportPanel(ctk.CTkFrame):
                                 text_color=color)
         val_lbl.pack(pady=(0, 4))
         self._summary_cards[key] = val_lbl
+
+    def _open_datetime_picker(self, which: str) -> None:
+        """Takvim + saat/dakika seçici popup aç."""
+        # Mevcut değeri parse et
+        btn = self._start_btn if which == "start" else self._end_btn
+        current_text = btn.cget("text")
+        try:
+            current_dt = datetime.strptime(current_text, "%Y-%m-%d %H:%M")
+        except ValueError:
+            current_dt = datetime.now()
+
+        # Popup pencere
+        popup = tk.Toplevel(self)
+        popup.title("Tarih & Saat Sec" if which == "start" else "Bitis Tarih & Saat")
+        popup.geometry("320x360")
+        popup.resizable(False, False)
+        popup.configure(bg="#1a1a2e")
+        popup.attributes("-topmost", True)
+        popup.grab_set()
+
+        # Takvim widget'ı
+        cal = Calendar(popup, selectmode="day",
+                       year=current_dt.year, month=current_dt.month, day=current_dt.day,
+                       date_pattern="yyyy-mm-dd",
+                       background="#1a1a2e", foreground="white",
+                       selectbackground="#3d5afe", selectforeground="white",
+                       normalbackground="#263238", normalforeground="white",
+                       weekendbackground="#1a1a2e", weekendforeground="#90A4AE",
+                       headersbackground="#0d47a1", headersforeground="white",
+                       bordercolor="#37474F", othermonthforeground="#546E7A",
+                       othermonthwebackground="#1a1a2e",
+                       font=("Segoe UI", 11))
+        cal.pack(padx=10, pady=(10, 5), fill="x")
+
+        # Saat & Dakika seçici
+        time_frame = tk.Frame(popup, bg="#1a1a2e")
+        time_frame.pack(pady=5)
+
+        tk.Label(time_frame, text="Saat:", bg="#1a1a2e", fg="white",
+                 font=("Segoe UI", 11)).pack(side="left", padx=(0, 5))
+        hour_var = tk.StringVar(value=f"{current_dt.hour:02d}")
+        hour_spin = tk.Spinbox(time_frame, from_=0, to=23, width=3, wrap=True,
+                               textvariable=hour_var, format="%02.0f",
+                               font=("Segoe UI", 14), justify="center",
+                               bg="#263238", fg="white", buttonbackground="#37474F",
+                               insertbackground="white")
+        hour_spin.pack(side="left", padx=2)
+
+        tk.Label(time_frame, text=":", bg="#1a1a2e", fg="white",
+                 font=("Segoe UI", 14, "bold")).pack(side="left")
+
+        minute_var = tk.StringVar(value=f"{current_dt.minute:02d}")
+        minute_spin = tk.Spinbox(time_frame, from_=0, to=59, width=3, wrap=True,
+                                 textvariable=minute_var, format="%02.0f",
+                                 increment=5, font=("Segoe UI", 14), justify="center",
+                                 bg="#263238", fg="white", buttonbackground="#37474F",
+                                 insertbackground="white")
+        minute_spin.pack(side="left", padx=2)
+
+        # Hızlı saat butonları
+        quick_time = tk.Frame(popup, bg="#1a1a2e")
+        quick_time.pack(pady=3)
+        for label, h, m in [("00:00", 0, 0), ("06:00", 6, 0), ("12:00", 12, 0),
+                            ("18:00", 18, 0), ("Simdi", -1, -1), ("23:59", 23, 59)]:
+            def _set_time(hh=h, mm=m):
+                if hh == -1:
+                    n = datetime.now()
+                    hour_var.set(f"{n.hour:02d}")
+                    minute_var.set(f"{n.minute:02d}")
+                else:
+                    hour_var.set(f"{hh:02d}")
+                    minute_var.set(f"{mm:02d}")
+            tk.Button(quick_time, text=label, width=6, bg="#37474F", fg="white",
+                      activebackground="#455A64", activeforeground="white",
+                      relief="flat", font=("Segoe UI", 9),
+                      command=_set_time).pack(side="left", padx=2)
+
+        # Onay butonu
+        def _confirm():
+            date_str = cal.get_date()
+            h = int(hour_var.get())
+            m = int(minute_var.get())
+            result = f"{date_str} {h:02d}:{m:02d}"
+            btn.configure(text=result)
+            popup.destroy()
+
+        confirm_frame = tk.Frame(popup, bg="#1a1a2e")
+        confirm_frame.pack(pady=(10, 5))
+        tk.Button(confirm_frame, text="  Uygula  ", bg="#00C853", fg="white",
+                  activebackground="#00E676", activeforeground="white",
+                  relief="flat", font=("Segoe UI", 12, "bold"),
+                  command=_confirm).pack(side="left", padx=5)
+        tk.Button(confirm_frame, text="  Iptal  ", bg="#455A64", fg="white",
+                  activebackground="#546E7A", activeforeground="white",
+                  relief="flat", font=("Segoe UI", 12),
+                  command=popup.destroy).pack(side="left", padx=5)
 
     def _quick_range(self, hours: int) -> None:
         self._start_entry.delete(0, "end")

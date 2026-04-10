@@ -257,7 +257,8 @@ class SystemMPanel(ctk.CTkFrame):
 
     def _refresh_loop(self) -> None:
         try:
-            self._update_all()
+            if self.winfo_viewable():
+                self._update_all()
         except Exception as e:
             logger.error(f"[SysM Panel] refresh error: {e}")
         self.after(2000, self._refresh_loop)

@@ -19,7 +19,7 @@ class CCI(Indicator):
         mad = tp.rolling(self.period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
         cci = (tp - sma) / (0.015 * mad + 1e-10)
         self._value = cci.iloc[-1] if not cci.empty else 0.0
-        self._series = cci
+        self._series = cci.iloc[-20:].reset_index(drop=True)
 
     def get_values(self) -> dict:
         return {"CCI": round(self._value, 2)}
@@ -62,7 +62,7 @@ class MFI(Indicator):
         mfr = pos_mf / (neg_mf + 1e-10)
         mfi = 100 - (100 / (1 + mfr))
         self._value = mfi.iloc[-1] if not mfi.empty else 0.0
-        self._series = mfi
+        self._series = mfi.iloc[-20:].reset_index(drop=True)
 
     def get_values(self) -> dict:
         return {"MFI": round(self._value, 2)}

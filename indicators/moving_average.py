@@ -10,7 +10,7 @@ class SMA(Indicator):
 
     def compute(self, df: pd.DataFrame) -> pd.Series:
         sma = df["close"].rolling(window=self.period).mean()
-        self._series = sma
+        self._series = sma.iloc[-20:].reset_index(drop=True)
         self._prev_value = sma.iloc[-2] if len(sma) >= 2 else None
         self._last_value = sma.iloc[-1] if len(sma) >= 1 else None
         return sma
@@ -24,7 +24,7 @@ class EMA(Indicator):
 
     def compute(self, df: pd.DataFrame) -> pd.Series:
         ema = df["close"].ewm(span=self.period, adjust=False).mean()
-        self._series = ema
+        self._series = ema.iloc[-20:].reset_index(drop=True)
         self._prev_value = ema.iloc[-2] if len(ema) >= 2 else None
         self._last_value = ema.iloc[-1] if len(ema) >= 1 else None
         return ema

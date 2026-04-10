@@ -233,6 +233,14 @@ class OrderLogger:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_trades_by_symbol(self, symbol: str, limit: int = 100) -> list[dict]:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM trades WHERE symbol = ? ORDER BY close_time DESC LIMIT ?",
+                (symbol, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_orders_by_symbol(self, symbol: str, limit: int = 50) -> list[dict]:
         with self._lock:
             cursor = self._conn.execute(

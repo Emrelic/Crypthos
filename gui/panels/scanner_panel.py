@@ -291,30 +291,31 @@ class ScannerPanel(ctk.CTkFrame):
         self._refresh()
 
     def _refresh(self):
-        try:
-            self._update_state()
-            self._update_alerts()
-        except Exception:
-            pass
-        try:
-            self._update_results()
-        except Exception:
-            pass
-        try:
-            self._update_mr_results()
-        except Exception:
-            pass
-        try:
-            self._update_position()
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"Refresh position error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-        try:
-            self._update_trade()
-        except Exception:
-            pass
+        if self.winfo_viewable():
+            try:
+                self._update_state()
+                self._update_alerts()
+            except Exception:
+                pass
+            try:
+                self._update_results()
+            except Exception:
+                pass
+            try:
+                self._update_mr_results()
+            except Exception:
+                pass
+            try:
+                self._update_position()
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"Refresh position error: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+            try:
+                self._update_trade()
+            except Exception:
+                pass
         self.after(4000, self._refresh)
 
     def _get_status_bar(self):

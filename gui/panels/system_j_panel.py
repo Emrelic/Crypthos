@@ -164,7 +164,8 @@ class SystemJPanel(ctk.CTkFrame):
 
     def _refresh_loop(self):
         try:
-            self._update_all()
+            if self.winfo_viewable():
+                self._update_all()
         except Exception as e:
             logger.error(f"[SysJ Panel] refresh error: {e}")
         self._refresh_job = self.after(2000, self._refresh_loop)

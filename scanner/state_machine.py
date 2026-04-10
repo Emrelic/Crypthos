@@ -1,6 +1,7 @@
 """Scanner State Machine - orchestrates the SCANNING->BUYING->SELLING cycle.
 Single thread, sequential state transitions.
 Supports up to max_positions concurrent positions."""
+import gc
 import re
 import time
 import threading
@@ -161,6 +162,9 @@ class ScannerStateMachine:
         self._system_n_decisions: list[dict] = []  # karar log'u (max 500)
         self._system_n_scan_count: int = 0  # System N'e özel tarama sayacı
         self._system_n_scan_start_time: float = 0.0  # bu scan döngüsünün başlangıç zamanı
+        # GUI enrichment cache — sadece sonuçlar değişince yeniden hesaplanır
+        self._sn_enriched_cache: list[dict] = []
+        self._sn_enriched_scan_count: int = -1  # hangi scan'de üretildi
         # System N loss protection: ardışık reverse takibi
         self._system_n_reverse_history: dict[str, list[float]] = {}  # symbol -> [reverse_timestamps]
 
@@ -263,10 +267,23 @@ class ScannerStateMachine:
 
     def _main_loop(self) -> None:
         _last_state_save = 0.0
+        _last_mem_cleanup = 0.0
+        _last_hard_purge = 0.0
         while self._running:
             try:
                 # Periyodik state save (60sn'de bir, crash/kill koruması)
                 _now = time.time()
+
+                # Periyodik bellek temizliği (15 sn'de bir)
+                if _now - _last_mem_cleanup > 15:
+                    self._periodic_memory_cleanup()
+                    _last_mem_cleanup = _now
+
+                # Agresif hard purge (5 dk'da bir — tüm gereksiz veriyi sıfırla)
+                if _now - _last_hard_purge > 300:
+                    self._hard_memory_purge()
+                    _last_hard_purge = _now
+
                 if _now - _last_state_save > 60 and self._position_mgr.has_position:
                     try:
                         self._position_mgr.save_state()
@@ -313,6 +330,261 @@ class ScannerStateMachine:
                 import traceback
                 logger.error(f"Scanner error in {self._state.value}: {e}\n{traceback.format_exc()}")
                 self._stop_event.wait(timeout=5)
+
+    # ──── Memory Cleanup ────
+
+    def _periodic_memory_cleanup(self) -> None:
+        """15 saniyede bir çalışır — artık kullanılmayan cache/history verilerini temizler."""
+        try:
+            held = self._position_mgr.get_held_symbols()
+            now = time.time()
+
+            # 1. System B regime history — stale key'leri sil + per-symbol cap
+            if self._system_b_regime_history:
+                active_syms = {r.symbol for r in self._last_system_b_results}
+                stale = [s for s in self._system_b_regime_history if s not in active_syms and s not in held]
+                for s in stale:
+                    del self._system_b_regime_history[s]
+                # Per-symbol cap: son 20 regime kaydını tut
+                for s in self._system_b_regime_history:
+                    if len(self._system_b_regime_history[s]) > 20:
+                        self._system_b_regime_history[s] = self._system_b_regime_history[s][-20:]
+
+            # 2. System N reverse history — in-place temizle
+            reverse_cutoff = now - 1800
+            stale_reverse = []
+            for sym, timestamps in self._system_n_reverse_history.items():
+                # In-place filter (avoid creating new list)
+                i = 0
+                while i < len(timestamps):
+                    if timestamps[i] <= reverse_cutoff:
+                        timestamps.pop(i)
+                    else:
+                        i += 1
+                if not timestamps:
+                    stale_reverse.append(sym)
+            for sym in stale_reverse:
+                del self._system_n_reverse_history[sym]
+
+            # 3. Trade timestamps — son 1 saati tut, max 50 entry
+            if len(self._trade_timestamps) > 50:
+                cutoff = now - 3600
+                self._trade_timestamps[:] = [t for t in self._trade_timestamps if t > cutoff]
+                # Hard cap
+                if len(self._trade_timestamps) > 50:
+                    self._trade_timestamps[:] = self._trade_timestamps[-50:]
+
+            # 4. Coin loss history — in-place temizle, 48h max
+            loss_cutoff = now - 48 * 3600
+            stale_loss = []
+            for sym, timestamps in self._coin_loss_history.items():
+                i = 0
+                while i < len(timestamps):
+                    if timestamps[i] <= loss_cutoff:
+                        timestamps.pop(i)
+                    else:
+                        i += 1
+                if not timestamps:
+                    stale_loss.append(sym)
+            for sym in stale_loss:
+                del self._coin_loss_history[sym]
+
+            # 5. Market context cache — temizle
+            self._market_context.clear()
+
+            # 6. Kline cache'leri — temizle
+            self._sg_cached_klines.clear()
+            self._sg_cached_volume_map.clear()
+            self._sf_cached_klines.clear()
+            self._sf_cached_ob_map.clear()
+            self._sf_cached_volume_map.clear()
+
+            # 7. System I cache temizliği
+            if self._system_i_scanner is not None and hasattr(self._system_i_scanner, 'cleanup_caches'):
+                active_syms = {r.symbol for r in self._last_system_i_results}
+                if active_syms:
+                    self._system_i_scanner.cleanup_caches(active_symbols=active_syms)
+
+            # 8. System J scanner cache temizliği
+            if self._system_j_scanner is not None and hasattr(self._system_j_scanner, 'cleanup_caches'):
+                active_syms = {r.symbol for r in self._last_system_j_results}
+                if active_syms:
+                    self._system_j_scanner.cleanup_caches(active_symbols=active_syms)
+
+            # 9. System N scanner cache temizliği
+            if self._system_n_scanner is not None and hasattr(self._system_n_scanner, 'cleanup_caches'):
+                active_syms = {r.symbol for r in self._last_system_n_results}
+                self._system_n_scanner.cleanup_caches(active_symbols=active_syms)
+
+            # 10. Binance REST kline cache — agresif temizlik
+            if hasattr(self, '_rest') and hasattr(self._rest, '_kline_cache'):
+                expired = [k for k, (ts, _) in self._rest._kline_cache.items()
+                           if now - ts > 30]
+                for k in expired:
+                    del self._rest._kline_cache[k]
+
+            # 11. BatchFetcher cache — temizle
+            if hasattr(self, '_fetcher') and hasattr(self._fetcher, '_cache'):
+                expired = [k for k, (ts, _) in self._fetcher._cache.items()
+                           if now - ts > 45]
+                for k in expired:
+                    del self._fetcher._cache[k]
+
+            # 12. Decision log'ları — cap'le (bellekte en fazla 200 tut)
+            if len(self._system_n_decisions) > 200:
+                self._system_n_decisions[:] = self._system_n_decisions[-200:]
+            if len(self._system_m_decisions) > 200:
+                self._system_m_decisions[:] = self._system_m_decisions[-200:]
+
+            # 13. İnaktif sistem sonuçlarını temizle (sadece aktif sistemin sonuçları kalsın)
+            sys_n_active = self._config.get("system_n.enabled", False)
+            sys_m_active = self._config.get("system_m.enabled", False)
+            sys_j_active = self._config.get("system_j.enabled", False)
+            sys_i_active = self._config.get("system_i.enabled", False)
+            if not sys_n_active:
+                self._last_system_n_results.clear()
+                self._system_n_decisions.clear()
+            if not sys_m_active:
+                self._last_system_m_results.clear()
+                self._system_m_decisions.clear()
+            if not sys_j_active:
+                self._last_system_j_results.clear()
+            if not sys_i_active:
+                self._last_system_i_results.clear()
+            # Eski sistemleri her zaman temizle
+            if not self._config.get("system_h.enabled", False):
+                self._last_system_h_results.clear()
+            if not self._config.get("system_g.enabled", False):
+                self._last_system_g_results.clear()
+            if not self._config.get("system_f.enabled", False):
+                self._last_system_f_results.clear()
+                self._sf_last_full_results.clear() if hasattr(self, '_sf_last_full_results') else None
+            if not self._config.get("system_e.enabled", False):
+                self._last_system_e_results.clear()
+            if not self._config.get("system_d.enabled", False):
+                self._last_system_d_results.clear()
+            if not self._config.get("system_b.enabled", False):
+                self._last_system_b_results.clear()
+            # System A (default) — sadece aktifse tut
+            if sys_n_active or sys_m_active or sys_j_active or sys_i_active:
+                self._last_scan_results.clear()
+                self._last_mr_results.clear()
+
+            # 14. Held indicators — kapalı pozisyon artıklarını temizle
+            stale_held = [s for s in self._held_indicators if s not in held]
+            for s in stale_held:
+                del self._held_indicators[s]
+
+            # 15. Python garbage collector — generation 0+1 (hızlı)
+            gc.collect(1)
+
+            logger.debug("[MEM] Periyodik bellek temizliği tamamlandı")
+        except Exception as e:
+            logger.debug(f"[MEM] Cleanup hatası (zararsız): {e}")
+
+    def _hard_memory_purge(self) -> None:
+        """5 dakikada bir çalışır — tüm geçici/cache verisini komple sıfırlar.
+        Pozisyon ve config verisine dokunmaz, sadece birikmiş analiz verilerini temizler."""
+        try:
+            import sys
+            # RAM kullanımını logla
+            try:
+                import psutil
+                proc = psutil.Process()
+                ram_mb = proc.memory_info().rss / 1024 / 1024
+                logger.info(f"[MEM-PURGE] RAM: {ram_mb:.0f} MB")
+            except ImportError:
+                ram_mb = 0
+
+            # 1. TÜM scan result listelerini sıfırla (GUI bir sonraki scan'de yeniden doldurur)
+            self._last_scan_results.clear()
+            self._last_mr_results.clear()
+            self._last_system_b_results.clear()
+            self._last_system_d_results.clear()
+            self._last_system_e_results.clear()
+            self._last_system_f_results.clear()
+            self._last_system_g_results.clear()
+            self._last_system_h_results.clear()
+            self._last_system_m_results.clear()
+            self._last_system_n_results.clear()
+            self._last_system_j_results.clear()
+            self._last_system_i_results.clear()
+            if hasattr(self, '_sf_last_full_results'):
+                self._sf_last_full_results.clear()
+
+            # 2. Decision log'larını sıfırla
+            self._system_m_decisions.clear()
+            self._system_n_decisions.clear()
+
+            # 3. TÜM cache'leri komple sıfırla
+            self._market_context.clear()
+            self._sg_cached_klines.clear()
+            self._sg_cached_volume_map.clear()
+            self._sg_cached_ob_map.clear() if hasattr(self, '_sg_cached_ob_map') else None
+            self._sf_cached_klines.clear()
+            self._sf_cached_ob_map.clear()
+            self._sf_cached_volume_map.clear()
+            self._sf_cached_market_ctx.clear() if hasattr(self, '_sf_cached_market_ctx') else None
+            self._sf_cached_beta_map.clear() if hasattr(self, '_sf_cached_beta_map') else None
+
+            # 4. Held indicators — sadece aktif pozisyonları tut
+            held = self._position_mgr.get_held_symbols()
+            stale = [s for s in self._held_indicators if s not in held]
+            for s in stale:
+                del self._held_indicators[s]
+
+            # 5. Binance REST kline cache — komple sıfırla
+            if hasattr(self, '_rest') and hasattr(self._rest, '_kline_cache'):
+                self._rest._kline_cache.clear()
+
+            # 6. BatchFetcher cache — komple sıfırla
+            if hasattr(self, '_fetcher') and hasattr(self._fetcher, '_cache'):
+                self._fetcher._cache.clear()
+
+            # 7. Scanner'ların internal cache'lerini sıfırla
+            for scanner_attr in ['_system_n_scanner', '_system_j_scanner', '_system_i_scanner',
+                                 '_system_m_scanner', '_system_b_scanner', '_system_d_scanner',
+                                 '_system_e_scanner', '_system_f_scanner', '_system_g_scanner',
+                                 '_system_h_scanner']:
+                scanner = getattr(self, scanner_attr, None)
+                if scanner is not None and hasattr(scanner, 'cleanup_caches'):
+                    try:
+                        scanner.cleanup_caches(active_symbols=set())
+                    except Exception:
+                        pass
+
+            # 8. BTC correlation cache
+            if hasattr(self, '_btc_corr') and hasattr(self._btc_corr, '_beta_cache'):
+                self._btc_corr._beta_cache.clear()
+
+            # 9. History dict'leri — eski verileri temizle, sadece son 10dk tut
+            now = __import__('time').time()
+            recent_cutoff = now - 600  # 10 dakika
+
+            # Trade timestamps — son 10dk
+            self._trade_timestamps[:] = [t for t in self._trade_timestamps if t > recent_cutoff]
+
+            # Reverse history — son 10dk
+            stale_keys = []
+            for sym, ts_list in self._system_n_reverse_history.items():
+                ts_list[:] = [t for t in ts_list if t > recent_cutoff]
+                if not ts_list:
+                    stale_keys.append(sym)
+            for sym in stale_keys:
+                del self._system_n_reverse_history[sym]
+
+            # 10. Full garbage collection (tüm generation'lar)
+            gc.collect(2)
+
+            try:
+                ram_after = psutil.Process().memory_info().rss / 1024 / 1024
+                freed = ram_mb - ram_after
+                logger.info(f"[MEM-PURGE] Tamamlandı. RAM: {ram_after:.0f} MB (freed ~{freed:.0f} MB)")
+            except Exception:
+                logger.info("[MEM-PURGE] Tamamlandı")
+
+        except Exception as e:
+            logger.debug(f"[MEM-PURGE] Hatası (zararsız): {e}")
 
     # ──── SCANNING State ────
 
@@ -461,25 +733,30 @@ class ScannerStateMachine:
 
         # 5. Find best eligible candidate
         now = time.time()
-        self._failed_symbols = {
-            s: t for s, t in self._failed_symbols.items()
-            if now - t < self._failed_cooldown
-        }
+        # In-place cleanup: avoid creating new dict objects
+        stale_keys = [s for s, t in self._failed_symbols.items() if now - t >= self._failed_cooldown]
+        for s in stale_keys:
+            del self._failed_symbols[s]
         # Expire old loss cooldowns
-        self._loss_cooldown_symbols = {
-            s: t for s, t in self._loss_cooldown_symbols.items()
-            if now - t < self._loss_cooldown_seconds
-        }
+        stale_keys = [s for s, t in self._loss_cooldown_symbols.items() if now - t >= self._loss_cooldown_seconds]
+        for s in stale_keys:
+            del self._loss_cooldown_symbols[s]
 
         # Periodic cleanup: coin loss history (remove entries older than ban window)
         ban_hours = self._config.get("strategy.coin_daily_ban_hours", 24)
         ban_cutoff = now - (ban_hours * 3600)
-        for sym in list(self._coin_loss_history.keys()):
-            self._coin_loss_history[sym] = [
-                t for t in self._coin_loss_history[sym] if t > ban_cutoff
-            ]
-            if not self._coin_loss_history[sym]:
-                del self._coin_loss_history[sym]
+        stale_loss_keys = []
+        for sym, timestamps in self._coin_loss_history.items():
+            i = 0
+            while i < len(timestamps):
+                if timestamps[i] <= ban_cutoff:
+                    timestamps.pop(i)
+                else:
+                    i += 1
+            if not timestamps:
+                stale_loss_keys.append(sym)
+        for sym in stale_loss_keys:
+            del self._coin_loss_history[sym]
 
         # Cleanup: expired close retries (stale entries from permanently failed closes)
         for sym in list(self._close_retries.keys()):
@@ -4050,8 +4327,8 @@ class ScannerStateMachine:
             "price": price,
         }
         self._system_m_decisions.append(entry)
-        if len(self._system_m_decisions) > 500:
-            self._system_m_decisions = self._system_m_decisions[-500:]
+        if len(self._system_m_decisions) > 200:
+            self._system_m_decisions[:] = self._system_m_decisions[-200:]
 
     def get_system_n_results(self) -> list:
         """Return last System N scan results (for GUI).
@@ -4059,10 +4336,19 @@ class ScannerStateMachine:
         Her sonuca ban/cooldown durumu eklenir:
           ban_status: "" | "BAN" | "COOLDOWN"
           ban_detail: "" | açıklama metni (sebep + kalan süre)
+
+        Cache: sadece yeni scan tamamlanınca yeniden hesaplanır (scan_count değişince).
+        GUI her 2sn'de çağırsa da allocation olmaz.
         """
-        results = list(self._last_system_n_results)
+        # Cache hit: aynı scan döngüsündeyse eski sonucu dön
+        if self._sn_enriched_scan_count == self._system_n_scan_count and self._sn_enriched_cache:
+            return self._sn_enriched_cache
+
+        results = self._last_system_n_results
         if not results:
-            return results
+            self._sn_enriched_cache = []
+            self._sn_enriched_scan_count = self._system_n_scan_count
+            return self._sn_enriched_cache
 
         now = time.time()
         sn_cfg = self._config.get("system_n", {})
@@ -4108,7 +4394,9 @@ class ScannerStateMachine:
             row["ban_detail"] = ban_detail
             enriched.append(row)
 
-        return enriched
+        self._sn_enriched_cache = enriched
+        self._sn_enriched_scan_count = self._system_n_scan_count
+        return self._sn_enriched_cache
 
     def get_system_n_decisions(self) -> list[dict]:
         """Return System N trade decision log (for GUI)."""
@@ -4127,8 +4415,8 @@ class ScannerStateMachine:
             "price": price,
         }
         self._system_n_decisions.append(entry)
-        if len(self._system_n_decisions) > 500:
-            self._system_n_decisions = self._system_n_decisions[-500:]
+        if len(self._system_n_decisions) > 200:
+            self._system_n_decisions[:] = self._system_n_decisions[-200:]
 
     def get_system_b_results(self) -> list:
         """Return last System B scan results (for GUI)."""

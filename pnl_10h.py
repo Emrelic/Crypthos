@@ -1,4 +1,4 @@
-"""Son 24 saatlik trade P&L raporu + portfoy durumu."""
+"""Son 10 saatlik trade P&L raporu + portfoy durumu."""
 from dotenv import load_dotenv
 import os, time, hmac, hashlib, requests
 from urllib.parse import urlencode
@@ -20,7 +20,7 @@ def sign(params):
     return params
 
 base = "https://fapi.binance.com"
-start_ms = int((time.time() - 24 * 3600) * 1000)
+start_ms = int((time.time() - 10 * 3600) * 1000)
 
 # Fetch income history (paginated for 24h)
 all_data = []
@@ -89,7 +89,7 @@ all_trades.sort(key=lambda x: x["time"])
 
 since = datetime.fromtimestamp(start_ms / 1000).strftime("%Y-%m-%d %H:%M")
 now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-print(f"\nSON 24 SAAT TRADE RAPORU ({since} - {now_str})")
+print(f"\nSON 10 SAAT TRADE RAPORU ({since} - {now_str})")
 print("=" * 115)
 print(f"{'#':>3} | {'Tarih':14} | {'Sembol':15} | {'Brut K/Z':>10} | {'Fee':>10} | {'Likid.':>10} | {'Net K/Z':>10} | {'Durum':>8}")
 print("-" * 115)
@@ -322,7 +322,7 @@ if all_reverses:
                 print(f"    {sym:15} {cnt} kez")
     print()
 else:
-    print("  Son 24 saatte reverse (yon degisimi) yok.")
+    print("  Son 10 saatte reverse (yon degisimi) yok.")
     print()
 
 # ==================== POZISYON ACILMA SAYISI ====================

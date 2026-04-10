@@ -30,7 +30,8 @@ class BollingerBands(Indicator):
         self._upper = upper_s.iloc[-1]
         self._lower = lower_s.iloc[-1]
         self._bandwidth = (self._upper - self._lower) / (self._middle + 1e-10) * 100
-        self._bandwidth_series = (upper_s - lower_s) / (middle_s + 1e-10) * 100
+        _bw = (upper_s - lower_s) / (middle_s + 1e-10) * 100
+        self._bandwidth_series = _bw.iloc[-20:].reset_index(drop=True)
         self._percent_b = (close.iloc[-1] - self._lower) / (self._upper - self._lower + 1e-10)
         self._value = close.iloc[-1]
 

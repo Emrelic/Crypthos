@@ -252,6 +252,21 @@ class SystemJScanner:
         return self._config.get(f"system_j.elliott.{key}", default)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # CACHE CLEANUP
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def cleanup_caches(self, active_symbols: set = None) -> None:
+        """Artık taranmayan coinlerin leverage bracket cache'ini temizle."""
+        if not active_symbols:
+            return
+        with self._lock:
+            stale = [s for s in self._leverage_brackets if s not in active_symbols]
+            for s in stale:
+                del self._leverage_brackets[s]
+            if stale:
+                self._log.debug(f"Cache cleanup: {len(stale)} stale bracket silindi")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # LEVERAGE BRACKET — Binance API
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

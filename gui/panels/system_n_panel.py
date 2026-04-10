@@ -130,6 +130,10 @@ class SystemNPanel(ctk.CTkFrame):
         self._dec_filter = "all"
         self._active_tab = "scan"
         self._held_map: dict = {}
+        self._selected_pos_idx: int = -1
+        self._positions_data: list = []
+        self._scan_data: list = []
+        self._chart_popup = None
 
         try:
             self._build_ui()
@@ -205,6 +209,14 @@ class SystemNPanel(ctk.CTkFrame):
             font=ctk.CTkFont(size=_TITLE_FONT_SZ, weight="bold"),
             text_color="#FFFFFF",
         ).pack(side="left")
+        self._chart_btn = ctk.CTkButton(
+            pos_title_bar, text="Grafikte Goster", width=130, height=30,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#1565C0", hover_color="#1976D2",
+            corner_radius=6, command=self._on_show_chart,
+        )
+        self._chart_btn.pack(side="right", padx=6)
+
         self._pos_summary_label = ctk.CTkLabel(
             pos_title_bar, text="",
             font=ctk.CTkFont(size=13), text_color="#B0BEC5",
@@ -778,7 +790,8 @@ class SystemNPanel(ctk.CTkFrame):
 
     def _refresh_loop(self) -> None:
         try:
-            self._update_all()
+            if self.winfo_viewable():
+                self._update_all()
         except Exception as e:
             logger.error(f"[SysN Panel] refresh error: {e}")
         self.after(2000, self._refresh_loop)
@@ -839,11 +852,14 @@ class SystemNPanel(ctk.CTkFrame):
         if new_cache == self._scan_cache:
             return
         self._scan_cache = new_cache
+        self._scan_data = sorted_r[:60]
         for w in self._scan_rows:
             w.destroy()
         self._scan_rows.clear()
         for idx, rd in enumerate(new_cache):
-            self._scan_rows.append(_make_data_row(self._scan_scroll, rd, idx))
+            row_widget = _make_data_row(self._scan_scroll, rd, idx)
+            row_widget._row_idx = idx  # index'i widget'a kaydet (binding yerine)
+            self._scan_rows.append(row_widget)
 
     def _scan_row_data(self, idx, r):
         signal = _g(r, "signal", "NONE")
@@ -921,6 +937,7 @@ class SystemNPanel(ctk.CTkFrame):
     #  POSITIONS TABLE
     # ═══════════════════════════════════════════════════
     def _update_pos_table(self, positions):
+        self._positions_data = list(positions)
         # Summary: toplam PnL, marjin, long/short sayisi
         total_pnl = sum(_g(p, "pnl_usdt", 0) or 0 for p in positions)
         total_margin = sum(_g(p, "margin_usdt", 0) or 0 for p in positions)
@@ -944,7 +961,102 @@ class SystemNPanel(ctk.CTkFrame):
             return
         self._pos_empty_label.pack_forget()
         for idx, rd in enumerate(new_cache):
-            self._pos_rows.append(_make_data_row(self._pos_scroll, rd, idx))
+            row_widget = _make_data_row(self._pos_scroll, rd, idx)
+            row_widget._row_idx = idx  # index'i widget'a kaydet
+            # Tek binding: sadece row frame'e, child'lara propagate eder
+            row_widget.bind("<Button-1>", self._on_pos_click_handler)
+            row_widget.bind("<Double-Button-1>", self._on_pos_dblclick_handler)
+            self._pos_rows.append(row_widget)
+        # Secim hala gecerli mi kontrol et
+        if self._selected_pos_idx >= len(self._pos_rows):
+            self._selected_pos_idx = -1
+        self._highlight_selected_row()
+
+    def _on_pos_click_handler(self, event):
+        """Pozisyon satirina tiklandiginda sec/kaldir. Widget'tan index al."""
+        widget = event.widget
+        # Parent frame'e kadar çık (child label'dan tıklanmış olabilir)
+        while widget and not hasattr(widget, '_row_idx'):
+            widget = widget.master
+        if widget and hasattr(widget, '_row_idx'):
+            idx = widget._row_idx
+            if self._selected_pos_idx == idx:
+                self._selected_pos_idx = -1
+            else:
+                self._selected_pos_idx = idx
+            self._highlight_selected_row()
+
+    def _on_pos_dblclick_handler(self, event):
+        """Cift tiklama ile direkt grafik ac."""
+        widget = event.widget
+        while widget and not hasattr(widget, '_row_idx'):
+            widget = widget.master
+        if widget and hasattr(widget, '_row_idx'):
+            self._selected_pos_idx = widget._row_idx
+            self._highlight_selected_row()
+            self._on_show_chart()
+
+    def _highlight_selected_row(self):
+        """Secili satiri vurgula."""
+        for i, row in enumerate(self._pos_rows):
+            if i == self._selected_pos_idx:
+                row.configure(fg_color="#2a4a7a")
+            else:
+                row.configure(fg_color=_BG_ROW_ODD if i % 2 == 0 else _BG_ROW_EVEN)
+
+    def _on_show_chart(self):
+        """Secili pozisyonun grafikini ac."""
+        if self._selected_pos_idx < 0 or self._selected_pos_idx >= len(self._positions_data):
+            # Hic secim yoksa bilgi ver
+            from tkinter import messagebox
+            messagebox.showinfo("Grafik", "Once bir pozisyon satiri secin (tiklayin).")
+            return
+
+        pos = self._positions_data[self._selected_pos_idx]
+        symbol = _g(pos, "symbol", "")
+        tf = _g(pos, "timeframe", "5m") or "5m"
+
+        # Eski popup varsa kapat
+        if self._chart_popup and self._chart_popup.winfo_exists():
+            self._chart_popup.destroy()
+
+        from gui.chart_popup import ChartPopup
+        self._chart_popup = ChartPopup(
+            self, self.controller, symbol,
+            timeframe=tf, candle_count=300,
+            position_info=pos,
+        )
+
+    def _on_scan_row_dblclick(self, idx: int):
+        """Tarama satarina cift tiklama ile grafik ac (pozisyon yoksa yalin grafik)."""
+        if not hasattr(self, '_scan_data') or idx >= len(self._scan_data):
+            return
+        r = self._scan_data[idx]
+        symbol = _g(r, "symbol", "")
+        if not symbol:
+            return
+
+        # Bu coin'de acik pozisyon var mi?
+        pos_info = None
+        for p in self._positions_data:
+            if _g(p, "symbol", "") == symbol:
+                pos_info = p
+                break
+
+        tf = "5m"
+        cfg = self.controller.config
+        if cfg:
+            tf = cfg.get("system_n.timeframe", "5m")
+
+        if self._chart_popup and self._chart_popup.winfo_exists():
+            self._chart_popup.destroy()
+
+        from gui.chart_popup import ChartPopup
+        self._chart_popup = ChartPopup(
+            self, self.controller, symbol,
+            timeframe=tf, candle_count=300,
+            position_info=pos_info,
+        )
 
     def _pos_row_data(self, idx, p):
         symbol = _g(p, "symbol", "")

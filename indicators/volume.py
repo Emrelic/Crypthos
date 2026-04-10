@@ -19,7 +19,7 @@ class OBV(Indicator):
         direction = np.sign(close.diff())
         obv = (direction * volume).cumsum()
         self._value = obv.iloc[-1] if not obv.empty else 0.0
-        self._series = obv
+        self._series = obv.iloc[-20:].reset_index(drop=True)
         # Store slope for signal
         if len(obv) >= 5:
             self._obv_slope = obv.iloc[-1] - obv.iloc[-5]
@@ -51,7 +51,7 @@ class CVD(Indicator):
         delta = 2 * taker_buy - volume
         cvd = delta.cumsum()
         self._value = cvd.iloc[-1] if not cvd.empty else 0.0
-        self._series = cvd
+        self._series = cvd.iloc[-20:].reset_index(drop=True)
 
         # Slope over last 5 candles
         if len(cvd) >= 5:

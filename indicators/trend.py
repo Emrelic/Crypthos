@@ -42,9 +42,9 @@ class ADX(Indicator):
         self._value = adx.iloc[-1] if not adx.empty else 0.0
         self._plus_di = plus_di.iloc[-1] if not plus_di.empty else 0.0
         self._minus_di = minus_di.iloc[-1] if not minus_di.empty else 0.0
-        self._plus_di_series = plus_di
-        self._minus_di_series = minus_di
-        self._adx_series = adx
+        self._plus_di_series = plus_di.iloc[-20:].reset_index(drop=True)
+        self._minus_di_series = minus_di.iloc[-20:].reset_index(drop=True)
+        self._adx_series = adx.iloc[-20:].reset_index(drop=True)
 
     def get_values(self) -> dict:
         return {

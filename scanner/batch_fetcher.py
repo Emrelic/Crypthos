@@ -35,7 +35,7 @@ class BatchKlineFetcher:
         self._limiter = RateLimiter(requests_per_second)
         # Cache: symbol -> (timestamp, DataFrame)
         self._cache: dict[str, tuple[float, pd.DataFrame]] = {}
-        self._cache_ttl = 75.0  # seconds (>2x scan interval for better hit rate)
+        self._cache_ttl = 45.0  # seconds
 
     def fetch_batch(self, symbols: list[str], interval: str = "15m",
                     limit: int = 200,
@@ -92,12 +92,17 @@ class BatchKlineFetcher:
                 except Exception as e:
                     logger.debug(f"Kline fetch failed for {symbol}: {e}")
 
-        # Evict expired cache entries to prevent unbounded growth
+        # Evict expired cache entries aggressively
         evict_time = time.time()
         expired_keys = [k for k, (ts, _) in self._cache.items()
-                        if evict_time - ts > self._cache_ttl * 2]
+                        if evict_time - ts > self._cache_ttl]
         for k in expired_keys:
             del self._cache[k]
+        # Hard cap: drop oldest if still too many
+        if len(self._cache) > 80:
+            sorted_keys = sorted(self._cache, key=lambda k: self._cache[k][0])
+            for k in sorted_keys[:len(self._cache) - 80]:
+                del self._cache[k]
 
         elapsed = evict_time - start
         logger.info(f"Fetched {len(results)}/{len(symbols)} klines in {elapsed:.1f}s")

@@ -69,12 +69,17 @@ class BinanceRestClient:
             df[col] = df[col].astype(float)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
 
-        # Store in cache and evict expired entries
+        # Store in cache and evict expired entries aggressively
         self._kline_cache[cache_key] = (now, df)
-        if len(self._kline_cache) > 200:
-            expired = [k for k, (ts, _) in self._kline_cache.items()
-                       if now - ts > self._kline_cache_ttl * 2]
-            for k in expired:
+        # Always evict expired entries (not just when >50)
+        expired = [k for k, (ts, _) in self._kline_cache.items()
+                   if now - ts > self._kline_cache_ttl]
+        for k in expired:
+            del self._kline_cache[k]
+        # Hard cap: if still too many, drop oldest
+        if len(self._kline_cache) > 30:
+            sorted_keys = sorted(self._kline_cache, key=lambda k: self._kline_cache[k][0])
+            for k in sorted_keys[:len(self._kline_cache) - 30]:
                 del self._kline_cache[k]
 
         return df

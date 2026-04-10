@@ -145,14 +145,15 @@ class SystemGPanel(ctk.CTkFrame):
         self._refresh()
 
     def _refresh(self):
-        try:
-            self._update_scan_results()
-        except Exception as e:
-            logger.error(f"[SysG Panel] scan refresh error: {e}")
-        try:
-            self._update_positions()
-        except Exception as e:
-            logger.error(f"[SysG Panel] pos refresh error: {e}")
+        if self.winfo_viewable():
+            try:
+                self._update_scan_results()
+            except Exception as e:
+                logger.error(f"[SysG Panel] scan refresh error: {e}")
+            try:
+                self._update_positions()
+            except Exception as e:
+                logger.error(f"[SysG Panel] pos refresh error: {e}")
         self.after(4000, self._refresh)
 
     # ═══ Generic row helpers ═══

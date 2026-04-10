@@ -342,6 +342,24 @@ class SystemNScanner:
                     f"(kaynak: {ts})")
         return loaded
 
+    def cleanup_caches(self, active_symbols: set = None) -> None:
+        """Artık taranmayan coinlerin cache'ini temizle."""
+        with self._lock:
+            # optimize_cache'den stale coin'leri sil
+            if active_symbols and self._optimize_cache:
+                stale = [s for s in self._optimize_cache if s not in active_symbols]
+                for s in stale:
+                    del self._optimize_cache[s]
+                    self._coin_trend_direction.pop(s, None)
+                if stale:
+                    logger.debug(f"[SysN] Cache cleanup: {len(stale)} stale coin silindi")
+
+            # coin_trend_direction'dan stale coin'leri sil
+            if active_symbols and self._coin_trend_direction:
+                stale_dir = [s for s in self._coin_trend_direction if s not in active_symbols]
+                for s in stale_dir:
+                    del self._coin_trend_direction[s]
+
     def reload_if_stale(self, max_age_hours: float = 24.0) -> None:
         """Cache eski ise yeniden yükle + artık olmayan coinlerin state'ini temizle."""
         age = _time.time() - self._optimize_loaded_at

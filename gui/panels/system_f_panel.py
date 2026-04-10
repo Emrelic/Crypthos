@@ -268,20 +268,21 @@ class SystemFPanel(ctk.CTkFrame):
         self._refresh()
 
     def _refresh(self):
-        try:
-            self._update_balance_tracker()
-        except Exception:
-            pass
-        try:
-            self._update_scan_results()
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"[SysF Panel] scan refresh error: {e}")
-        try:
-            self._update_positions()
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"[SysF Panel] pos refresh error: {e}")
+        if self.winfo_viewable():
+            try:
+                self._update_balance_tracker()
+            except Exception:
+                pass
+            try:
+                self._update_scan_results()
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"[SysF Panel] scan refresh error: {e}")
+            try:
+                self._update_positions()
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"[SysF Panel] pos refresh error: {e}")
         self.after(3000, self._refresh)
 
     # ═══ Balance Tracker ═══

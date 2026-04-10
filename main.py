@@ -101,7 +101,7 @@ from gui.main_window import MainWindow
 # Configure logging
 logger.remove()
 logger.add(sys.stderr, level="INFO")
-logger.add("data/crypthos.log", rotation="10 MB", retention="7 days", level="DEBUG")
+logger.add("data/crypthos.log", rotation="10 MB", retention="7 days", level="INFO")
 
 
 def main():

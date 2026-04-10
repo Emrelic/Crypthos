@@ -63,44 +63,47 @@ class MainWindow(ctk.CTk):
         self._status_bar.pack(fill="x", padx=5, pady=(5, 0))
 
         # ═══ VIEW SWITCHER: Sistemler / Araclar ═══
-        self._view_switch = ctk.CTkSegmentedButton(
-            self, values=["Sistemler", "Araclar"],
-            command=self._switch_view,
+        _sw_frame = ctk.CTkFrame(self, fg_color="transparent", height=32)
+        _sw_frame.pack(fill="x", padx=10, pady=(2, 0))
+        self._btn_sistemler = ctk.CTkButton(
+            _sw_frame, text="Sistemler", width=120, height=28,
             font=ctk.CTkFont(size=12, weight="bold"),
-            height=28,
+            fg_color="#3d5afe", hover_color="#536DFE",
+            command=lambda: self._switch_view("Sistemler"),
         )
-        self._view_switch.set("Sistemler")
-        self._view_switch.pack(fill="x", padx=10, pady=(2, 0))
+        self._btn_sistemler.pack(side="left", padx=(0, 4))
+        self._btn_araclar = ctk.CTkButton(
+            _sw_frame, text="Araclar", width=120, height=28,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#455A64", hover_color="#546E7A",
+            command=lambda: self._switch_view("Araclar"),
+        )
+        self._btn_araclar.pack(side="left")
+        self._view_switch = _sw_frame  # pack reference olarak kullan
+        logger.info("[VIEW] View switch buttons created")
 
-        # ═══ SYSTEM TABS (12 tab) ═══
+        # ═══ SYSTEM TABS (sadece aktif sistemler baştan, diğerleri lazy) ═══
         self._sys_tabview = ctk.CTkTabview(self)
 
+        # Aktif sistemleri baştan oluştur
         tab_n = self._sys_tabview.add("N")
         tab_m = self._sys_tabview.add("M")
-        tab_j = self._sys_tabview.add("J")
-        tab_i = self._sys_tabview.add("I")
-        tab_a = self._sys_tabview.add("A")
-        tab_b = self._sys_tabview.add("B")
-        tab_c = self._sys_tabview.add("C")
-        tab_d = self._sys_tabview.add("D")
-        tab_e = self._sys_tabview.add("E")
-        tab_f = self._sys_tabview.add("F")
-        tab_g = self._sys_tabview.add("G")
-        tab_h = self._sys_tabview.add("H")
 
         self._system_n_panel = SystemNPanel(tab_n, controller)
         self._system_m_panel = SystemMPanel(tab_m, controller)
-        self._system_j_panel = SystemJPanel(tab_j, controller)
-        self._system_i_panel = SystemIPanel(tab_i, controller)
-        self._scanner_panel = ScannerPanel(tab_a, controller)
-        self._system_b_panel = SystemBPanel(tab_b, controller)
-        self._system_c_panel = SystemCPanel(tab_c, controller)
-        self._system_d_panel = SystemDPanel(tab_d, controller)
-        self._system_e_panel = SystemEPanel(tab_e, controller)
-        self._system_f_panel = SystemFPanel(tab_f, controller)
-        self._system_g_panel = SystemGPanel(tab_g, controller)
-        self._system_h_panel = SystemHPanel(tab_h, controller)
         self._sys_tabview.set("N")
+
+        # Pasif sistemler — placeholder (lazy-load, widget limiti koruması)
+        self._system_j_panel = None
+        self._system_i_panel = None
+        self._scanner_panel = None
+        self._system_b_panel = None
+        self._system_c_panel = None
+        self._system_d_panel = None
+        self._system_e_panel = None
+        self._system_f_panel = None
+        self._system_g_panel = None
+        self._system_h_panel = None
 
         # ═══ TOOL TABS (lazy — built on first Araclar click) ═══
         self._tool_tabview = None
@@ -145,7 +148,9 @@ class MainWindow(ctk.CTk):
 
     def _switch_view(self, value: str) -> None:
         """Switch between Sistemler and Araclar views."""
+        logger.info(f"[VIEW] _switch_view called: '{value}' (current: '{self._active_view}')")
         if value == self._active_view:
+            logger.info("[VIEW] Same view, skipping")
             return
         if value == "Sistemler":
             if self._tool_tabview:
@@ -155,10 +160,25 @@ class MainWindow(ctk.CTk):
         else:
             self._sys_tabview.pack_forget()
             if not self._tools_built:
-                self._build_tool_tabs()
+                logger.info("[VIEW] Building tool tabs for first time...")
+                try:
+                    self._build_tool_tabs()
+                    logger.info("[VIEW] Tool tabs built OK")
+                except Exception as e:
+                    logger.error(f"[VIEW] Tool tabs build FAILED: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
             self._tool_tabview.pack(after=self._view_switch,
                                     fill="both", expand=True, padx=5, pady=(0, 5))
         self._active_view = value
+        # Buton renklerini güncelle
+        if value == "Sistemler":
+            self._btn_sistemler.configure(fg_color="#3d5afe")
+            self._btn_araclar.configure(fg_color="#455A64")
+        else:
+            self._btn_sistemler.configure(fg_color="#455A64")
+            self._btn_araclar.configure(fg_color="#3d5afe")
+        logger.info(f"[VIEW] Switched to '{value}'")
 
     def _build_tool_tabs(self) -> None:
         """Build tool tabs on first Araclar click (lightweight panels only)."""
@@ -266,11 +286,8 @@ class MainWindow(ctk.CTk):
             # Get indicator values
             indicator_values = self.controller.get_indicator_values()
 
-            # Compute indicators if we have klines
-            if self.controller.market_service and self.controller.indicator_engine:
-                klines = self.controller.market_service.get_klines(symbol)
-                if klines is not None and not klines.empty:
-                    indicator_values = self.controller.indicator_engine.compute_all(klines)
+            # Not: compute_all scanner thread'inde çalışır, GUI thread'inde tekrar çalıştırmıyoruz
+            # (GUI thread'i bloklanmasın diye)
 
             # Update status bar
             use_api = self.controller.config.get("trading.use_api", False)

@@ -17,5 +17,5 @@ class RSI(Indicator):
         rsi = 100 - (100 / (1 + rs))
         self._prev_value = rsi.iloc[-2] if len(rsi) >= 2 else None
         self._last_value = rsi.iloc[-1] if len(rsi) >= 1 else None
-        self._series = rsi
+        self._series = rsi.iloc[-20:].reset_index(drop=True)
         return rsi

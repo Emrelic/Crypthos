@@ -53,6 +53,11 @@ class MarketDataService:
     def stop(self) -> None:
         self._running = False
         self._ws.disconnect()
+        # Clear all caches to free memory
+        self._price_cache.clear()
+        self._kline_cache.clear()
+        self._funding_cache.clear()
+        self._ticker_cache.clear()
 
     def switch_symbol(self, symbol: str) -> None:
         self._current_symbol = symbol
@@ -130,6 +135,11 @@ class MarketDataService:
         try:
             df = self._rest.get_klines(symbol, interval, limit)
             self._kline_cache[symbol] = df
+            # Limit cache size: keep only current symbol + 5 recent
+            if len(self._kline_cache) > 6:
+                stale = [k for k in self._kline_cache if k != self._current_symbol]
+                for k in stale[:-5]:
+                    del self._kline_cache[k]
         except Exception as e:
             logger.error(f"Kline refresh failed for {symbol}: {e}")
 
