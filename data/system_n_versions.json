@@ -1,0 +1,128 @@
+{
+  "current_version": "N-V3-C4",
+  "versions": [
+    {
+      "tag": "N-V1-C1",
+      "version": 1,
+      "config": 1,
+      "start": "2026-04-06T00:04",
+      "end": "2026-04-13T22:39",
+      "code_changes": [
+        "System N ilk versiyon (stabil-calisan-no1 branch)",
+        "AlphaTrend PRO v2 + G-bazli dinamik kaldirac",
+        "SL=1.5G, Liq=SLx2 formulu",
+        "Supertrend kodu mevcut ama config'de yok"
+      ],
+      "config_changes": [
+        "system_n.sl.enabled: true -> false (baslangicta kapali)",
+        "system_n.sl.g_mult: 1.5",
+        "system_n.max_leverage: 150",
+        "supertrend_confirm: alan yok"
+      ],
+      "performance": {
+        "trades": 266,
+        "wins": 64,
+        "losses": 202,
+        "wr_pct": 24.1,
+        "net_pnl": -26.85,
+        "pf": 0.47,
+        "sl_count": 91,
+        "sl_pnl": -28.08,
+        "rev_count": 68,
+        "liq_count": 0,
+        "avg_lev": 12.5
+      }
+    },
+    {
+      "tag": "N-V1-C2",
+      "version": 1,
+      "config": 2,
+      "start": "2026-04-13T22:39",
+      "end": "2026-04-15T11:00",
+      "code_changes": [],
+      "config_changes": [
+        "system_n.sl.enabled: true",
+        "system_n.sl.g_mult: 1.5 -> 3.0",
+        "system_n.sl.liq_g_mult: (yeni alan) 3.5",
+        "system_n.indicators.supertrend_confirm: false (alan eklendi)",
+        "Beyaz sayfa: tum pozisyonlar kapatildi, 25.09 USDT ile yeniden baslatildi"
+      ],
+      "performance": {
+        "trades": 42,
+        "wins": 13,
+        "losses": 29,
+        "wr_pct": 31.0,
+        "net_pnl": -1.16,
+        "pf": 0.87,
+        "sl_count": 15,
+        "sl_pnl": -2.85,
+        "rev_count": 27,
+        "liq_count": 0,
+        "avg_lev": 13.3
+      }
+    },
+    {
+      "tag": "N-V2-C3",
+      "version": 2,
+      "config": 3,
+      "start": "2026-04-15T11:00",
+      "end": "2026-04-15T22:26",
+      "code_changes": [
+        "Kaldirac formulu degisti: PratikLiq=2.4G, TeorikLiq=2.4G/0.7=3.43G",
+        "LEV_PRATIK_MULT=2.4, LEV_DIVISOR=0.7 sabitleri eklendi",
+        "SL_G_MULT=3.0 -> 2.0 (referans, SL kapali)",
+        "Backtest sonucu: HIBRIT SLyok+3.5Gliq en iyi senaryo"
+      ],
+      "config_changes": [
+        "system_n.sl.enabled: true -> false (SL tamamen kapali)",
+        "system_n.sl.g_mult: 3.0 -> 2.0 (referans)",
+        "Cikis: yalnizca reverse sinyal + emergency anti-liq",
+        "Liq koruma mesafesi: 3.5G (degismedi, guvenlik agi)"
+      ],
+      "performance": {
+        "trades": 22,
+        "wins": 2,
+        "losses": 20,
+        "wr_pct": 9.1,
+        "net_pnl": -2.68,
+        "pf": 0.15,
+        "sl_count": 12,
+        "sl_pnl": -2.08,
+        "rev_count": 10,
+        "liq_count": 0,
+        "avg_lev": 20.4,
+        "note": "SL config kapali ama software SL (_check_system_n_m) hala aktifti — V3'te duzeltildi"
+      }
+    },
+    {
+      "tag": "N-V3-C3",
+      "version": 3,
+      "config": 3,
+      "start": "2026-04-15T22:26",
+      "end": "2026-04-18T00:30",
+      "code_changes": [
+        "position_manager._check_system_n_m(): System N icin software SL artik system_n.sl.enabled config'ine bakiyor",
+        "SL enabled=false ise: sadece emergency anti-liq + reverse sinyal ile cikis",
+        "System M etkilenmez (her zaman SL aktif)"
+      ],
+      "config_changes": [],
+      "performance": null
+    },
+    {
+      "tag": "N-V3-C4",
+      "version": 3,
+      "config": 4,
+      "start": "2026-04-18T00:30",
+      "end": null,
+      "code_changes": [],
+      "config_changes": [
+        "system_n.sl.enabled: false -> true (1.5G SL aktif)",
+        "system_n.sl.g_mult: 2.0 -> 1.5",
+        "Backtest sonucu: 88 trade, NO_SL=-5.26 vs 1.5G=+0.75 (6.01 USDT kurtarma)",
+        "Emergency close'lar artik SL ile onlenecek",
+        "Karli pozisyonlara etkisi yok (SAFE — favor >> SL mesafesi)"
+      ],
+      "performance": null
+    }
+  ]
+}
