@@ -30,4 +30,13 @@ Kullanici `*kza` yazdiginda asagidaki tam analizi calistir:
 - Canli: `.env`'den API key'leri yukle, `BinanceRestClient(requests.Session(), key, secret)` ile baglanti kur
 - API: `rest.get_account()` (wallet/margin balance), `rest.get_positions()` (acik pozisyonlar, mark price, unrealized)
 
-**Cikti formati**: Markdown tablolar + ozet + yorum. Turkce.
+10. **OZET (en sonda, zorunlu)**: Tum analizden sonra 3-5 cumlelik kisa bir ozet yaz. Su sorulari cevapla:
+    - Son analizden bu yana portfoy karda mi zararda mi? Kac USDT degisim?
+    - Tum pozisyonlar kapatilirsa portfoy kac dolar?
+    - En buyuk risk/sorun ne?
+    - SL/Emergency/Reverse performansi tek cumleyle.
+    Bu ozet kullanicinin hizlica "durum iyi mi kotu mu" sorusunu cevaplasin.
+
+**Cutoff**: Her zaman onceki raporun timestamp'ini kullan (konusmada son *kza'nin zamani). Yoksa son 24 saati al.
+
+**Cikti formati**: Markdown tablolar + her bolum sonrasi kisa yorum + EN SONDA mutlaka genel ozet. Turkce.

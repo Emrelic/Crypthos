@@ -22,6 +22,7 @@ from gui.panels.strategy_settings_panel import StrategySettingsPanel
 from gui.panels.trade_report_panel import TradeReportPanel
 from gui.panels.activity_panel import ActivityPanel
 from gui.panels.settings_panel import SettingsPanel
+from gui.panels.market_research_panel import MarketResearchPanel
 
 
 class MainWindow(ctk.CTk):
@@ -62,50 +63,43 @@ class MainWindow(ctk.CTk):
         self._status_bar = StatusBar(self, controller)
         self._status_bar.pack(fill="x", padx=5, pady=(5, 0))
 
-        # ═══ VIEW SWITCHER: Sistemler / Araclar ═══
-        self._view_switch = ctk.CTkSegmentedButton(
-            self, values=["Sistemler", "Araclar"],
-            command=self._switch_view,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            height=28,
-        )
-        self._view_switch.set("Sistemler")
-        self._view_switch.pack(fill="x", padx=10, pady=(2, 0))
+        # ═══ UNIFIED TABVIEW — Tüm sekmeler tek yerde, lazy load ═══
+        self._tabview = ctk.CTkTabview(self, command=self._on_tab_change)
 
-        # ═══ SYSTEM TABS (12 tab) ═══
-        self._sys_tabview = ctk.CTkTabview(self)
+        # Tab isimleri: sistem + araç sekmeleri
+        self._all_tabs = ["N", "M", "J", "I", "A", "B", "C", "D", "E", "F", "G", "H",
+                          "Rapor", "Str.Ayar", "Aktivite", "Ayarlar", "Emir", "Piyasa", "Strateji", "Arastr"]
+        for name in self._all_tabs:
+            self._tabview.add(name)
 
-        tab_n = self._sys_tabview.add("N")
-        tab_m = self._sys_tabview.add("M")
-        tab_j = self._sys_tabview.add("J")
-        tab_i = self._sys_tabview.add("I")
-        tab_a = self._sys_tabview.add("A")
-        tab_b = self._sys_tabview.add("B")
-        tab_c = self._sys_tabview.add("C")
-        tab_d = self._sys_tabview.add("D")
-        tab_e = self._sys_tabview.add("E")
-        tab_f = self._sys_tabview.add("F")
-        tab_g = self._sys_tabview.add("G")
-        tab_h = self._sys_tabview.add("H")
+        # Lazy load takibi
+        self._tabs_loaded = set()
 
-        self._system_n_panel = SystemNPanel(tab_n, controller)
-        self._system_m_panel = SystemMPanel(tab_m, controller)
-        self._system_j_panel = SystemJPanel(tab_j, controller)
-        self._system_i_panel = SystemIPanel(tab_i, controller)
-        self._scanner_panel = ScannerPanel(tab_a, controller)
-        self._system_b_panel = SystemBPanel(tab_b, controller)
-        self._system_c_panel = SystemCPanel(tab_c, controller)
-        self._system_d_panel = SystemDPanel(tab_d, controller)
-        self._system_e_panel = SystemEPanel(tab_e, controller)
-        self._system_f_panel = SystemFPanel(tab_f, controller)
-        self._system_g_panel = SystemGPanel(tab_g, controller)
-        self._system_h_panel = SystemHPanel(tab_h, controller)
-        self._sys_tabview.set("N")
+        # Panel → class eşlemesi (lazy build için)
+        self._tab_panel_map = {
+            "N": (SystemNPanel, "_system_n_panel"),
+            "M": (SystemMPanel, "_system_m_panel"),
+            "J": (SystemJPanel, "_system_j_panel"),
+            "I": (SystemIPanel, "_system_i_panel"),
+            "A": (ScannerPanel, "_scanner_panel"),
+            "B": (SystemBPanel, "_system_b_panel"),
+            "C": (SystemCPanel, "_system_c_panel"),
+            "D": (SystemDPanel, "_system_d_panel"),
+            "E": (SystemEPanel, "_system_e_panel"),
+            "F": (SystemFPanel, "_system_f_panel"),
+            "G": (SystemGPanel, "_system_g_panel"),
+            "H": (SystemHPanel, "_system_h_panel"),
+            "Rapor": (TradeReportPanel, "_report_panel"),
+            "Str.Ayar": (StrategySettingsPanel, "_strategy_settings_panel"),
+            "Aktivite": (ActivityPanel, "_activity_panel"),
+            "Ayarlar": (SettingsPanel, "_settings_panel"),
+            "Emir": (QuickOrderPanel, "_quick_panel"),
+            "Piyasa": (MarketPanel, "_market_panel"),
+            "Strateji": (StrategyPanel, "_strategy_panel"),
+            "Arastr": (MarketResearchPanel, "_research_panel"),
+        }
 
-        # ═══ TOOL TABS (lazy — built on first Araclar click) ═══
-        self._tool_tabview = None
-        self._tools_built = False
-        # Placeholders for event handlers
+        # Placeholders for event handlers / update loop
         class _Noop:
             def add_log_entry(self, *a, **kw): pass
             def refresh_orders(self): pass
@@ -113,10 +107,16 @@ class MainWindow(ctk.CTk):
         self._quick_panel = None
         self._market_panel = None
 
-        # Default: Sistemler gorunur
-        self._sys_tabview.pack(after=self._view_switch,
-                               fill="both", expand=True, padx=5, pady=(0, 5))
+        # Sadece varsayılan sekmeyi (N) hemen build et
+        self._lazy_build_tab("N")
+        self._tabview.set("N")
+
+        self._tabview.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+
+        # Eski view switcher uyumluluk (update loop için)
         self._active_view = "Sistemler"
+        self._sys_tabview = self._tabview  # Eski referanslar için alias
+        self._tool_tabview = self._tabview
 
         # Register global hotkeys
         self._register_hotkeys()
@@ -143,47 +143,42 @@ class MainWindow(ctk.CTk):
         # On close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _switch_view(self, value: str) -> None:
-        """Switch between Sistemler and Araclar views."""
-        if value == self._active_view:
+    def _on_tab_change(self) -> None:
+        """Tab değiştiğinde, henüz build edilmemiş paneli lazy build et."""
+        try:
+            current = self._tabview.get()
+            if current and current not in self._tabs_loaded:
+                self._lazy_build_tab(current)
+            # Update loop için active view takibi
+            tool_tabs = {"Rapor", "Str.Ayar", "Aktivite", "Ayarlar", "Emir", "Piyasa", "Strateji"}
+            self._active_view = "Araclar" if current in tool_tabs else "Sistemler"
+        except Exception as e:
+            logger.error(f"[GUI] _on_tab_change error: {e}")
+
+    def _lazy_build_tab(self, tab_name: str) -> None:
+        """Tek bir paneli build et (lazy). Tüm sekmeler için geçerli."""
+        if tab_name in self._tabs_loaded:
             return
-        if value == "Sistemler":
-            if self._tool_tabview:
-                self._tool_tabview.pack_forget()
-            self._sys_tabview.pack(after=self._view_switch,
-                                   fill="both", expand=True, padx=5, pady=(0, 5))
-        else:
-            self._sys_tabview.pack_forget()
-            if not self._tools_built:
-                self._build_tool_tabs()
-            self._tool_tabview.pack(after=self._view_switch,
-                                    fill="both", expand=True, padx=5, pady=(0, 5))
-        self._active_view = value
+        if tab_name not in self._tab_panel_map:
+            return
 
-    def _build_tool_tabs(self) -> None:
-        """Build tool tabs on first Araclar click (lightweight panels only)."""
-        self._tool_tabview = ctk.CTkTabview(self)
-        ctrl = self.controller
-        tv = self._tool_tabview
-
-        tab_report = tv.add("Rapor")
-        tab_strat_s = tv.add("Str.Ayar")
-        tab_act = tv.add("Aktivite")
-        tab_set = tv.add("Ayarlar")
-        tab_quick = tv.add("Emir")
-        tab_market = tv.add("Piyasa")
-        tab_strat = tv.add("Strateji")
-
-        self._report_panel = TradeReportPanel(tab_report, ctrl)
-        self._strategy_settings_panel = StrategySettingsPanel(tab_strat_s, ctrl)
-        self._activity_panel = ActivityPanel(tab_act, ctrl)
-        self._settings_panel = SettingsPanel(tab_set, ctrl)
-        self._quick_panel = QuickOrderPanel(tab_quick, ctrl)
-        self._market_panel = MarketPanel(tab_market, ctrl)
-        self._strategy_panel = StrategyPanel(tab_strat, ctrl)
-
-        self._tools_built = True
-        logger.info("Tool tabs built (7 panels)")
+        PanelClass, attr_name = self._tab_panel_map[tab_name]
+        tab = self._tabview.tab(tab_name)
+        try:
+            panel = PanelClass(tab, self.controller)
+            setattr(self, attr_name, panel)
+            self._tabs_loaded.add(tab_name)
+            logger.info(f"[GUI] Panel '{tab_name}' lazy-built OK")
+        except Exception as e:
+            logger.error(f"[GUI] Panel '{tab_name}' build FAILED: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            ctk.CTkLabel(
+                tab, text=f"{tab_name} paneli yuklenemedi:\n{e}",
+                font=ctk.CTkFont(size=14), text_color="#EF5350",
+                wraplength=500,
+            ).pack(pady=30, padx=20)
+            self._tabs_loaded.add(tab_name)
 
     def _ensure_visible(self):
         """Force window visible and maximized, then refresh tabview."""
@@ -198,13 +193,10 @@ class MainWindow(ctk.CTk):
     def _refresh_tabview(self):
         """Force CTkTabview to re-render tab bar after window resize."""
         try:
-            # Re-pack sys tabview to force geometry recalculation
-            if self._active_view == "Sistemler":
-                self._sys_tabview.pack_forget()
-                self._sys_tabview.pack(after=self._view_switch,
-                                       fill="both", expand=True, padx=5, pady=(0, 5))
-            current = self._sys_tabview.get()
-            self._sys_tabview.set(current)
+            self._tabview.pack_forget()
+            self._tabview.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+            current = self._tabview.get()
+            self._tabview.set(current)
             self.update_idletasks()
         except Exception:
             pass
@@ -297,8 +289,8 @@ class MainWindow(ctk.CTk):
             )
 
             # Update panels based on active tab
-            if self._active_view == "Araclar" and self._tool_tabview:
-                active_tab = self._tool_tabview.get()
+            if self._active_view == "Araclar":
+                active_tab = self._tabview.get()
                 if active_tab == "Emir" and self._quick_panel:
                     self._quick_panel.update_display(
                         price=price,
