@@ -105,6 +105,18 @@ def _rsi(closes, n=14):
     return rsi[-1] if len(rsi) > 0 else 50.0
 
 
+def _rsi_array(closes, n=14):
+    """Return full RSI array (len = len(closes)-1, padded to len(closes))."""
+    d = np.diff(closes)
+    gain = np.where(d > 0, d, 0.0)
+    loss = np.where(d < 0, -d, 0.0)
+    avg_g = pd.Series(gain).ewm(span=n, adjust=False).mean().values
+    avg_l = pd.Series(loss).ewm(span=n, adjust=False).mean().values
+    rs = avg_g / np.where(avg_l > 0, avg_l, 1e-10)
+    rsi = 100.0 - 100.0 / (1.0 + rs)
+    return np.concatenate([[50.0], rsi])
+
+
 def _macd(closes, fast=12, slow=26, sig=9):
     f = _ema(closes, fast)
     s = _ema(closes, slow)
@@ -112,6 +124,16 @@ def _macd(closes, fast=12, slow=26, sig=9):
     signal = _ema(line, sig)
     hist = line - signal
     return line[-1], signal[-1], hist[-1]
+
+
+def _macd_arrays(closes, fast=12, slow=26, sig=9):
+    """Return full MACD arrays (line, signal, hist)."""
+    f = _ema(closes, fast)
+    s = _ema(closes, slow)
+    line = f - s
+    signal = _ema(line, sig)
+    hist = line - signal
+    return line, signal, hist
 
 
 def _adx(highs, lows, closes, n=14):
@@ -133,6 +155,26 @@ def _adx(highs, lows, closes, n=14):
     return float(adx_val[-1]) if len(adx_val) > 0 else 0.0
 
 
+def _adx_array(highs, lows, closes, n=14):
+    """Return full ADX array (len = len(closes)-1, padded to len(closes))."""
+    if len(highs) < n + 2:
+        return np.full(len(closes), 0.0)
+    up = np.diff(highs)
+    down = -np.diff(lows)
+    pdm = np.where((up > down) & (up > 0), up, 0.0)
+    ndm = np.where((down > up) & (down > 0), down, 0.0)
+    tr1 = highs[1:] - lows[1:]
+    tr2 = np.abs(highs[1:] - closes[:-1])
+    tr3 = np.abs(lows[1:] - closes[:-1])
+    tr = np.maximum(tr1, np.maximum(tr2, tr3))
+    atr = pd.Series(tr).ewm(span=n, adjust=False).mean().values
+    pdi = 100 * pd.Series(pdm).ewm(span=n, adjust=False).mean().values / np.where(atr > 0, atr, 1e-10)
+    ndi = 100 * pd.Series(ndm).ewm(span=n, adjust=False).mean().values / np.where(atr > 0, atr, 1e-10)
+    dx = 100 * np.abs(pdi - ndi) / np.where((pdi + ndi) > 0, pdi + ndi, 1e-10)
+    adx_val = pd.Series(dx).ewm(span=n, adjust=False).mean().values
+    return np.concatenate([[0.0], adx_val])
+
+
 def _bb(closes, n=20, k=2.0):
     s = pd.Series(closes)
     mid = s.rolling(n).mean().values
@@ -152,6 +194,18 @@ def _atr(highs, lows, closes, n=14):
     tr = np.maximum(tr1, np.maximum(tr2, tr3))
     atr_vals = pd.Series(tr).ewm(span=n, adjust=False).mean().values
     return float(atr_vals[-1]) if len(atr_vals) > 0 else 0.0
+
+
+def _atr_array(highs, lows, closes, n=14):
+    """Return full ATR array (padded to len(closes))."""
+    if len(highs) < 2:
+        return np.full(len(closes), 0.0)
+    tr1 = highs[1:] - lows[1:]
+    tr2 = np.abs(highs[1:] - closes[:-1])
+    tr3 = np.abs(lows[1:] - closes[:-1])
+    tr = np.maximum(tr1, np.maximum(tr2, tr3))
+    atr_vals = pd.Series(tr).ewm(span=n, adjust=False).mean().values
+    return np.concatenate([[atr_vals[0] if len(atr_vals) > 0 else 0.0], atr_vals])
 
 
 # ─── Renk sabitleri ─────────────────────────────────────────────────
@@ -178,6 +232,9 @@ class MarketResearchPanel(ctk.CTkFrame):
         self._toolbar = None
         self._fig = None
         self._analysis_data = None
+        self._vline = None       # vertical cursor line on chart
+        self._selected_idx = -1  # clicked candle index
+        self._ax1 = None
         self._build_ui()
 
     # ─── UI ──────────────────────────────────────────────────────────
@@ -238,7 +295,9 @@ class MarketResearchPanel(ctk.CTkFrame):
         self._regime_frame.pack(fill="x", padx=4, pady=(0, 4))
 
         # Indicators section
-        ctk.CTkLabel(right, text="INDIKATORLER", font=ctk.CTkFont(size=13, weight="bold"),
+        self._ind_title_var = ctk.StringVar(value="INDIKATORLER (son mum)")
+        ctk.CTkLabel(right, textvariable=self._ind_title_var,
+                     font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=_YELLOW).pack(anchor="w", padx=6, pady=(4, 2))
         self._ind_frame = ctk.CTkScrollableFrame(right)
         self._ind_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
@@ -356,12 +415,21 @@ class MarketResearchPanel(ctk.CTkFrame):
                 except Exception:
                     pass
 
+            # Full arrays for click-to-inspect
+            rsi_arr = _rsi_array(closes, 14)
+            macd_l_arr, macd_s_arr, macd_h_arr = _macd_arrays(closes)
+            adx_arr = _adx_array(highs, lows, closes, 14)
+            atr_arr = _atr_array(highs, lows, closes, 14)
+
             self._analysis_data = {
                 "symbol": symbol, "tf": tf, "limit": limit,
                 "closes": closes, "highs": highs, "lows": lows, "opens": opens,
                 "volumes": volumes, "times": times,
                 "ema9": ema9, "ema21": ema21, "ema50": ema50,
                 "bb_mid": bb_mid, "bb_up": bb_up, "bb_lo": bb_lo,
+                "bb_width": bb_width,
+                "rsi_arr": rsi_arr, "adx_arr": adx_arr, "atr_arr": atr_arr,
+                "macd_l_arr": macd_l_arr, "macd_s_arr": macd_s_arr, "macd_h_arr": macd_h_arr,
                 "indicators": indicators,
                 "regime_results": sorted(regime_results, key=lambda x: ALL_TFS.index(x["tf"])
                                          if x["tf"] in ALL_TFS else 99),
@@ -521,11 +589,156 @@ class MarketResearchPanel(ctk.CTkFrame):
         ax2.set_ylabel("Volume", color=_FG, fontsize=8)
         ax2.grid(True, alpha=0.1, color="#555")
 
+        # Store axes for click handler
+        self._ax1 = ax1
+        self._vline = None
+
         # Embed
         self._canvas = FigureCanvasTkAgg(fig, master=self._chart_frame)
         self._canvas.draw()
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
 
+        # Click event — pick candle index
+        self._canvas.mpl_connect("button_press_event", self._on_chart_click)
+
         self._toolbar = NavigationToolbar2Tk(self._canvas, self._chart_frame)
         self._toolbar.update()
         self._toolbar.pack(side="bottom", fill="x")
+
+    # ─── Chart click → update indicators at that candle ─────────────
+    def _on_chart_click(self, event):
+        if event.inaxes is None or self._analysis_data is None:
+            return
+        # Only respond to left click
+        if event.button != 1:
+            return
+
+        idx = int(round(event.xdata))
+        n = len(self._analysis_data["closes"])
+        idx = max(0, min(idx, n - 1))
+        self._selected_idx = idx
+
+        # Draw/update vertical cursor line
+        if self._vline is not None:
+            try:
+                self._vline.remove()
+            except ValueError:
+                pass
+        self._vline = self._ax1.axvline(x=idx, color="#FFD54F", linewidth=1, alpha=0.7, linestyle="--")
+        self._canvas.draw_idle()
+
+        # Update indicator panel for this candle
+        self._update_indicators_at(idx)
+
+    def _update_indicators_at(self, idx: int):
+        """Recalculate and display indicators at candle index `idx`."""
+        d = self._analysis_data
+        if not d:
+            return
+
+        closes = d["closes"]
+        n = len(closes)
+        if idx < 0 or idx >= n:
+            return
+
+        # Timestamp info
+        times = d["times"]
+        try:
+            ts = str(times[idx])[:19]
+        except Exception:
+            ts = f"mum #{idx}"
+
+        tf = d["tf"]
+        self._ind_title_var.set(f"INDIKATORLER — {ts}")
+
+        # Read precomputed arrays at idx
+        rsi_val = float(d["rsi_arr"][idx])
+
+        macd_line = float(d["macd_l_arr"][idx])
+        macd_sig = float(d["macd_s_arr"][idx])
+        macd_hist = float(d["macd_h_arr"][idx])
+
+        adx_val = float(d["adx_arr"][idx])
+
+        atr_val = float(d["atr_arr"][idx])
+        atr_pct = atr_val / closes[idx] * 100 if closes[idx] > 0 else 0
+
+        ema9_val = float(d["ema9"][idx])
+        ema21_val = float(d["ema21"][idx])
+        ema50_val = float(d["ema50"][idx]) if idx < len(d["ema50"]) else 0
+
+        bb_up_val = d["bb_up"][idx]
+        bb_lo_val = d["bb_lo"][idx]
+        bb_w_val = d["bb_width"][idx]
+
+        vol = d["volumes"][idx]
+        vol_start = max(0, idx - 19)
+        vol_avg = np.mean(d["volumes"][vol_start:idx + 1])
+        vol_ratio = vol / vol_avg if vol_avg > 0 else 1.0
+
+        # ER/Hurst at this point (using data up to idx)
+        if idx >= 40:
+            er_val = _rolling_er(closes[:idx + 1])
+        else:
+            er_val = _efficiency_ratio(closes[:idx + 1])
+        if idx >= 64:
+            hurst_val = _hurst(closes[:idx + 1])
+        else:
+            hurst_val = 0.5
+        regime = _classify(er_val, hurst_val)
+
+        indicators = {
+            "Mum #": f"{idx} / {n - 1}",
+            "Fiyat": f"{closes[idx]:.6g}",
+            "Open": f"{d['opens'][idx]:.6g}",
+            "High": f"{d['highs'][idx]:.6g}",
+            "Low": f"{d['lows'][idx]:.6g}",
+            "RSI(14)": f"{rsi_val:.1f}",
+            "MACD Line": f"{macd_line:.6g}",
+            "MACD Signal": f"{macd_sig:.6g}",
+            "MACD Hist": f"{macd_hist:.6g}",
+            "ADX(14)": f"{adx_val:.1f}",
+            "ATR(14)": f"{atr_val:.6g}",
+            "ATR%": f"{atr_pct:.3f}%",
+            "EMA(9)": f"{ema9_val:.6g}",
+            "EMA(21)": f"{ema21_val:.6g}",
+            "EMA(50)": f"{ema50_val:.6g}",
+            "BB Upper": f"{bb_up_val:.6g}" if not np.isnan(bb_up_val) else "-",
+            "BB Lower": f"{bb_lo_val:.6g}" if not np.isnan(bb_lo_val) else "-",
+            "BB Width%": f"{bb_w_val:.2f}%" if not np.isnan(bb_w_val) else "-",
+            "Volume": f"{vol:.0f}",
+            "Vol Ratio": f"{vol_ratio:.2f}x",
+            "ER": f"{er_val:.3f}",
+            "Hurst": f"{hurst_val:.3f}",
+            "Rejim": regime,
+        }
+
+        # Render
+        for w in self._ind_frame.winfo_children():
+            w.destroy()
+
+        for key, val in indicators.items():
+            row = ctk.CTkFrame(self._ind_frame)
+            row.pack(fill="x", pady=1)
+            ctk.CTkLabel(row, text=key, width=90, anchor="w",
+                         font=ctk.CTkFont(size=11), text_color="#90CAF9").pack(side="left", padx=4)
+            vc = _FG
+            if key == "RSI(14)":
+                v = float(val); vc = _RED if v > 70 else (_GREEN if v < 30 else _YELLOW)
+            elif key == "ADX(14)":
+                v = float(val); vc = _GREEN if v > 25 else (_RED if v < 18 else _YELLOW)
+            elif key == "MACD Hist":
+                try:
+                    v = float(val); vc = _GREEN if v > 0 else _RED
+                except ValueError:
+                    pass
+            elif key == "ER":
+                v = float(val); vc = _GREEN if v > 0.3 else (_RED if v < 0.2 else _YELLOW)
+            elif key == "Hurst":
+                v = float(val); vc = _GREEN if v > 0.55 else (_RED if v < 0.45 else _YELLOW)
+            elif key == "Rejim":
+                if "TREND" in val: vc = _GREEN
+                elif "RANG" in val: vc = _RED
+                else: vc = _YELLOW
+            ctk.CTkLabel(row, text=val, width=120, anchor="e",
+                         font=ctk.CTkFont(size=11, weight="bold"), text_color=vc).pack(side="right", padx=4)
