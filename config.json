@@ -963,7 +963,7 @@
     }
   },
   "system_n": {
-    "version": "N-V3-C4",
+    "version": "N-V4-C5",
     "enabled": true,
     "coin_mode": "top_n",
     "coin_sayisi": 50,
@@ -1016,7 +1016,17 @@
       "atr_mult": 2.0,
       "fixed_pct": 5.0,
       "fee_total_pct": 0.12,
-      "server_side": true
+      "server_side": true,
+      "regime_adaptive": {
+        "enabled": true,
+        "trend_g_mult": 1.5,
+        "ranging_g_mult": 3.0,
+        "uncertain_g_mult": 2.0,
+        "er_trend_threshold": 0.30,
+        "er_ranging_threshold": 0.20,
+        "hurst_trend_threshold": 0.55,
+        "hurst_ranging_threshold": 0.45
+      }
     }
   },
   "system_m": {

@@ -4,6 +4,7 @@ Supports up to max_positions concurrent positions."""
 import re
 import time
 import threading
+import numpy as np
 import pandas as pd
 from loguru import logger
 from core.config_manager import ConfigManager
@@ -10688,14 +10689,18 @@ class ScannerStateMachine:
                         reasons.append("ADX_dyn✗")
                     if not result.slope_ok:
                         reasons.append("slope✗")
+                    if not result.supertrend_ok:
+                        st_dir_str = "UP" if result.supertrend_direction == 1 else "DOWN"
+                        reasons.append(f"ST_{st_dir_str}✗")
                     if result.reject_reason and result.reject_reason != "no_signal":
                         reasons.append(result.reject_reason)
                     if not reasons:
                         reasons.append("crossover yok")
                     trend = "▲" if result.trend_color == "green" else "▼"
+                    st_icon = "⬆" if result.supertrend_direction == 1 else "⬇" if result.supertrend_direction == -1 else "—"
                     self._log_n_decision(
                         sym, "—", "SİNYAL_YOK",
-                        f"{trend} ADX:{result.adx:.1f} RSI:{result.rsi:.0f} | {', '.join(reasons)}",
+                        f"{trend} ADX:{result.adx:.1f} RSI:{result.rsi:.0f} ST:{st_icon} | {', '.join(reasons)}",
                         result.price)
 
             except Exception as e:
@@ -11105,6 +11110,9 @@ class ScannerStateMachine:
                 logger.error(f"[SysN] Failed to open position for {symbol}")
                 return False
 
+            # Version tag ekle
+            pos.version_tag = sm_cfg.get("version", "")
+
             # Opsiyonel SL yerleştir
             self._place_sl_system_n(symbol, pos, sig, leverage, pp)
 
@@ -11131,6 +11139,102 @@ class ScannerStateMachine:
             self._failed_symbols[symbol] = time.time()
             return False
 
+    def _detect_regime_for_sl(self, symbol: str) -> str:
+        """ER + Hurst ile rejim tespiti (SL ayarlamak icin).
+        Returns: 'TREND', 'RANGING', 'UNCERTAIN'
+        """
+        try:
+            import numpy as np
+            sm_cfg = self._config.get("system_n", {})
+            tf = sm_cfg.get("timeframe", "5m")
+            klines = self._rest.get_klines(symbol, tf, 200)
+            if klines is None or klines.empty or len(klines) < 64:
+                return "UNCERTAIN"
+
+            closes = klines["close"].values.astype(float)
+
+            # Rolling ER
+            window = 20
+            n_med = 10
+            if len(closes) >= window + n_med:
+                ers = []
+                for i in range(len(closes) - window + 1):
+                    seg = closes[i:i + window]
+                    net = abs(seg[-1] - seg[0])
+                    total = np.sum(np.abs(np.diff(seg)))
+                    ers.append(net / total if total > 0 else 0.0)
+                er = float(np.median(ers[-n_med:]))
+            else:
+                net = abs(closes[-1] - closes[0])
+                total = np.sum(np.abs(np.diff(closes)))
+                er = net / total if total > 0 else 0.0
+
+            # Hurst
+            hurst = 0.5
+            if len(closes) >= 64:
+                log_ret = np.diff(np.log(closes))
+                ns = [n for n in [8, 12, 16, 24, 32, 48, 64, 96, 128] if n <= len(log_ret)]
+                if len(ns) >= 3:
+                    pts = []
+                    for n in ns:
+                        rs_list = []
+                        step = max(1, n // 2)
+                        for s in range(0, len(log_ret) - n + 1, step):
+                            chunk = log_ret[s:s + n]
+                            dev = np.cumsum(chunk - np.mean(chunk))
+                            R = np.max(dev) - np.min(dev)
+                            S = np.std(chunk, ddof=1)
+                            if S > 0:
+                                rs_list.append(R / S)
+                        if rs_list:
+                            pts.append((np.log(n), np.log(np.mean(rs_list))))
+                    if len(pts) >= 3:
+                        x = np.array([p[0] for p in pts])
+                        y = np.array([p[1] for p in pts])
+                        hurst = float(np.clip(
+                            (len(x) * np.sum(x * y) - np.sum(x) * np.sum(y)) /
+                            (len(x) * np.sum(x ** 2) - np.sum(x) ** 2),
+                            0.0, 1.0))
+
+            # Classify
+            ra_cfg = self._config.get("system_n.sl", {}).get("regime_adaptive", {})
+            er_trend = ra_cfg.get("er_trend_threshold", 0.30)
+            er_range = ra_cfg.get("er_ranging_threshold", 0.20)
+            hu_trend = ra_cfg.get("hurst_trend_threshold", 0.55)
+            hu_range = ra_cfg.get("hurst_ranging_threshold", 0.45)
+
+            score = 0
+            if er < er_range:
+                score -= 2
+            elif er < (er_range + er_trend) / 2:
+                score -= 1
+            elif er > er_trend:
+                score += 2
+            elif er > (er_range + er_trend) / 2:
+                score += 1
+            if hurst < hu_range:
+                score -= 2
+            elif hurst < (hu_range + hu_trend) / 2:
+                score -= 1
+            elif hurst > hu_trend:
+                score += 2
+            elif hurst > (hu_range + hu_trend) / 2:
+                score += 1
+
+            if score >= 2:
+                regime = "TREND"
+            elif score <= -2:
+                regime = "RANGING"
+            else:
+                regime = "UNCERTAIN"
+
+            logger.info(f"[SysN SL] {symbol} regime: {regime} (ER={er:.3f} Hurst={hurst:.3f})")
+            return regime
+
+        except Exception as e:
+            logger.warning(f"[SysN SL] {symbol} regime detection failed: {e}")
+            return "UNCERTAIN"
+
     def _place_sl_system_n(self, symbol: str, pos, sig, leverage: int,
                             price_precision: int = 2) -> None:
         """System N opsiyonel SL yerleştirme (config: system_n.sl).
@@ -11139,6 +11243,10 @@ class ScannerStateMachine:
             g_based:   G × sl_g_mult + fee → SL%
             atr_based: ATR × sl_atr_mult / fiyat → SL%
             fixed_pct: sabit yüzde
+
+        Regime adaptive: ER/Hurst ile rejim tespiti yapilir,
+            TREND → trend_g_mult (siki), RANGING → ranging_g_mult (genis),
+            UNCERTAIN → uncertain_g_mult (orta).
         """
         sl_cfg = self._config.get("system_n.sl", {})
         if not sl_cfg.get("enabled", False):
@@ -11154,14 +11262,30 @@ class ScannerStateMachine:
         if mode == "g_based":
             scanner = self._system_n_scanner
             coin_params = scanner.get_coin_params(symbol) if scanner else {}
-            cached_sl = coin_params.get("sl_pct", 0)
-            if cached_sl > 0:
-                sl_pct = cached_sl
-            else:
-                G = coin_params.get("G", 0)
-                g_mult = sl_cfg.get("g_mult", 1.5)
-                fee = sl_cfg.get("fee_total_pct", 0.12)
+            G = coin_params.get("G", 0)
+            g_mult = sl_cfg.get("g_mult", 1.5)
+            fee = sl_cfg.get("fee_total_pct", 0.12)
+
+            # ── Regime adaptive g_mult ──
+            ra_cfg = sl_cfg.get("regime_adaptive", {})
+            if ra_cfg.get("enabled", False):
+                regime = self._detect_regime_for_sl(symbol)
+                if regime == "TREND":
+                    g_mult = ra_cfg.get("trend_g_mult", 1.5)
+                elif regime == "RANGING":
+                    g_mult = ra_cfg.get("ranging_g_mult", 3.0)
+                else:
+                    g_mult = ra_cfg.get("uncertain_g_mult", 2.0)
+                logger.info(f"[SysN SL] {symbol}: regime={regime} -> g_mult={g_mult}")
+
+            if G > 0:
                 sl_pct = G * g_mult + fee
+            else:
+                cached_sl = coin_params.get("sl_pct", 0)
+                if cached_sl > 0:
+                    sl_pct = cached_sl * (g_mult / 1.5)
+                else:
+                    sl_pct = 0
         elif mode == "atr_based":
             atr_mult = sl_cfg.get("atr_mult", 2.0)
             atr = getattr(sig, "atr", 0) or 0
@@ -11268,6 +11392,8 @@ class ScannerStateMachine:
                     entry_regime=trade.get("entry_regime", ""),
                     entry_regime_confidence=trade.get("entry_regime_confidence", 0),
                     entry_bb_width=trade.get("entry_bb_width", 0),
+                    version_tag=trade.get("version_tag", ""),
+                    entry_mode=trade.get("entry_mode", ""),
                 )
             return True
         except Exception as e:
@@ -11421,6 +11547,8 @@ class ScannerStateMachine:
                     entry_regime=trade.get("entry_regime", ""),
                     entry_regime_confidence=trade.get("entry_regime_confidence", 0),
                     entry_bb_width=trade.get("entry_bb_width", 0),
+                    version_tag=trade.get("version_tag", ""),
+                    entry_mode=trade.get("entry_mode", ""),
                 )
 
             # 3. Leverage'ı güncelle + hemen yeni yönde aç (gap minimize)
@@ -11454,6 +11582,11 @@ class ScannerStateMachine:
             if not new_pos:
                 logger.error(f"[SysN REVERSE] {symbol}: new pos failed")
             else:
+                # Reverse sayacını devral ve artır
+                old_rev = getattr(pos, "reverse_count", 1)
+                new_pos.reverse_count = old_rev + 1
+                # Version tag
+                new_pos.version_tag = sm_cfg.get("version", "")
                 # Opsiyonel SL yerleştir
                 pp = 2
                 if self._symbol_info_cache:
@@ -11480,6 +11613,70 @@ class ScannerStateMachine:
             return self._do_close_system_n(symbol, pos, f"REVERSE_{new_direction}_ERR")
 
     def _check_held_positions_system_n(self) -> None:
-        """System N pozisyon kontrolü — sadece external close tespiti.
-        Sinyal bazlı çıkış _do_trading_system_n'de yapılır."""
+        """System N pozisyon kontrolü — external close + Supertrend erken çıkış.
+        Sinyal bazlı çıkış _do_trading_system_n'de yapılır.
+        Supertrend erken çıkış: ST ters dönerse AlphaTrend crossover beklemeden kapat."""
         self._detect_external_closes()
+
+        # Supertrend erken çıkış kontrolü
+        sm_cfg = self._config.get("system_n", {})
+        ind_cfg = sm_cfg.get("indicators", {})
+        st_confirm = ind_cfg.get("supertrend_confirm", True)
+        if not st_confirm:
+            return
+
+        held = self._position_mgr.get_all_positions()
+        system_n_positions = {
+            sym: pos for sym, pos in held.items()
+            if getattr(pos, "entry_mode", "") == "SYSTEM_N"
+        }
+        if not system_n_positions:
+            return
+
+        from scanner.system_n_scanner import compute_supertrend, _true_range, _rma
+        from core.constants import OrderSide
+
+        st_period = ind_cfg.get("supertrend_period", 10)
+        st_mult = ind_cfg.get("supertrend_multiplier", 3.0)
+        default_tf = sm_cfg.get("timeframe", "5m")
+        kline_limit = sm_cfg.get("kline_limit", 300)
+
+        for sym, pos in system_n_positions.items():
+            try:
+                # Kline çek
+                coin_params = self._system_n_scanner.get_coin_params(sym) if self._system_n_scanner else {}
+                tf = coin_params.get("tf", default_tf)
+                klines_raw = self._rest.get_klines(sym, tf, limit=min(kline_limit, 100))
+
+                if isinstance(klines_raw, pd.DataFrame):
+                    if klines_raw.empty or len(klines_raw) < 30:
+                        continue
+                    highs = klines_raw["high"].values.astype(float)
+                    lows = klines_raw["low"].values.astype(float)
+                    closes = klines_raw["close"].values.astype(float)
+                else:
+                    if not klines_raw or len(klines_raw) < 30:
+                        continue
+                    highs = np.array([float(k[2]) for k in klines_raw])
+                    lows = np.array([float(k[3]) for k in klines_raw])
+                    closes = np.array([float(k[4]) for k in klines_raw])
+
+                _, st_dir_arr = compute_supertrend(highs, lows, closes, st_period, st_mult)
+                st_dir = int(st_dir_arr[-1])
+
+                # LONG pozisyon + Supertrend DOWN → erken çıkış
+                is_long = pos.side == OrderSide.BUY_LONG
+                is_short = pos.side == OrderSide.SELL_SHORT
+
+                if (is_long and st_dir == -1) or (is_short and st_dir == 1):
+                    direction_str = "LONG" if is_long else "SHORT"
+                    st_str = "DOWN" if st_dir == -1 else "UP"
+                    logger.info(f"[SysN] {sym}: Supertrend erken çıkış — "
+                                f"{direction_str} pozisyon + ST={st_str}")
+                    self._log_n_decision(
+                        sym, direction_str, "ST_ERKEN_ÇIKIŞ",
+                        f"Supertrend {st_str} döndü → {direction_str} kapatılıyor",
+                        closes[-1])
+                    self._do_close_system_n(sym, pos, "SUPERTREND_EXIT")
+            except Exception as e:
+                logger.debug(f"[SysN] {sym}: ST check error: {e}")

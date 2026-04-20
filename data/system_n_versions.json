@@ -1,5 +1,5 @@
 {
-  "current_version": "N-V3-C4",
+  "current_version": "N-V4-C5",
   "versions": [
     {
       "tag": "N-V1-C1",
@@ -121,6 +121,29 @@
         "Backtest sonucu: 88 trade, NO_SL=-5.26 vs 1.5G=+0.75 (6.01 USDT kurtarma)",
         "Emergency close'lar artik SL ile onlenecek",
         "Karli pozisyonlara etkisi yok (SAFE — favor >> SL mesafesi)"
+      ],
+      "performance": null
+    },
+    {
+      "tag": "N-V4-C5",
+      "version": 4,
+      "config": 5,
+      "start": "2026-04-20T14:00",
+      "end": null,
+      "code_changes": [
+        "state_machine._detect_regime_for_sl(): ER+Hurst ile rejim tespiti (TREND/RANGING/UNCERTAIN)",
+        "state_machine._place_sl_system_n(): regime_adaptive aktifse g_mult rejime gore secilir",
+        "TREND -> 1.5G (siki SL), RANGING -> 3.0G (genis SL), UNCERTAIN -> 2.0G (orta)",
+        "Klines REST'ten cekilir (30s cache), ER rolling(20,10) + Hurst improved hesaplanir"
+      ],
+      "config_changes": [
+        "system_n.sl.regime_adaptive.enabled: true",
+        "system_n.sl.regime_adaptive.trend_g_mult: 1.5",
+        "system_n.sl.regime_adaptive.ranging_g_mult: 3.0",
+        "system_n.sl.regime_adaptive.uncertain_g_mult: 2.0",
+        "system_n.sl.regime_adaptive.er_trend/ranging_threshold: 0.30/0.20",
+        "system_n.sl.regime_adaptive.hurst_trend/ranging_threshold: 0.55/0.45",
+        "Backtest: trending donemde 1.5G +6.01 kurtarma, ranging donemde 3G emergency'den iyi"
       ],
       "performance": null
     }
