@@ -963,7 +963,6 @@
     }
   },
   "system_n": {
-    "version": "N-V4-C5",
     "enabled": true,
     "coin_mode": "top_n",
     "coin_sayisi": 50,
@@ -987,10 +986,7 @@
       "use_adx_dynamic": true,
       "adx_dyn_mult": 1.0,
       "use_slope": false,
-      "slope_factor": 0.1,
-      "supertrend_confirm": false,
-      "supertrend_period": 10,
-      "supertrend_multiplier": 3.0
+      "slope_factor": 0.1
     },
     "position": {
       "sizing_mode": "hybrid",
@@ -1012,21 +1008,10 @@
       "enabled": true,
       "mode": "g_based",
       "g_mult": 1.5,
-      "liq_g_mult": 3.5,
       "atr_mult": 2.0,
       "fixed_pct": 5.0,
       "fee_total_pct": 0.12,
-      "server_side": true,
-      "regime_adaptive": {
-        "enabled": true,
-        "trend_g_mult": 1.5,
-        "ranging_g_mult": 3.0,
-        "uncertain_g_mult": 2.0,
-        "er_trend_threshold": 0.30,
-        "er_ranging_threshold": 0.20,
-        "hurst_trend_threshold": 0.55,
-        "hurst_ranging_threshold": 0.45
-      }
+      "server_side": true
     }
   },
   "system_m": {
