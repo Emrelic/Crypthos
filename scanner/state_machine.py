@@ -1541,8 +1541,8 @@ class ScannerStateMachine:
                         status="placed",
                         trigger_source="exit:external_close",
                     )
-                    # Log complete trade record
-                    if result:
+                    # Log complete trade record (skip if essential data missing)
+                    if result and result.get("leverage", 0) > 0:
                         fee_pct = self._config.get("strategy.fee_pct", 0.10) / 100.0
                         fee_usdt = result.get("notional_usdt", 0) * fee_pct
                         from datetime import datetime as dt
@@ -1564,7 +1564,7 @@ class ScannerStateMachine:
                             pnl_percent=result.get("pnl_percent", 0),
                             roi_percent=result.get("roi_percent", 0),
                             fee_usdt=fee_usdt,
-                            exit_reason="external_close",
+                            exit_reason=exit_reason,
                             hold_seconds=result.get("hold_seconds", 0),
                             highest_price=result.get("highest_price", 0),
                             lowest_price=result.get("lowest_price", 0),

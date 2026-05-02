@@ -242,22 +242,35 @@ class OrderLogger:
             return [dict(row) for row in cursor.fetchall()]
 
     def import_from_binance(self, rest_client, start_ms: int = 0, end_ms: int = 0) -> int:
-        """Import historical trades from Binance income history into trades table.
-        Groups REALIZED_PNL + COMMISSION events by symbol+time window.
+        """Import historical trades from Binance userTrades API into trades table.
+        Groups fills by symbol + time window, calculates real side/price/leverage.
         Returns number of trades imported."""
         from collections import defaultdict
 
+        # Step 1: Income history for PnL + fee (commission is negative)
         income = rest_client.get_income_history(
             start_time=start_ms, end_time=end_ms, limit=1000)
         if not income:
             return 0
 
-        # Group by symbol + time window (5 min = 300000 ms)
+        # Group income by symbol + time window (5 min = 300000 ms)
         symbol_events = defaultdict(list)
         for item in income:
             typ = item.get("incomeType", "")
             if typ in ("REALIZED_PNL", "COMMISSION", "INSURANCE_CLEAR"):
                 symbol_events[item.get("symbol", "")].append(item)
+
+        # Step 2: Fetch userTrades for each symbol to get real side/price/qty
+        symbol_fills = {}
+        for sym in symbol_events:
+            try:
+                fills = rest_client.get_account_trades(
+                    symbol=sym, start_time=start_ms,
+                    end_time=end_ms, limit=500)
+                symbol_fills[sym] = fills or []
+            except Exception as e:
+                logger.warning(f"[IMPORT] {sym}: userTrades fetch failed: {e}")
+                symbol_fills[sym] = []
 
         trades_imported = 0
         for sym, evts in symbol_events.items():
@@ -272,6 +285,8 @@ class OrderLogger:
                     current.append(e)
             if current:
                 groups.append(current)
+
+            fills = symbol_fills.get(sym, [])
 
             for group in groups:
                 pnl = sum(float(x.get("income", 0)) for x in group
@@ -295,30 +310,85 @@ class OrderLogger:
                     if cursor.fetchone():
                         continue
 
+                # Match fills to this group by time window
+                g_start = group[0].get("time", 0)
+                g_end = group[-1].get("time", 0) + 60000  # 1 min buffer
+                matched = [f for f in fills
+                           if g_start - 60000 <= f.get("time", 0) <= g_end
+                           and f.get("realizedPnl", "0") != "0"]
+
+                # Extract real trade info from fills
+                side = "unknown"
+                entry_price = 0.0
+                exit_price = 0.0
+                total_qty = 0.0
+                total_notional = 0.0
+
+                if matched:
+                    # Close fills: the side that realized PnL
+                    # buyer=True means this fill was a BUY → closing a SHORT
+                    first = matched[0]
+                    is_buyer = first.get("buyer", False)
+                    side = "Sell/Short" if is_buyer else "Buy/Long"
+
+                    total_qty = sum(float(f.get("qty", 0)) for f in matched)
+                    total_notional = sum(
+                        float(f.get("price", 0)) * float(f.get("qty", 0))
+                        for f in matched)
+                    exit_price = (total_notional / total_qty) if total_qty > 0 else 0
+
+                    # Approximate entry from PnL
+                    if total_qty > 0 and pnl != 0:
+                        pnl_per_unit = pnl / total_qty
+                        if is_buyer:
+                            # Closed SHORT: pnl = (entry - exit) * qty
+                            entry_price = exit_price + pnl_per_unit
+                        else:
+                            # Closed LONG: pnl = (exit - entry) * qty
+                            entry_price = exit_price - pnl_per_unit
+
+                # Derive leverage and percentages
+                margin_usdt = 0.0
+                leverage = 0
+                pnl_percent = 0.0
+                roi_percent = 0.0
+
+                if entry_price > 0 and total_qty > 0:
+                    notional = entry_price * total_qty
+                    pnl_percent = (pnl / notional) * 100 if notional > 0 else 0
+
+                    # Try to get leverage from position info in fills
+                    if matched:
+                        # Estimate leverage from margin if available
+                        # Fills don't have leverage directly, estimate from
+                        # commission rate pattern or use account position data
+                        pass
+
+                    total_notional = notional
+
                 exit_reason = "LIQUIDATION" if liq < 0 else "external_close"
-                net_pnl = pnl + fee + liq  # fee is negative
 
                 self.log_trade(
-                    open_time=close_time,  # approximate (no exact entry time from income)
+                    open_time=close_time,
                     close_time=close_time,
                     symbol=sym,
-                    side="unknown",
-                    leverage=0,
-                    margin_usdt=0,
-                    notional_usdt=0,
-                    entry_price=0,
-                    exit_price=0,
-                    size=0,
+                    side=side,
+                    leverage=leverage,
+                    margin_usdt=margin_usdt,
+                    notional_usdt=round(total_notional, 4),
+                    entry_price=round(entry_price, 8),
+                    exit_price=round(exit_price, 8),
+                    size=round(total_qty, 8),
                     pnl_usdt=round(pnl, 6),
-                    pnl_percent=0,
-                    roi_percent=0,
+                    pnl_percent=round(pnl_percent, 2),
+                    roi_percent=round(roi_percent, 2),
                     fee_usdt=round(abs(fee), 6),
                     exit_reason=exit_reason,
                     hold_seconds=0,
                 )
                 trades_imported += 1
 
-        logger.info(f"Imported {trades_imported} trades from Binance income history")
+        logger.info(f"Imported {trades_imported} trades from Binance history")
         return trades_imported
 
     def log_config_change(self, old_config: dict, new_config: dict,

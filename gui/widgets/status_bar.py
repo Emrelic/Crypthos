@@ -65,6 +65,13 @@ class StatusBar(ctk.CTkFrame):
                                         font=ctk.CTkFont(size=11))
         self._trade_lbl.pack(side="left", padx=4)
 
+        # Active system info
+        self._system_info_lbl = ctk.CTkLabel(
+            self, text="", width=220, anchor="w",
+            text_color="#FFA726", font=ctk.CTkFont(size=11, weight="bold"))
+        self._system_info_lbl.pack(side="left", padx=(6, 3))
+        self._update_system_info()
+
         # Strategy status (compact)
         self._strategy_label = ctk.CTkLabel(self, text="Str:OFF", width=55,
                                             text_color="gray",
@@ -144,6 +151,9 @@ class StatusBar(ctk.CTkFrame):
         strat_color = "green" if strategy_running else "gray"
         self._strategy_label.configure(text=strat_text, text_color=strat_color)
 
+        # System info
+        self._update_system_info()
+
         # Kill
         if killed:
             self._kill_btn.configure(fg_color="red", text="KILLED!")
@@ -161,3 +171,51 @@ class StatusBar(ctk.CTkFrame):
             self._candidate_lbl.configure(text=candidate_text, text_color=candidate_color)
         if trade_text:
             self._trade_lbl.configure(text=trade_text, text_color=trade_color)
+
+    def _update_system_info(self) -> None:
+        """Read config and show active system + version + key params."""
+        cfg = self.controller.config
+        # Determine active system
+        systems = [
+            ("M", "system_m"), ("N", "system_n"), ("J", "system_j"),
+            ("I", "system_i"), ("B", "system_b"),
+        ]
+        active = None
+        for name, key in systems:
+            if cfg.get(f"{key}.enabled", False):
+                active = (name, key)
+                break
+
+        if not active:
+            self._system_info_lbl.configure(
+                text="Sistem: YOK", text_color="red")
+            return
+
+        name, key = active
+        parts = [f"Sistem {name}"]
+
+        # Version tag if available
+        vtag = cfg.get(f"{key}.version_tag", "")
+        if vtag:
+            parts.append(vtag)
+
+        # Key params per system
+        if name == "N":
+            lev = cfg.get(f"{key}.max_leverage",
+                          cfg.get(f"{key}.leverage", "?"))
+            max_pos = cfg.get(f"{key}.position.max_positions", "?")
+            sl = "ON" if cfg.get(f"{key}.sl.enabled", False) else "OFF"
+            parts.append(f"Lev:{lev} Pos:{max_pos} SL:{sl}")
+        elif name == "M":
+            lev = cfg.get(f"{key}.max_leverage",
+                          cfg.get(f"{key}.leverage", "?"))
+            max_pos = cfg.get(f"{key}.position.max_positions", "?")
+            mode = cfg.get(f"{key}.trading_mode", "?")
+            parts.append(f"Lev:{lev} Pos:{max_pos} {mode}")
+        elif name in ("J", "I", "B"):
+            max_pos = cfg.get(f"{key}.position.max_positions",
+                              cfg.get(f"{key}.max_positions", "?"))
+            parts.append(f"Pos:{max_pos}")
+
+        text = " | ".join(parts)
+        self._system_info_lbl.configure(text=text, text_color="#FFA726")
